@@ -1,10 +1,10 @@
 #include "flash_nvram.h"
 #include "user_config.h"
+#include "LPC17xx.h"
 #include <string.h>
 #include <stddef.h>
 
 #define IAP_LOCATION    0x1FFF1FF1
-#define IAP_CLK_KHZ     100000
 
 typedef void (*IAP_ENTRY)(unsigned long[], unsigned long[]);
 static const IAP_ENTRY iap_call = (IAP_ENTRY)IAP_LOCATION;
@@ -14,6 +14,77 @@ static unsigned long s_iap_res[5];
 
 static char s_active_station_id[16] = STATION_ID_DEFAULT;
 static char s_active_last_logged[20] = "NO DATA YET";
+
+/* Robust In-Application Programming (IAP) writer for Sector 1 (0x1000)
+ * Uses clock fallback (100MHz CCLK -> 398MHz PLL timing used by legacy TWS firmware)
+ * and read-back hardware verification with memcmp. */
+static bool iap_write_sector1(const void *src_buf, size_t len)
+{
+    if (!src_buf || len != 256) return false;
+
+    static const uint32_t clocks[] = { 100000, 398000, 12000 };
+
+    for (size_t c = 0; c < sizeof(clocks) / sizeof(clocks[0]); c++) {
+        uint32_t clk = clocks[c];
+
+        /* Step 1: Prepare Sector 1 for Erase */
+        s_iap_cmd[0] = 50;
+        s_iap_cmd[1] = PARAM_SECTOR;
+        s_iap_cmd[2] = PARAM_SECTOR;
+        __disable_irq();
+        iap_call(s_iap_cmd, s_iap_res);
+        __enable_irq();
+        if (s_iap_res[0] != 0) continue;
+
+        /* Delay between prepare and erase */
+        for (volatile int d = 0; d < 20000; d++);
+
+        /* Step 2: Erase Sector 1 */
+        s_iap_cmd[0] = 52;
+        s_iap_cmd[1] = PARAM_SECTOR;
+        s_iap_cmd[2] = PARAM_SECTOR;
+        s_iap_cmd[3] = clk;
+        __disable_irq();
+        iap_call(s_iap_cmd, s_iap_res);
+        __enable_irq();
+        if (s_iap_res[0] != 0) continue;
+
+        /* Critical: Settling delay after sector erase (~100-200ms) */
+        for (volatile int d = 0; d < 300000; d++);
+
+        /* Step 3: Prepare Sector 1 again before write */
+        s_iap_cmd[0] = 50;
+        s_iap_cmd[1] = PARAM_SECTOR;
+        s_iap_cmd[2] = PARAM_SECTOR;
+        __disable_irq();
+        iap_call(s_iap_cmd, s_iap_res);
+        __enable_irq();
+        if (s_iap_res[0] != 0) continue;
+
+        /* Delay between prepare and write */
+        for (volatile int d = 0; d < 20000; d++);
+
+        /* Step 4: Copy RAM to Flash (256 bytes) */
+        s_iap_cmd[0] = 51;
+        s_iap_cmd[1] = PARAM_SECTOR_ADDR;
+        s_iap_cmd[2] = (unsigned long)src_buf;
+        s_iap_cmd[3] = 256;
+        s_iap_cmd[4] = clk;
+        __disable_irq();
+        iap_call(s_iap_cmd, s_iap_res);
+        __enable_irq();
+
+        /* Settling delay */
+        for (volatile int d = 0; d < 50000; d++);
+
+        /* Step 5: Read-back verification directly against physical Flash address */
+        if (s_iap_res[0] == 0 && memcmp((const void *)PARAM_SECTOR_ADDR, src_buf, len) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 void flash_nvram_init(void)
 {
@@ -29,19 +100,12 @@ void flash_nvram_init(void)
             strncpy(temp_id, flash_str, len);
             temp_id[len] = '\0';
 
-            /* If flash contains legacy placeholder default "001922", migrate to new default "001061" */
-            if (strcmp(temp_id, "001922") == 0) {
-                strncpy(s_active_station_id, STATION_ID_DEFAULT, sizeof(s_active_station_id) - 1);
-                s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
-                flash_nvram_set_station_id(STATION_ID_DEFAULT);
-            } else {
-                /* User-configured custom Station ID: preserve permanently */
-                strncpy(s_active_station_id, temp_id, sizeof(s_active_station_id) - 1);
-                s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
-            }
+            /* User-configured custom Station ID: preserve permanently across power cycles & flashes */
+            strncpy(s_active_station_id, temp_id, sizeof(s_active_station_id) - 1);
+            s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
         }
     } else {
-        /* Blank/uninitialized sector: write new default station ID */
+        /* Blank/uninitialized sector: write default station ID */
         strncpy(s_active_station_id, STATION_ID_DEFAULT, sizeof(s_active_station_id) - 1);
         s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
         flash_nvram_set_station_id(STATION_ID_DEFAULT);
@@ -51,7 +115,7 @@ void flash_nvram_init(void)
     const char *flash_log = (const char *)(PARAM_SECTOR_ADDR + offsetof(station_nvram_params_t, last_logged));
     if (flash_log[0] >= '0' && flash_log[0] <= '9') {
         int log_len = 0;
-        while (log_len < 16 && (flash_log[log_len] >= '0' && flash_log[log_len] <= '9' ||
+        while (log_len < 16 && ((flash_log[log_len] >= '0' && flash_log[log_len] <= '9') ||
                                 flash_log[log_len] == '-' || flash_log[log_len] == ':' ||
                                 flash_log[log_len] == ' ' || flash_log[log_len] == '/')) {
             log_len++;
@@ -87,55 +151,12 @@ bool flash_nvram_set_last_logged(const char *last_logged_str)
     memset(sector_buf + offset, 0, sizeof(((station_nvram_params_t *)0)->last_logged));
     strncpy((char *)(sector_buf + offset), last_logged_str, sizeof(((station_nvram_params_t *)0)->last_logged) - 1);
 
-    /* Update RAM cache */
-    strncpy(s_active_last_logged, last_logged_str, sizeof(s_active_last_logged) - 1);
-    s_active_last_logged[sizeof(s_active_last_logged) - 1] = '\0';
-
-    /* Disable interrupts during Flash write */
-    __asm volatile ("cpsid i" : : : "memory");
-
-    /* 1. Prepare Sector 1 */
-    s_iap_cmd[0] = 50;
-    s_iap_cmd[1] = PARAM_SECTOR;
-    s_iap_cmd[2] = PARAM_SECTOR;
-    iap_call(s_iap_cmd, s_iap_res);
-    if (s_iap_res[0] != 0) {
-        __asm volatile ("cpsie i" : : : "memory");
-        return false;
+    bool ok = iap_write_sector1(sector_buf, 256);
+    if (ok) {
+        strncpy(s_active_last_logged, last_logged_str, sizeof(s_active_last_logged) - 1);
+        s_active_last_logged[sizeof(s_active_last_logged) - 1] = '\0';
     }
-
-    /* 2. Erase Sector 1 */
-    s_iap_cmd[0] = 52;
-    s_iap_cmd[1] = PARAM_SECTOR;
-    s_iap_cmd[2] = PARAM_SECTOR;
-    s_iap_cmd[3] = IAP_CLK_KHZ;
-    iap_call(s_iap_cmd, s_iap_res);
-    if (s_iap_res[0] != 0) {
-        __asm volatile ("cpsie i" : : : "memory");
-        return false;
-    }
-
-    /* 3. Prepare Sector 1 again before write */
-    s_iap_cmd[0] = 50;
-    s_iap_cmd[1] = PARAM_SECTOR;
-    s_iap_cmd[2] = PARAM_SECTOR;
-    iap_call(s_iap_cmd, s_iap_res);
-    if (s_iap_res[0] != 0) {
-        __asm volatile ("cpsie i" : : : "memory");
-        return false;
-    }
-
-    /* 4. Copy RAM to Flash (256 bytes) */
-    s_iap_cmd[0] = 51;
-    s_iap_cmd[1] = PARAM_SECTOR_ADDR;
-    s_iap_cmd[2] = (unsigned long)sector_buf;
-    s_iap_cmd[3] = 256;
-    s_iap_cmd[4] = IAP_CLK_KHZ;
-    iap_call(s_iap_cmd, s_iap_res);
-
-    __asm volatile ("cpsie i" : : : "memory");
-
-    return (s_iap_res[0] == 0);
+    return ok;
 }
 
 bool flash_nvram_set_station_id(const char *new_id)
@@ -148,57 +169,18 @@ bool flash_nvram_set_station_id(const char *new_id)
 
     /* Update station ID at offset 0 */
     memset(sector_buf, 0, 8);
-    strncpy((char *)sector_buf, new_id, 7);
+    size_t id_len = strlen(new_id);
+    if (id_len > 6) id_len = 6;
+    strncpy((char *)sector_buf, new_id, id_len);
+    sector_buf[id_len] = '\0';
 
-    /* Update RAM copy */
-    strncpy(s_active_station_id, new_id, sizeof(s_active_station_id) - 1);
-    s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
-
-    /* Disable interrupts during Flash write */
-    __asm volatile ("cpsid i" : : : "memory");
-
-    /* 1. Prepare Sector 1 */
-    s_iap_cmd[0] = 50;
-    s_iap_cmd[1] = PARAM_SECTOR;
-    s_iap_cmd[2] = PARAM_SECTOR;
-    iap_call(s_iap_cmd, s_iap_res);
-    if (s_iap_res[0] != 0) {
-        __asm volatile ("cpsie i" : : : "memory");
-        return false;
+    bool ok = iap_write_sector1(sector_buf, 256);
+    if (ok) {
+        /* Update active RAM cache ONLY when flash write was verified 100% in silicon */
+        strncpy(s_active_station_id, (char *)sector_buf, sizeof(s_active_station_id) - 1);
+        s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
     }
-
-    /* 2. Erase Sector 1 */
-    s_iap_cmd[0] = 52;
-    s_iap_cmd[1] = PARAM_SECTOR;
-    s_iap_cmd[2] = PARAM_SECTOR;
-    s_iap_cmd[3] = IAP_CLK_KHZ;
-    iap_call(s_iap_cmd, s_iap_res);
-    if (s_iap_res[0] != 0) {
-        __asm volatile ("cpsie i" : : : "memory");
-        return false;
-    }
-
-    /* 3. Prepare Sector 1 again before write */
-    s_iap_cmd[0] = 50;
-    s_iap_cmd[1] = PARAM_SECTOR;
-    s_iap_cmd[2] = PARAM_SECTOR;
-    iap_call(s_iap_cmd, s_iap_res);
-    if (s_iap_res[0] != 0) {
-        __asm volatile ("cpsie i" : : : "memory");
-        return false;
-    }
-
-    /* 4. Copy RAM to Flash (256 bytes) */
-    s_iap_cmd[0] = 51;
-    s_iap_cmd[1] = PARAM_SECTOR_ADDR;
-    s_iap_cmd[2] = (unsigned long)sector_buf;
-    s_iap_cmd[3] = 256;
-    s_iap_cmd[4] = IAP_CLK_KHZ;
-    iap_call(s_iap_cmd, s_iap_res);
-
-    __asm volatile ("cpsie i" : : : "memory");
-
-    return (s_iap_res[0] == 0);
+    return ok;
 }
 
 bool flash_nvram_read(station_nvram_params_t *out_params)
@@ -231,49 +213,5 @@ bool flash_nvram_write(const station_nvram_params_t *in_params)
     memcpy(&ram_copy, in_params, sizeof(station_nvram_params_t));
     ram_copy.magic = PARAM_MAGIC;
 
-    /* Disable interrupts during Flash write */
-    __asm volatile ("cpsid i" : : : "memory");
-
-    /* 1. Prepare Sector 1 */
-    s_iap_cmd[0] = 50;
-    s_iap_cmd[1] = PARAM_SECTOR;
-    s_iap_cmd[2] = PARAM_SECTOR;
-    iap_call(s_iap_cmd, s_iap_res);
-    if (s_iap_res[0] != 0) {
-        __asm volatile ("cpsie i" : : : "memory");
-        return false;
-    }
-
-    /* 2. Erase Sector 1 */
-    s_iap_cmd[0] = 52;
-    s_iap_cmd[1] = PARAM_SECTOR;
-    s_iap_cmd[2] = PARAM_SECTOR;
-    s_iap_cmd[3] = IAP_CLK_KHZ;
-    iap_call(s_iap_cmd, s_iap_res);
-    if (s_iap_res[0] != 0) {
-        __asm volatile ("cpsie i" : : : "memory");
-        return false;
-    }
-
-    /* 3. Prepare Sector 1 again before write */
-    s_iap_cmd[0] = 50;
-    s_iap_cmd[1] = PARAM_SECTOR;
-    s_iap_cmd[2] = PARAM_SECTOR;
-    iap_call(s_iap_cmd, s_iap_res);
-    if (s_iap_res[0] != 0) {
-        __asm volatile ("cpsie i" : : : "memory");
-        return false;
-    }
-
-    /* 4. Copy RAM to Flash (256 bytes) */
-    s_iap_cmd[0] = 51;
-    s_iap_cmd[1] = PARAM_SECTOR_ADDR;
-    s_iap_cmd[2] = (unsigned long)&ram_copy;
-    s_iap_cmd[3] = 256;
-    s_iap_cmd[4] = IAP_CLK_KHZ;
-    iap_call(s_iap_cmd, s_iap_res);
-
-    __asm volatile ("cpsie i" : : : "memory");
-
-    return (s_iap_res[0] == 0);
+    return iap_write_sector1(&ram_copy, sizeof(ram_copy));
 }
