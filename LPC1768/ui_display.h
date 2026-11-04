@@ -25,9 +25,11 @@ void ui_display_init(void);
 void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_t *modem_stat);
 key_code_t ui_keypad_scan(void);
 
-/* Activity timer reset on user interactions */
+/* Activity timer and operator presence state */
 void ui_reset_activity_timer(void);
 bool ui_is_operator_active(void);
+bool ui_is_display_active(void);
+bool ui_is_operator_touched(void);
 
 /* Backlog tracking */
 uint32_t ui_get_backlog_count(void);

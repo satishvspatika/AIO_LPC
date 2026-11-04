@@ -8,6 +8,7 @@
 void storage_log_init(void);
 void storage_log_timer_step_10ms(void);
 void storage_log_drain_step(void);
+void storage_log_flush(void);
 
 /* Verbose debug logger */
 void storage_log_debug(const char *tag, const char *msg);

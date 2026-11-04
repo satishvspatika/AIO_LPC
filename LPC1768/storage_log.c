@@ -1,6 +1,7 @@
 #include "storage_log.h"
 #include "user_config.h"
 #include "ui_display.h"
+#include "intermcu_protocol.h"
 #include "ff.h"
 #include "diskio.h"
 #include "FreeRTOS.h"
@@ -42,13 +43,31 @@ void storage_log_debug(const char *tag, const char *msg)
 {
     if (!s_debug_dump_enabled || !msg) return;
 
+    /* Format timestamp: real date/time if synced, else FreeRTOS tick uptime */
+    char ts_str[24];
+    telemetry_data_t t;
+    if (intermcu_get_telemetry(&t) && strlen(t.present_time) >= 14 && strncmp(t.present_time, "20", 2) == 0 && t.present_time[2] != '0') {
+        snprintf(ts_str, sizeof(ts_str), "%.4s-%.2s-%.2s %.2s:%.2s:%.2s",
+                 t.present_time, t.present_time + 4, t.present_time + 6,
+                 t.present_time + 8, t.present_time + 10, t.present_time + 12);
+    } else {
+        uint32_t ticks = xTaskGetTickCount();
+        uint32_t sec = ticks / configTICK_RATE_HZ;
+        uint32_t h = sec / 3600;
+        uint32_t m = (sec % 3600) / 60;
+        uint32_t s = sec % 60;
+        uint32_t ms = (ticks % configTICK_RATE_HZ) * (1000 / configTICK_RATE_HZ);
+        snprintf(ts_str, sizeof(ts_str), "T+%02u:%02u:%02u.%03u", (unsigned int)h, (unsigned int)m, (unsigned int)s, (unsigned int)ms);
+    }
+
     /* Push string to ring buffer safely */
-    char line[160];
-    int len = snprintf(line, sizeof(line), "[%s] %s\r\n", tag ? tag : "SYS", msg);
+    char line[256];
+    int len = snprintf(line, sizeof(line), "[%s] [%s] %s\r\n", ts_str, tag ? tag : "SYS", msg);
     if (len <= 0) return;
     if (len >= (int)sizeof(line)) len = sizeof(line) - 1;
 
     taskENTER_CRITICAL();
+
     for (int i = 0; i < len; i++) {
         uint16_t next_head = (s_head + 1) % RING_BUFFER_SIZE;
         if (next_head != s_tail) {
@@ -58,6 +77,7 @@ void storage_log_debug(const char *tag, const char *msg)
             break; /* Buffer full, drop byte to avoid blocking */
         }
     }
+
     taskEXIT_CRITICAL();
 }
 
@@ -94,7 +114,7 @@ void storage_log_drain_step(void)
     if (f_open(&s_drain_file, DEBUG_LOG_FILENAME, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
         f_lseek(&s_drain_file, s_drain_file.fsize);
 
-        static char s_drain_buf[256];
+        static char s_drain_buf[512];
         uint16_t drain_idx = 0;
 
         taskENTER_CRITICAL();
@@ -118,6 +138,14 @@ void storage_log_drain_step(void)
             s_tail = (s_tail + 128) % RING_BUFFER_SIZE;
         }
         taskEXIT_CRITICAL();
+    }
+}
+
+void storage_log_flush(void)
+{
+    for (int i = 0; i < 5; i++) {
+        if (s_tail == s_head) break;
+        storage_log_drain_step();
     }
 }
 

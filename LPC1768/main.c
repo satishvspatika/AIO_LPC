@@ -189,7 +189,17 @@ static void vMain_Task(void *pvParameters)
 {
     (void)pvParameters;
 
-    storage_log_debug("BOOT", "AIO Unified Telemetry Firmware v6.1 Started");
+    char boot_info[128];
+    snprintf(boot_info, sizeof(boot_info), "AIO Telemetry Station %s Started (Station ID: %s, Profile: %s)",
+             FIRMWARE_VERSION, flash_nvram_get_station_id(),
+             (UNIT_CFG == KSNDMC_TRG) ? "KSNDMC_TRG" :
+             (UNIT_CFG == BIHAR_TRG) ? "BIHAR_TRG" : "KSNDMC_TWS");
+    storage_log_debug("BOOT", boot_info);
+
+    uint32_t bk_count = storage_backlog_get_pending_count();
+    char bk_info[64];
+    snprintf(bk_info, sizeof(bk_info), "Pending Backlogs in Storage: %u", (unsigned int)bk_count);
+    storage_log_debug("BOOT", bk_info);
 
     int last_transmitted_min = -1;
 
@@ -225,10 +235,11 @@ static void vMain_Task(void *pvParameters)
 
                 execute_slot_transmission(&telem);
 
-                /* If operator is not actively interacting with LCD/keypad, sleep system */
-                if (!ui_is_operator_active()) {
-                    storage_log_debug("PWR", "Slot transmission complete and no operator active -> sleeping ($f1;)");
+                /* If operator has not touched keypad (unattended slot wakeup), sleep system */
+                if (!ui_is_operator_touched()) {
+                    storage_log_debug("PWR", "Slot transmission complete and no operator keypress -> sleeping ($f1;)");
                     sim7600_power_off();
+                    storage_log_flush();
                     vTaskDelay(200 / portTICK_RATE_MS);
                     hal_power_sleep_system();
                 } else {
@@ -249,7 +260,7 @@ static void vModem_Task(void *pvParameters)
     storage_log_debug("MODEM", "Modem Supervisor Task Started");
 
     for (;;) {
-        if (ui_is_operator_active()) {
+        if (ui_is_display_active()) {
             sim7600_worker_step();
         }
         vTaskDelay(2000 / portTICK_RATE_MS);

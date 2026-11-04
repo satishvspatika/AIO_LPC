@@ -893,13 +893,29 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
         storage_log_debug("TCP", "Received server response (+IPD)");
         storage_log_http(s_http_capture);
 
+        /* Parse and log HTTP status line or first line of response */
+        char resp_line[128] = "";
+        char *http_ver = strstr(s_http_capture, "HTTP/1.");
+        if (http_ver) {
+            char *eol = strstr(http_ver, "\r\n");
+            size_t slen = eol ? (size_t)(eol - http_ver) : 32;
+            if (slen >= sizeof(resp_line)) slen = sizeof(resp_line) - 1;
+            strncpy(resp_line, http_ver, slen);
+            resp_line[slen] = '\0';
+        } else {
+            snprintf(resp_line, sizeof(resp_line), "%.60s", s_http_capture);
+        }
+        char log_resp[160];
+        snprintf(log_resp, sizeof(log_resp), "Server Status: %s", resp_line);
+        storage_log_debug("HTTP", log_resp);
+
         if (strstr(s_http_capture, "200 OK") ||
             strstr(s_http_capture, "Success") ||
             strstr(s_http_capture, "SUCCESS") ||
             strstr(s_http_capture, "accepted") ||
             strstr(s_http_capture, "ACCEPTED")) {
             success = true;
-            storage_log_debug("TCP", "HTTP POST Verified OK (200 / Success)");
+            storage_log_debug("HTTP", "HTTP POST Verified OK (200 / Success)");
 
             /* Extract server Date: header if present to update RTC */
             char *d_ptr = strstr(s_http_capture, "Date: ");
@@ -913,10 +929,10 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
                 }
             }
         } else {
-            storage_log_debug("TCP", "Response received but no 200 OK / Success matched");
+            storage_log_debug("HTTP", "Server response rejected (no 200 OK / Success matched)");
         }
     } else {
-        storage_log_debug("TCP", "HTTP Response timeout (no +IPD)!");
+        storage_log_debug("HTTP", "HTTP Response timeout (no +IPD received within 15s)!");
     }
 
     /* Step 8: Close TCP socket */

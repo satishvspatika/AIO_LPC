@@ -144,6 +144,7 @@ typedef enum {
 
 static bool s_lcd_initialized = false;
 static bool s_display_active = true;
+static bool s_operator_touched_key = false;
 static uint32_t s_inactivity_ticks = 0; /* 50ms ticks, 2 mins = 2400 */
 static size_t s_current_screen_idx = 0;
 
@@ -526,7 +527,17 @@ void ui_reset_activity_timer(void)
 
 bool ui_is_operator_active(void)
 {
+    return s_display_active && s_operator_touched_key;
+}
+
+bool ui_is_display_active(void)
+{
     return s_display_active;
+}
+
+bool ui_is_operator_touched(void)
+{
+    return s_operator_touched_key;
 }
 
 void ui_display_init(void)
@@ -544,6 +555,7 @@ void ui_display_init(void)
     sim7600_set_progress_callback(on_sms_progress);
     s_calib_tips = 0;
     s_display_active = true;
+    s_operator_touched_key = false;
     ui_reset_activity_timer();
 
     telemetry_data_t telem;
@@ -766,17 +778,21 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             s_current_screen_idx = 0;
             s_ui_mode = UI_MODE_BROWSE;
             s_display_active = true;
+            s_operator_touched_key = true;
             s_inactivity_ticks = 0;
+            storage_log_debug("UI", "Keypress detected: Display woke up from sleep");
         }
         return;
     }
 
     /* Auto-sleep after 2 minutes of inactivity (120s = 2400 ticks of 50ms) */
     if (key != KEY_NONE) {
+        s_operator_touched_key = true;
         s_inactivity_ticks = 0;
     } else if (s_status_sms_state != STATUS_UI_SENDING) {
         s_inactivity_ticks++;
         if (s_inactivity_ticks >= (120 * 20)) {
+            storage_log_debug("UI", "2-minute inactivity timeout reached -> entering auto-sleep");
             if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
                 lcd_command(0x0C);
             }
@@ -787,6 +803,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             sim7600_power_off(); /* Power off modem to turn off NETLIGHT */
             hal_power_sleep_system(); /* Sentry sleep command ($f1;) */
             s_display_active = false;
+            s_operator_touched_key = false;
             s_inactivity_ticks = 0;
             return;
         }
@@ -794,6 +811,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
 
     /* Global DSP key handler: Sleep display on demand */
     if (key == KEY_DSP) {
+        storage_log_debug("UI", "Operator pressed DSP key -> entering sleep");
         s_no_rf_popup_timer = 0;
         if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
             lcd_command(0x0C);
@@ -805,6 +823,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         sim7600_power_off();
         hal_power_sleep_system();
         s_display_active = false;
+        s_operator_touched_key = false;
         s_inactivity_ticks = 0;
         return;
     }
@@ -1022,6 +1041,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 }
             } else if (active_scr == SCR_SLEEP) {
                 /* Operator selected Sleep System */
+                storage_log_debug("UI", "Operator confirmed SLEEP SYSTEM? -> entering sleep");
                 lcd_command(0x80);
                 lcd_print("SYSTEM SLEEPING ");
                 lcd_command(0xC0);
@@ -1034,6 +1054,8 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 sim7600_power_off(); /* Cut modem rail */
                 hal_power_sleep_system(); /* Sentry sleep command ($f1;) */
                 s_display_active = false;
+                s_operator_touched_key = false;
+                s_inactivity_ticks = 0;
                 return;
             }
         }
