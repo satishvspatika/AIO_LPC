@@ -58,6 +58,7 @@ typedef enum {
     SCR_BATTERY,
     SCR_SOLAR,
     SCR_SIGNAL,
+    SCR_LAST_LOGGED,
     SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA,
@@ -78,6 +79,7 @@ static const screen_type_t s_screens[] = {
     SCR_BATTERY,
     SCR_SOLAR,
     SCR_SIGNAL,
+    SCR_LAST_LOGGED,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA,
     SCR_SLEEP
@@ -89,6 +91,7 @@ static const screen_type_t s_screens[] = {
     SCR_RAINFALL,       /* Shows ONLY Cumulative Rainfall */
     SCR_BATTERY,
     SCR_SIGNAL,
+    SCR_LAST_LOGGED,
     SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA,
@@ -101,6 +104,7 @@ static const screen_type_t s_screens[] = {
     SCR_RAINFALL,       /* Shows BOTH 15M and Cumulative Rainfall */
     SCR_BATTERY,
     SCR_SIGNAL,
+    SCR_LAST_LOGGED,
     SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA,
@@ -140,9 +144,48 @@ static uint16_t s_calib_last_raw_tips = 0;
 static bool s_calib_status_pass = true;
 static char s_calib_last_date[16] = "2026-01-01";
 
-/* Status SMS Feedback */
+/* Status SMS Feedback & Background Worker */
 static status_ui_state_t s_status_sms_state = STATUS_UI_IDLE;
 static uint32_t s_status_sms_timer = 0;
+static xTaskHandle s_sms_task_handle = NULL;
+static char s_status_sms_substep[20] = "PRESS EN TO SEND";
+static uint32_t s_anim_counter = 0;
+
+static void on_sms_progress(const char *step_text)
+{
+    if (step_text) {
+        strncpy(s_status_sms_substep, step_text, sizeof(s_status_sms_substep) - 1);
+        s_status_sms_substep[sizeof(s_status_sms_substep) - 1] = '\0';
+    }
+}
+
+static void vStatusSms_Task(void *pvParameters)
+{
+    (void)pvParameters;
+    telemetry_data_t t;
+    memset(&t, 0, sizeof(t));
+    intermcu_get_telemetry(&t);
+
+    modem_status_t m;
+    sim7600_get_status(&m);
+
+    bool ok = sim7600_transmit_status_sms(&t, m.csq_dbm);
+
+    if (sim7600_is_cancel_requested()) {
+        s_status_sms_state = STATUS_UI_IDLE;
+        strncpy(s_status_sms_substep, "CANCELLED       ", sizeof(s_status_sms_substep) - 1);
+        s_status_sms_timer = 20;
+    } else {
+        s_status_sms_state = ok ? STATUS_UI_SUCCESS : STATUS_UI_FAILED;
+        if (ok) {
+            strncpy(s_status_sms_substep, "STATUS SENT OK  ", sizeof(s_status_sms_substep) - 1);
+        }
+        s_status_sms_timer = 60; /* 3 seconds display */
+    }
+
+    s_sms_task_handle = NULL;
+    vTaskDelete(NULL);
+}
 
 volatile uint32_t g_dbg_last_key = 0;
 volatile uint32_t g_dbg_cols_r0 = 7;
@@ -410,6 +453,10 @@ void ui_display_init(void)
     s_ui_mode = UI_MODE_BROWSE;
     s_status_sms_state = STATUS_UI_IDLE;
     s_status_sms_timer = 0;
+    s_sms_task_handle = NULL;
+    s_anim_counter = 0;
+    strncpy(s_status_sms_substep, "PRESS EN TO SEND", sizeof(s_status_sms_substep) - 1);
+    sim7600_set_progress_callback(on_sms_progress);
     s_calib_tips = 0;
     s_display_active = true;
     ui_reset_activity_timer();
@@ -484,18 +531,35 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 break;
 
             case SCR_BATTERY:
-                snprintf(line1, sizeof(line1), "BAT1: %04.2f V", telemetry->bat1_volt);
-                snprintf(line2, sizeof(line2), "STATUS: NORMAL");
+                snprintf(line1, sizeof(line1), "BATTERY VOLTAGE ");
+                snprintf(line2, sizeof(line2), "    %04.2f V    ", telemetry->bat1_volt);
                 break;
 
             case SCR_SOLAR:
-                snprintf(line1, sizeof(line1), "SOLAR: %04.2f V", telemetry->solar_volt);
-                snprintf(line2, sizeof(line2), "CHG: %s", (telemetry->solar_status == 'C') ? "CHARGING" : "STANDBY");
+                snprintf(line1, sizeof(line1), "SOLAR VOLTAGE   ");
+                if (telemetry->solar_volt > 1.0f) {
+                    snprintf(line2, sizeof(line2), "%04.2fV %s",
+                             telemetry->solar_volt,
+                             (telemetry->solar_status == 'C' || telemetry->solar_status == 'Y') ? "CHARGING" : "STANDBY");
+                } else {
+                    snprintf(line2, sizeof(line2), "    STANDBY     ");
+                }
                 break;
 
             case SCR_SIGNAL:
-                snprintf(line1, sizeof(line1), "SIGNAL: %d dBm", csq_dbm);
-                snprintf(line2, sizeof(line2), "REG: 4G HOME");
+                if (csq_dbm <= -113) {
+                    snprintf(line1, sizeof(line1), "SIGNAL: NO NET  ");
+                    snprintf(line2, sizeof(line2), "REG: SEARCHING  ");
+                } else {
+                    snprintf(line1, sizeof(line1), "SIGNAL: %d dBm  ", csq_dbm);
+                    snprintf(line2, sizeof(line2), "REG: 4G HOME    ");
+                }
+                break;
+
+            case SCR_LAST_LOGGED:
+                snprintf(line1, sizeof(line1), "LAST LOGGED AT  ");
+                const char *last_log = flash_nvram_get_last_logged();
+                snprintf(line2, sizeof(line2), "%-16.16s", (last_log && last_log[0]) ? last_log : "NO DATA YET");
                 break;
 
             case SCR_FIELD_CALIB:
@@ -504,14 +568,24 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 break;
 
             case SCR_SEND_STATUS:
-                snprintf(line1, sizeof(line1), "SEND STATUS SMS");
                 if (s_status_sms_state == STATUS_UI_SENDING) {
-                    snprintf(line2, sizeof(line2), "SENDING STATUS..");
+                    static const char *anim_dots[] = {
+                        "SEND STATUS     ",
+                        "SEND STATUS .   ",
+                        "SEND STATUS ..  ",
+                        "SEND STATUS ... "
+                    };
+                    int f = (s_anim_counter / 6) % 4;
+                    snprintf(line1, sizeof(line1), "%s", anim_dots[f]);
+                    snprintf(line2, sizeof(line2), "%-16.16s", s_status_sms_substep);
                 } else if (s_status_sms_state == STATUS_UI_SUCCESS) {
+                    snprintf(line1, sizeof(line1), "SEND STATUS SMS ");
                     snprintf(line2, sizeof(line2), "STATUS SENT OK  ");
                 } else if (s_status_sms_state == STATUS_UI_FAILED) {
-                    snprintf(line2, sizeof(line2), "STATUS FAILED   ");
+                    snprintf(line1, sizeof(line1), "SEND STATUS SMS ");
+                    snprintf(line2, sizeof(line2), "%-16.16s", (s_status_sms_substep[0]) ? s_status_sms_substep : "STATUS FAILED   ");
                 } else {
+                    snprintf(line1, sizeof(line1), "SEND STATUS SMS ");
                     snprintf(line2, sizeof(line2), "PRESS EN TO SEND");
                 }
                 break;
@@ -549,6 +623,8 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
 
 void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const char *ip_addr)
 {
+    s_anim_counter++;
+
     /* Countdown timer for status SMS result message */
     if (s_status_sms_timer > 0) {
         s_status_sms_timer--;
@@ -760,6 +836,12 @@ void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const 
                 s_current_screen_idx = 0;
             }
         } else if (key == KEY_BACK) {
+            if (s_status_sms_state == STATUS_UI_SENDING) {
+                sim7600_request_cancel();
+                s_status_sms_state = STATUS_UI_IDLE;
+                strncpy(s_status_sms_substep, "SEND CANCELLED  ", sizeof(s_status_sms_substep) - 1);
+                s_status_sms_timer = 20; /* 1.0s display */
+            }
             s_current_screen_idx = 0;
         } else if (key == KEY_EN) {
             screen_type_t active_scr = s_screens[s_current_screen_idx];
@@ -790,13 +872,12 @@ void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const 
                 /* Prompt Erase Confirmation */
                 s_ui_mode = UI_MODE_ERASE_CONFIRM;
             } else if (active_scr == SCR_SEND_STATUS) {
-                /* Transmit Status SMS */
-                s_status_sms_state = STATUS_UI_SENDING;
-                render_screen(active_scr, telemetry, csq_dbm, ip_addr);
-
-                bool ok = sim7600_transmit_status_sms(telemetry, csq_dbm);
-                s_status_sms_state = ok ? STATUS_UI_SUCCESS : STATUS_UI_FAILED;
-                s_status_sms_timer = 60; /* 60 * 50ms = 3.0s */
+                /* Transmit Status SMS Asynchronously in FreeRTOS Task (keeps UI responsive) */
+                if (s_status_sms_state != STATUS_UI_SENDING && s_sms_task_handle == NULL) {
+                    s_status_sms_state = STATUS_UI_SENDING;
+                    strncpy(s_status_sms_substep, "MODEM POWER ON  ", sizeof(s_status_sms_substep) - 1);
+                    xTaskCreate(vStatusSms_Task, (const signed char *)"SmsTask", 512, NULL, 1, &s_sms_task_handle);
+                }
             } else if (active_scr == SCR_SLEEP) {
                 /* Operator selected Sleep System */
                 hal_power_sleep_system();

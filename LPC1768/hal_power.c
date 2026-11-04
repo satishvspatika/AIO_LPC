@@ -35,6 +35,11 @@ void hal_power_init(void)
 
     UART_TxCmd(LPC_UART3, ENABLE);
 
+    /* Enable UART3 RX Interrupt for reliable non-blocking inter-MCU frame reception */
+    UART_IntConfig(LPC_UART3, UART_INTCFG_RBR, ENABLE);
+    NVIC_SetPriority(UART3_IRQn, 6);
+    NVIC_EnableIRQ(UART3_IRQn);
+
     /* Ensure 5V LCD power rail is active on LPC845 coprocessor */
     hal_power_lcd_on();
 }

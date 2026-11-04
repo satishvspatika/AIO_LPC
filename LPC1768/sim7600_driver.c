@@ -41,11 +41,36 @@ static void delay_ms(uint32_t ms)
     vTaskDelay((ms + portTICK_RATE_MS - 1) / portTICK_RATE_MS);
 }
 
+static sim7600_progress_cb_t s_progress_cb = NULL;
+static volatile bool s_cancel_requested = false;
+
+void sim7600_set_progress_callback(sim7600_progress_cb_t cb)
+{
+    s_progress_cb = cb;
+}
+
+void sim7600_request_cancel(void)
+{
+    s_cancel_requested = true;
+}
+
+bool sim7600_is_cancel_requested(void)
+{
+    return s_cancel_requested;
+}
+
+static void report_progress(const char *msg)
+{
+    if (s_progress_cb && msg) {
+        s_progress_cb(msg);
+    }
+}
+
 void UART2_IRQHandler(void)
 {
     uint32_t int_id = (UART_MODEM->IIR & UART_IIR_INTID_MASK);
     if (int_id == UART_IIR_INTID_RDA || int_id == UART_IIR_INTID_CTI) {
-        while (UART_CheckBusy(UART_MODEM) || (LPC_UART2->LSR & UART_LSR_RDR)) {
+        while (LPC_UART2->LSR & UART_LSR_RDR) {
             uint8_t c = (uint8_t)LPC_UART2->RBR;
             uint16_t next = (s_rx_head + 1) % RX_BUFFER_SIZE;
             if (next != s_rx_tail) {
@@ -145,6 +170,8 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
 
 bool sim7600_power_on(void)
 {
+    report_progress("MODEM POWER ON ");
+
     /* 1. Turn ON 3.8V rail via LPC845 sentry command ($n2;) */
     hal_power_modem_on();
 
@@ -155,12 +182,17 @@ bool sim7600_power_on(void)
     LPC_GPIO0->FIODIR |= (1UL << PIN_GPRS_POWER);
 
     /* Allow SIM multiplexer and power supply 2.0s to settle */
-    delay_ms(2000);
+    for (int i = 0; i < 20; i++) {
+        if (sim7600_is_cancel_requested()) return false;
+        delay_ms(100);
+    }
 
     /* 3. Probe modem with "AT" once per second up to 30s or until RDY/OK */
+    report_progress("AT PROBING...   ");
     clear_rx();
     bool modem_ready = false;
     for (int i = 0; i < 30; i++) {
+        if (sim7600_is_cancel_requested()) return false;
         send_raw("AT\r\n");
         if (wait_response("OK", 800, NULL, 0) || wait_response("RDY", 200, NULL, 0)) {
             modem_ready = true;
@@ -171,8 +203,11 @@ bool sim7600_power_on(void)
 
     if (!modem_ready) {
         storage_log_debug("MODEM", "Modem unresponsive to AT probes");
+        report_progress("AT PROBE FAILED ");
         return false;
     }
+
+    report_progress("MODEM READY     ");
 
     /* 4. Basic modem synchronization */
     send_raw("ATE0\r\n");               /* Echo OFF */
@@ -183,9 +218,11 @@ bool sim7600_power_on(void)
     wait_response("OK", 500, NULL, 0);
 
     /* 5. Check SIM Card Readiness (AT+CPIN?) */
+    report_progress("CHECKING SIM... ");
     char capture[256];
     bool sim_ready = false;
     for (int i = 0; i < 10; i++) {
+        if (sim7600_is_cancel_requested()) return false;
         clear_rx();
         send_raw("AT+CPIN?\r\n");
         if (wait_response("+CPIN: READY", 1000, NULL, 0)) {
@@ -205,6 +242,8 @@ bool sim7600_power_on(void)
         wait_response("OK", 5000, NULL, 0);
         delay_ms(2000);
     }
+
+    report_progress("SIM READY       ");
 
     /* 6. Read ICCID and IMSI for Smart APN Resolution */
     char imsi[20] = "";
@@ -271,8 +310,10 @@ bool sim7600_power_on(void)
     wait_response("OK", 1000, NULL, 0);
 
     /* 8. Registration Polling (check both LTE CEREG and GSM/GPRS CGREG) */
+    report_progress("SEARCHING NET...");
     bool registered = false;
     for (int i = 0; i < 20; i++) {
+        if (sim7600_is_cancel_requested()) return false;
         clear_rx();
         send_raw("AT+CEREG?\r\n");
         if (wait_response("+CEREG: ", 1000, capture, sizeof(capture))) {
@@ -294,11 +335,13 @@ bool sim7600_power_on(void)
 
     if (!registered) {
         storage_log_debug("MODEM", "LTE registration pending, falling back to 2G/GSM (CNMP=13)");
+        report_progress("TRYING 2G/GSM...");
         send_raw("AT+CNMP=13\r\n");
         wait_response("OK", 1000, NULL, 0);
         delay_ms(2000);
 
         for (int i = 0; i < 15; i++) {
+            if (sim7600_is_cancel_requested()) return false;
             clear_rx();
             send_raw("AT+CGREG?\r\n");
             if (wait_response("+CGREG: ", 1000, capture, sizeof(capture))) {
@@ -311,7 +354,14 @@ bool sim7600_power_on(void)
         }
     }
 
+    if (registered) {
+        report_progress("NET REGISTERED  ");
+    } else {
+        report_progress("NO NETWORK      ");
+    }
+
     /* 9. Read Signal Quality (AT+CSQ) */
+    report_progress("READING CSQ...  ");
     clear_rx();
     send_raw("AT+CSQ\r\n");
     if (wait_response("+CSQ:", 1000, capture, sizeof(capture))) {
@@ -501,16 +551,48 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
 {
     if (!telem) return false;
 
+    s_cancel_requested = false;
+    report_progress("STARTING SMS... ");
+
     bool we_powered = false;
     /* Ensure modem is powered on and registered */
     if (!s_modem_status.is_registered) {
         storage_log_debug("SMS", "Modem idle, booting SIM7600 for status SMS...");
-        if (!sim7600_power_on()) {
+        if (!sim7600_power_on() || sim7600_is_cancel_requested()) {
             storage_log_debug("SMS", "Failed to boot/register modem for SMS!");
+            report_progress(sim7600_is_cancel_requested() ? "SEND CANCELLED  " : "MODEM FAIL      ");
+            sim7600_power_off();
             return false;
         }
         we_powered = true;
     }
+
+    if (sim7600_is_cancel_requested()) {
+        report_progress("SEND CANCELLED  ");
+        if (we_powered) sim7600_power_off();
+        return false;
+    }
+
+    /* Refresh live CSQ before composing status SMS */
+    report_progress("READING CSQ...  ");
+    clear_rx();
+    send_raw("AT+CSQ\r\n");
+    char csq_cap[64];
+    if (wait_response("+CSQ:", 1000, csq_cap, sizeof(csq_cap))) {
+        int csq = 99, ber = 99;
+        char *p = strstr(csq_cap, "+CSQ: ");
+        if (p) {
+            sscanf(p, "+CSQ: %d,%d", &csq, &ber);
+            s_modem_status.csq_val = csq;
+            s_modem_status.csq_dbm = (csq == 99) ? -113 : (-113 + 2 * csq);
+            csq_dbm = s_modem_status.csq_dbm;
+        }
+    }
+
+    char csq_step[17];
+    snprintf(csq_step, sizeof(csq_step), "CSQ: %d dBm    ", csq_dbm);
+    report_progress(csq_step);
+    delay_ms(500);
 
     const char *dest_phone = STATUS_SMS_DEST_NUMBER;
     const char *network_name = STATUS_SMS_NETWORK_NAME;
@@ -558,9 +640,18 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
         slot_iso
     );
 
+    report_progress("SENDING SMS...  ");
     storage_log_debug("SMS", status_msg);
     bool ok = sim7600_send_sms(dest_phone, status_msg);
+    if (ok) {
+        report_progress("STATUS SENT OK  ");
+    } else {
+        report_progress("STATUS FAILED   ");
+    }
+
     if (we_powered) {
+        delay_ms(1500);
+        report_progress("MODEM POWER OFF ");
         sim7600_power_off();
     }
     return ok;

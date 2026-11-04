@@ -24,6 +24,12 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
 /* Query live modem status */
 void sim7600_get_status(modem_status_t *out_status);
 
+/* Sub-step progress hook & cancellation for UI responsiveness */
+typedef void (*sim7600_progress_cb_t)(const char *step_text);
+void sim7600_set_progress_callback(sim7600_progress_cb_t cb);
+void sim7600_request_cancel(void);
+bool sim7600_is_cancel_requested(void);
+
 /* SMS Engine */
 void sanitize_phone_number(char *dest, const char *src, size_t dest_size);
 bool sim7600_send_sms(const char *dest_phone, const char *message);

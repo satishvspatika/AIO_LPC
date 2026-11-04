@@ -1,5 +1,6 @@
 #include "intermcu_protocol.h"
 #include "user_config.h"
+#include "lpc17xx_uart.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -13,6 +14,18 @@ static bool s_in_frame = false;
 static telemetry_data_t s_latest_telemetry = {0};
 static float s_daily_cumulative_rain_mm = 0.0f;
 static int s_last_reset_day = -1;
+
+/* Hardware Interrupt Handler for Inter-MCU UART3 (P4.28/P4.29) */
+void UART3_IRQHandler(void)
+{
+    uint32_t int_id = (LPC_UART3->IIR & UART_IIR_INTID_MASK);
+    if (int_id == UART_IIR_INTID_RDA || int_id == UART_IIR_INTID_CTI) {
+        while (LPC_UART3->LSR & UART_LSR_RDR) {
+            uint8_t c = (uint8_t)LPC_UART3->RBR;
+            intermcu_process_byte(c);
+        }
+    }
+}
 
 void intermcu_protocol_init(void)
 {
@@ -100,7 +113,16 @@ static void parse_d_packet(const char *frame)
         s_daily_cumulative_rain_mm += s_latest_telemetry.rf_15m_mm;
         s_latest_telemetry.rf_cum_mm = s_daily_cumulative_rain_mm;
 
-        s_latest_telemetry.bat1_volt = bat1_raw / 100.0f;
+        /* Battery 1 Voltage (R1=15k, R2=2.2k -> ratio 0.128, 12-bit ADC 0..4095 at 3.3V) */
+        float b1 = 0.0f;
+        if (sc_bat1_raw > 0) {
+            b1 = (((float)sc_bat1_raw * 3.3f / 4095.0f) / 0.128f);
+        }
+        if (b1 < 2.0f && bat1_raw > 0) {
+            b1 = (((float)bat1_raw * 3.3f / 4095.0f) / 0.128f);
+        }
+        s_latest_telemetry.bat1_volt = b1;
+
         s_latest_telemetry.temp_c = ltemp_raw / 10.0f;
         s_latest_telemetry.humidity_pct = lhum_raw / 10.0f;
         s_latest_telemetry.wind_speed_avg = lws_raw / 10.0f;
@@ -111,7 +133,13 @@ static void parse_d_packet(const char *frame)
         s_latest_telemetry.gprs_power_flag = gprs_flag;
         s_latest_telemetry.usb_power_flag = usb_flag;
         s_latest_telemetry.lpc845_ver = ver_code;
-        s_latest_telemetry.solar_volt = solar_raw / 100.0f;
+
+        /* Solar Voltage (R1=15k, R2=2.2k -> ratio 0.128) */
+        float sol = 0.0f;
+        if (solar_raw > 0) {
+            sol = (((float)solar_raw * 3.3f / 4095.0f) / 0.128f);
+        }
+        s_latest_telemetry.solar_volt = sol;
         s_latest_telemetry.solar_status = solar_state;
         s_latest_telemetry.is_valid = true;
     }

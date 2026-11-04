@@ -107,7 +107,21 @@ static void vMain_Task(void *pvParameters)
                     storage_archive_slot(date6, payload);
                 }
 
-
+                /* Persist Last Logged date/time in Sector 1 Flash NVRAM (survives power off) */
+                char last_log_ts[20] = "";
+                if (strlen(telem.slot_time) >= 12) {
+                    snprintf(last_log_ts, sizeof(last_log_ts), "%.2s-%.2s-%.4s %.2s:%.2s",
+                             telem.slot_time + 6, telem.slot_time + 4, telem.slot_time,
+                             telem.slot_time + 8, telem.slot_time + 10);
+                } else if (strlen(telem.present_time) >= 12) {
+                    snprintf(last_log_ts, sizeof(last_log_ts), "%.2s-%.2s-%.4s %.2s:%.2s",
+                             telem.present_time + 6, telem.present_time + 4, telem.present_time,
+                             telem.present_time + 8, telem.present_time + 10);
+                }
+                if (last_log_ts[0] != '\0') {
+                    flash_nvram_set_last_logged(last_log_ts);
+                    storage_log_debug("NVRAM", "Saved Last Logged timestamp to Sector 1 Flash");
+                }
             } else {
                 storage_log_debug("HTTP", "Transmission failed, falling back to storage");
             }
@@ -137,15 +151,11 @@ static void vMain_Task(void *pvParameters)
 static void vUart3_Task(void *pvParameters)
 {
     (void)pvParameters;
-    uint8_t rx_byte;
 
     for (;;) {
-        uint32_t len = UART_Receive(LPC_UART3, &rx_byte, 1, NONE_BLOCKING);
-        if (len > 0) {
-            intermcu_process_byte(rx_byte);
-        } else {
-            vTaskDelay(5 / portTICK_RATE_MS);
-        }
+        /* Hardware ISR UART3_IRQHandler handles all incoming bytes from LPC845 in real-time.
+         * Periodic sleep keeps task context alive. */
+        vTaskDelay(1000 / portTICK_RATE_MS);
     }
 }
 
