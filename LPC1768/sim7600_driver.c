@@ -15,7 +15,7 @@
 
 #define UART_MODEM      LPC_UART2
 #define PIN_SIM_SEL     0       /* P0.0: SIM select (Output LOW = Holder J1A) */
-#define PIN_GPRS_POWER  1       /* P0.1: GPRS power enable (Output HIGH) */
+#define PIN_PWR_KEY     1       /* P0.1: SIM7600 PWRKEY (Active LOW pulse, resting HIGH) */
 
 #define RX_BUFFER_SIZE  2048
 static char s_rx_buf[RX_BUFFER_SIZE];
@@ -131,11 +131,11 @@ void sim7600_init(void)
     LPC_GPIO0->FIOCLR = (1UL << PIN_SIM_SEL);   /* LOW = Holder J1A */
     LPC_GPIO0->FIODIR |= (1UL << PIN_SIM_SEL);  /* Output */
 
-    /* P0.1: GPRS_POWER (GPIO output driven HIGH) */
-    pin_cfg.Pinnum = PIN_GPRS_POWER;
+    /* P0.1: SIM7600 PWRKEY (GPIO output resting HIGH, active LOW pulse) */
+    pin_cfg.Pinnum = PIN_PWR_KEY;
     PINSEL_ConfigPin(&pin_cfg);
-    LPC_GPIO0->FIOSET = (1UL << PIN_GPRS_POWER); /* HIGH = Power ON */
-    LPC_GPIO0->FIODIR |= (1UL << PIN_GPRS_POWER);/* Output */
+    LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY); /* Default resting HIGH */
+    LPC_GPIO0->FIODIR |= (1UL << PIN_PWR_KEY);/* Output */
 
     /* Immediately request LPC845 sentry to activate 3.8V switching regulator on boot */
     hal_power_modem_on();
@@ -302,11 +302,25 @@ bool sim7600_power_on(void)
     /* 1. Turn ON 3.8V rail via LPC845 sentry command ($n2;) */
     hal_power_modem_on();
 
-    /* 2. Select SIM holder J1A (P0.0 LOW) and enable GPRS power circuit (P0.1 HIGH) */
+    /* 2. Select SIM holder J1A (P0.0 LOW) */
     LPC_GPIO0->FIOCLR = (1UL << PIN_SIM_SEL);       /* Driven LOW = Holder J1A */
     LPC_GPIO0->FIODIR |= (1UL << PIN_SIM_SEL);
-    LPC_GPIO0->FIOSET = (1UL << PIN_GPRS_POWER);    /* Driven HIGH = Power ON */
-    LPC_GPIO0->FIODIR |= (1UL << PIN_GPRS_POWER);
+
+    /* Ensure PWRKEY pin P0.1 is configured as output resting HIGH */
+    LPC_GPIO0->FIODIR |= (1UL << PIN_PWR_KEY);
+    LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
+
+    /* 3. Probe if modem is already running */
+    clear_rx();
+    send_raw("AT\r\n");
+    if (!wait_response("OK", 500, NULL, 0)) {
+        /* Modem is asleep: pulse PWRKEY LOW for 500ms to boot SIM7600 */
+        storage_log_debug("MODEM", "Modem idle, pulsing PWRKEY LOW (500ms) to power on...");
+        LPC_GPIO0->FIOCLR = (1UL << PIN_PWR_KEY);
+        delay_ms(500);
+        LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
+        delay_ms(500);
+    }
 
     /* Allow SIM multiplexer and power supply 2.0s to settle */
     for (int i = 0; i < 20; i++) {
@@ -314,7 +328,7 @@ bool sim7600_power_on(void)
         delay_ms(100);
     }
 
-    /* 3. Probe modem with "AT" once per second up to 30s or until RDY/OK */
+    /* 4. Probe modem with "AT" once per second up to 30s or until RDY/OK */
     report_progress("AT PROBING...   ");
     clear_rx();
     bool modem_ready = false;
@@ -536,28 +550,6 @@ bool sim7600_power_on(void)
     return registered;
 }
 
-void sim7600_power_off(void)
-{
-    send_raw("AT+CIPCLOSE=0\r\n");
-    wait_response("OK", 1000, NULL, 0);
-
-    send_raw("AT+NETCLOSE\r\n");
-    wait_response("OK", 1000, NULL, 0);
-
-    /* Software Power Off */
-    send_raw("AT+CPOF\r\n");
-    wait_response("OK", 2000, NULL, 0);
-
-    /* Turn OFF P0.1 (GPRS_POWER) */
-    LPC_GPIO0->FIOCLR = (1UL << PIN_GPRS_POWER);
-
-    /* Cut 3.8V rail via LPC845 sentry ($f2;) */
-    hal_power_modem_off();
-    s_modem_status.is_registered = false;
-    s_modem_status.is_pdp_active = false;
-    strncpy(s_modem_status.carrier, "OFFLINE", sizeof(s_modem_status.carrier) - 1);
-}
-
 typedef enum {
     MODEM_ST_UNINIT = 0,
     MODEM_ST_PROBING,
@@ -568,6 +560,49 @@ typedef enum {
 static modem_worker_state_t s_worker_state = MODEM_ST_UNINIT;
 static bool s_time_synced_flag = false;
 static uint32_t s_cclk_poll_counter = 0;
+
+void sim7600_power_off(void)
+{
+    storage_log_debug("MODEM", "Powering down SIM7600 cellular engine...");
+
+    clear_rx();
+    send_raw("AT+CIPCLOSE=0\r\n");
+    wait_response("OK", 500, NULL, 0);
+
+    clear_rx();
+    send_raw("AT+NETCLOSE\r\n");
+    wait_response("OK", 500, NULL, 0);
+
+    /* Software Power Off: AT+CPOF */
+    clear_rx();
+    send_raw("AT+CPOF\r\n");
+    bool cpof_ok = wait_response("OK", 3000, NULL, 0) || wait_response("MS OFF", 1000, NULL, 0);
+
+    /* Hardware fallback: pulse PWRKEY (P0.1) LOW for 2.5s if AT+CPOF failed */
+    if (!cpof_ok) {
+        storage_log_debug("MODEM", "AT+CPOF unconfirmed, pulsing PWRKEY (P0.1) LOW for 2.5s...");
+        LPC_GPIO0->FIOCLR = (1UL << PIN_PWR_KEY);
+        delay_ms(2500);
+        LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
+        delay_ms(500);
+    } else {
+        /* Ensure PWRKEY returns to resting HIGH */
+        LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
+        delay_ms(500);
+    }
+
+    /* Cut 3.8V rail via LPC845 sentry ($f2;) */
+    hal_power_modem_off();
+
+    /* Reset worker state so supervisor does not poll while powered down */
+    s_worker_state = MODEM_ST_UNINIT;
+    s_modem_status.is_registered = false;
+    s_modem_status.is_pdp_active = false;
+    s_modem_status.csq_val = 99;
+    s_modem_status.csq_dbm = -113;
+    strncpy(s_modem_status.carrier, "OFFLINE", sizeof(s_modem_status.carrier) - 1);
+    storage_log_debug("MODEM", "SIM7600 power down complete. NETLIGHT off.");
+}
 
 void sim7600_worker_step(void)
 {
@@ -580,8 +615,18 @@ void sim7600_worker_step(void)
             hal_power_modem_on();
             LPC_GPIO0->FIOCLR = (1UL << PIN_SIM_SEL);
             LPC_GPIO0->FIODIR |= (1UL << PIN_SIM_SEL);
-            LPC_GPIO0->FIOSET = (1UL << PIN_GPRS_POWER);
-            LPC_GPIO0->FIODIR |= (1UL << PIN_GPRS_POWER);
+            LPC_GPIO0->FIODIR |= (1UL << PIN_PWR_KEY);
+            LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
+
+            /* Check if already responsive; if not, pulse PWRKEY LOW for 500ms */
+            clear_rx();
+            send_raw("AT\r\n");
+            if (!wait_response("OK", 400, NULL, 0)) {
+                LPC_GPIO0->FIOCLR = (1UL << PIN_PWR_KEY);
+                delay_ms(500);
+                LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
+                delay_ms(500);
+            }
             s_worker_state = MODEM_ST_PROBING;
             break;
 
