@@ -30,8 +30,8 @@
 #endif
 
 /* Firmware Version Identifier */
-#define FIRMWARE_VERSION    "AIO_6.0.9"
-#define LCD_VERSION_STRING  "v6.0.9"
+#define FIRMWARE_VERSION    "AIO_6.1.0"
+#define LCD_VERSION_STRING  "v6.1.0"
 #define STATION_ID_DEFAULT  "001922"
 
 /* Status SMS Destination & Network Identifiers */
@@ -45,9 +45,9 @@
 
 /* Debug Dump Engine Settings */
 #define SDC_DEBUG_DUMP_DEFAULT  1       /* 1 = verbose debug dump enabled by default */
-#define DEBUG_LOG_FILENAME      "/debuglog.txt"
-#define HTTP_LOG_FILENAME       "/httplog.txt"
-#define DEBUG_TRIGGER_FILENAME  "/DEBUG.TXT"
+#define DEBUG_LOG_FILENAME      "DEBUG.TXT"
+#define HTTP_LOG_FILENAME       "HTTPLOG.TXT"
+#define DEBUG_TRIGGER_FILENAME  "DEBUG.TXT"
 
 /* Timing & Safety Watchdog Limits (in milliseconds) */
 #define WDT_PERIODIC_LIMIT_MS   (11 * 60 * 1000)  /* 11-min hard power cutoff */

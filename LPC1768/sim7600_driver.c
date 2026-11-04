@@ -216,6 +216,8 @@ bool sim7600_power_on(void)
     wait_response("OK", 500, NULL, 0);
     send_raw("AT+CGEREP=0\r\n");        /* Silence unsolicited packet domain reports */
     wait_response("OK", 500, NULL, 0);
+    send_raw("AT&D0\r\n");              /* Ignore DTR line to prevent PPP teardown */
+    wait_response("OK", 500, NULL, 0);
 
     /* 5. Check SIM Card Readiness (AT+CPIN?) */
     report_progress("CHECKING SIM... ");
@@ -301,63 +303,72 @@ bool sim7600_power_on(void)
     send_raw(apn_cmd);
     wait_response("OK", 2000, NULL, 0);
 
-    /* Also define PDP Context 5 as Network Default empty APN */
+    /* Also configure Socket PDP Context and Active Profile (critical for SIM7600 TCP stack) */
+    char sock_cmd[64];
+    snprintf(sock_cmd, sizeof(sock_cmd), "AT+CGSOCKCONT=1,\"IP\",\"%s\"\r\n", apn);
+    clear_rx();
+    send_raw(sock_cmd);
+    wait_response("OK", 2000, NULL, 0);
+
+    clear_rx();
+    send_raw("AT+CSOCKSETPN=1\r\n");
+    wait_response("OK", 1000, NULL, 0);
+
+    /* Define PDP Context 5 as Network Default empty APN */
     send_raw("AT+CGDCONT=5,\"IP\",\"\"\r\n");
     wait_response("OK", 1000, NULL, 0);
 
-    /* 7. Radio Mode Selection: 4G LTE-first (CNMP=38) with automatic 2G fallback (CNMP=13) */
-    send_raw("AT+CNMP=38\r\n");
+    /* 7. Radio Mode Selection: Automatic RAT selection (CNMP=2 allows seamless LTE/3G/2G attach) */
+    send_raw("AT+CNMP=2\r\n");
     wait_response("OK", 1000, NULL, 0);
 
-    /* 8. Registration Polling (check both LTE CEREG and GSM/GPRS CGREG) */
+    /* 8. Registration Polling (check LTE CEREG, GPRS CGREG, and GSM CREG) */
     report_progress("SEARCHING NET...");
     bool registered = false;
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < 25; i++) {
         if (sim7600_is_cancel_requested()) return false;
+
+        /* Check LTE CEREG */
         clear_rx();
         send_raw("AT+CEREG?\r\n");
-        if (wait_response("+CEREG: ", 1000, capture, sizeof(capture))) {
+        if (wait_response("+CEREG: ", 800, capture, sizeof(capture))) {
             if (strstr(capture, ",1") || strstr(capture, ",5")) {
                 registered = true;
+                storage_log_debug("MODEM", "Registered on LTE (+CEREG: 1/5)");
                 break;
             }
         }
+
+        /* Check GPRS CGREG */
         clear_rx();
         send_raw("AT+CGREG?\r\n");
-        if (wait_response("+CGREG: ", 1000, capture, sizeof(capture))) {
+        if (wait_response("+CGREG: ", 800, capture, sizeof(capture))) {
             if (strstr(capture, ",1") || strstr(capture, ",5")) {
                 registered = true;
+                storage_log_debug("MODEM", "Registered on GPRS (+CGREG: 1/5)");
                 break;
             }
         }
-        delay_ms(1000);
-    }
 
-    if (!registered) {
-        storage_log_debug("MODEM", "LTE registration pending, falling back to 2G/GSM (CNMP=13)");
-        report_progress("TRYING 2G/GSM...");
-        send_raw("AT+CNMP=13\r\n");
-        wait_response("OK", 1000, NULL, 0);
-        delay_ms(2000);
-
-        for (int i = 0; i < 15; i++) {
-            if (sim7600_is_cancel_requested()) return false;
-            clear_rx();
-            send_raw("AT+CGREG?\r\n");
-            if (wait_response("+CGREG: ", 1000, capture, sizeof(capture))) {
-                if (strstr(capture, ",1") || strstr(capture, ",5")) {
-                    registered = true;
-                    break;
-                }
+        /* Check GSM CREG */
+        clear_rx();
+        send_raw("AT+CREG?\r\n");
+        if (wait_response("+CREG: ", 800, capture, sizeof(capture))) {
+            if (strstr(capture, ",1") || strstr(capture, ",5")) {
+                registered = true;
+                storage_log_debug("MODEM", "Registered on GSM (+CREG: 1/5)");
+                break;
             }
-            delay_ms(1000);
         }
+
+        delay_ms(1000);
     }
 
     if (registered) {
         report_progress("NET REGISTERED  ");
     } else {
         report_progress("NO NETWORK      ");
+        storage_log_debug("MODEM", "Network registration timeout!");
     }
 
     /* 9. Read Signal Quality (AT+CSQ) */
@@ -371,6 +382,9 @@ bool sim7600_power_on(void)
             sscanf(p, "+CSQ: %d,%d", &csq, &ber);
             s_modem_status.csq_val = csq;
             s_modem_status.csq_dbm = (csq == 99) ? -113 : (-113 + 2 * csq);
+            char csq_msg[48];
+            snprintf(csq_msg, sizeof(csq_msg), "CSQ: %d (%d dBm)", csq, s_modem_status.csq_dbm);
+            storage_log_debug("MODEM", csq_msg);
         }
     }
 
@@ -429,25 +443,72 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
 {
     if (!endpoint || !payload) return false;
 
-    /* Open network */
-    clear_rx();
-    send_raw("AT+NETOPEN\r\n");
-    wait_response("OK", 3000, NULL, 0);
+    char log_msg[128];
+    char capture[256];
 
-    /* Open Layer-4 direct TCP socket */
-    char open_cmd[128];
-    snprintf(open_cmd, sizeof(open_cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%d\r\n", endpoint->ip, endpoint->port);
+    /* Step 1: Ensure IP Stack (NETOPEN) is active */
+    bool net_is_open = false;
     clear_rx();
-    send_raw(open_cmd);
-    if (!wait_response("+CIPOPEN: 0,0", 15000, NULL, 0)) {
-        storage_log_debug("TCP", "CIPOPEN failed!");
-        return false;
+    send_raw("AT+NETOPEN?\r\n");
+    if (wait_response("+NETOPEN:", 2000, capture, sizeof(capture))) {
+        if (strstr(capture, "+NETOPEN: 1")) {
+            net_is_open = true;
+            storage_log_debug("TCP", "NETOPEN already open (+NETOPEN: 1)");
+        }
     }
 
-    /* Sockets settling delay */
+    if (!net_is_open) {
+        clear_rx();
+        send_raw("AT+NETOPEN\r\n");
+        /* SIM7600 responds OK immediately, then asynchronously +NETOPEN: 0 on bearer activation */
+        if (wait_response("+NETOPEN: 0", 20000, capture, sizeof(capture)) ||
+            strstr(capture, "already opened")) {
+            storage_log_debug("TCP", "NETOPEN successful (+NETOPEN: 0)");
+            net_is_open = true;
+        } else {
+            snprintf(log_msg, sizeof(log_msg), "NETOPEN failed! (Response: %.60s)", capture);
+            storage_log_debug("TCP", log_msg);
+            return false;
+        }
+    }
+
+    /* Step 2: Query IP address for verification */
+    clear_rx();
+    send_raw("AT+IPADDR\r\n");
+    if (wait_response("+IPADDR:", 3000, capture, sizeof(capture))) {
+        char *p = strstr(capture, "+IPADDR: ");
+        if (p) {
+            char ip_str[32] = "";
+            sscanf(p, "+IPADDR: %31s", ip_str);
+            snprintf(log_msg, sizeof(log_msg), "Assigned IP: %s", ip_str);
+            storage_log_debug("TCP", log_msg);
+            strncpy(s_modem_status.ip_addr, ip_str, sizeof(s_modem_status.ip_addr) - 1);
+        }
+    }
+
+    /* Step 3: Close any stale socket 0 connection */
+    send_raw("AT+CIPCLOSE=0\r\n");
+    wait_response("OK", 1000, NULL, 0);
+    delay_ms(100);
+
+    /* Step 4: Open Layer-4 direct TCP socket to endpoint */
+    char open_cmd[128];
+    snprintf(open_cmd, sizeof(open_cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%d\r\n", endpoint->ip, endpoint->port);
+    snprintf(log_msg, sizeof(log_msg), "Connecting to %s:%d...", endpoint->ip, endpoint->port);
+    storage_log_debug("TCP", log_msg);
+
+    clear_rx();
+    send_raw(open_cmd);
+    if (!wait_response("+CIPOPEN: 0,0", 20000, capture, sizeof(capture))) {
+        snprintf(log_msg, sizeof(log_msg), "CIPOPEN failed! (Response: %.60s)", capture);
+        storage_log_debug("TCP", log_msg);
+        return false;
+    }
+    storage_log_debug("TCP", "TCP socket connected (+CIPOPEN: 0,0 OK)!");
+
     delay_ms(150);
 
-    /* Build HTTP Request Headers */
+    /* Step 5: Format HTTP Request Headers */
     const char *content_type = (endpoint->format == FORMAT_JSON) ? "application/json" : "application/x-www-form-urlencoded";
     int req_len = snprintf(s_http_req, sizeof(s_http_req),
         "POST %s HTTP/1.1\r\n"
@@ -460,28 +521,36 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
         endpoint->path, endpoint->domain, content_type, (int)strlen(payload), payload
     );
 
-    /* Send Data */
+    /* Step 6: Send Data */
     char send_cmd[32];
     snprintf(send_cmd, sizeof(send_cmd), "AT+CIPSEND=0,%d\r\n", req_len);
     clear_rx();
     send_raw(send_cmd);
-    if (!wait_response(">", 3000, NULL, 0)) {
-        storage_log_debug("TCP", "No '>' prompt!");
+    if (!wait_response(">", 5000, NULL, 0)) {
+        storage_log_debug("TCP", "CIPSEND failed: No '>' prompt!");
         send_raw("AT+CIPCLOSE=0\r\n");
         return false;
     }
 
+    storage_log_debug("TCP", "Streaming HTTP payload...");
     clear_rx();
     send_raw(s_http_req);
 
-    /* Wait for HTTP Response */
+    /* Step 7: Wait for Server Response */
     bool success = false;
-    if (wait_response("+IPD", 10000, s_http_capture, sizeof(s_http_capture))) {
-        if (strstr(s_http_capture, "200 OK") || strstr(s_http_capture, "Success") || strstr(s_http_capture, "accepted")) {
-            success = true;
-            storage_log_http(s_http_capture);
+    if (wait_response("+IPD", 15000, s_http_capture, sizeof(s_http_capture))) {
+        storage_log_debug("TCP", "Received server response (+IPD)");
+        storage_log_http(s_http_capture);
 
-            /* Extract server Date: header */
+        if (strstr(s_http_capture, "200 OK") ||
+            strstr(s_http_capture, "Success") ||
+            strstr(s_http_capture, "SUCCESS") ||
+            strstr(s_http_capture, "accepted") ||
+            strstr(s_http_capture, "ACCEPTED")) {
+            success = true;
+            storage_log_debug("TCP", "HTTP POST Verified OK (200 / Success)");
+
+            /* Extract server Date: header if present to update RTC */
             char *d_ptr = strstr(s_http_capture, "Date: ");
             if (d_ptr && date_hdr_out && date_hdr_size > 0) {
                 char *end = strstr(d_ptr, "\r\n");
@@ -492,9 +561,14 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
                     date_hdr_out[len] = '\0';
                 }
             }
+        } else {
+            storage_log_debug("TCP", "Response received but no 200 OK / Success matched");
         }
+    } else {
+        storage_log_debug("TCP", "HTTP Response timeout (no +IPD)!");
     }
 
+    /* Step 8: Close TCP socket */
     send_raw("AT+CIPCLOSE=0\r\n");
     wait_response("OK", 1000, NULL, 0);
 

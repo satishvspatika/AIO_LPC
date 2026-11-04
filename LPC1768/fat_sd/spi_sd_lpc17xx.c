@@ -868,12 +868,13 @@ static inline void spi_xmit_block (
 static BYTE wait_ready (void)
 {
 	BYTE res;
+	uint32_t retries = 50000;
 
 	Timer2 = 50;	/* Wait for ready in timeout of 500ms */
 	rcvr_spi();
-	do
+	do {
 		res = rcvr_spi();
-	while ((res != 0xFF) && Timer2);
+	} while ((res != 0xFF) && Timer2 && --retries);
 
 	return res;
 }
@@ -1054,13 +1055,26 @@ DSTATUS MMC_disk_initialize(void)
 	for (n = 10; n; n--) rcvr_spi();	/* 80 dummy clocks with card de-selected */
 
 	ty = 0;
-	if (send_cmd(CMD0, 0) == 1) {			/* Enter Idle state */
+	/* Send CMD0 with retry loop up to 100 attempts */
+	for (int retry = 0; retry < 100; retry++) {
+		if (send_cmd(CMD0, 0) == 1) {
+			ty = 1;
+			break;
+		}
+		for (volatile int d = 0; d < 2000; d++);
+	}
+
+	if (ty == 1) {			/* Enter Idle state */
+		ty = 0;
 		Timer1 = 100;						/* Initialization timeout of 1000 milliseconds */
+		uint32_t retries = 2000;
 		if (send_cmd(CMD8, 0x1AA) == 1) {	/* SDHC */
 			for (n = 0; n < 4; n++) ocr[n] = rcvr_spi();		/* Get trailing return value of R7 response */
 			if (ocr[2] == 0x01 && ocr[3] == 0xAA) {				/* The card can work at VDD range of 2.7-3.6V */
-				while (Timer1 && send_cmd(ACMD41, 1UL << 30));	/* Wait for leaving idle state (ACMD41 with HCS bit) */
-				if (Timer1 && send_cmd(CMD58, 0) == 0) {		/* Check CCS bit in the OCR */
+				while (retries-- && send_cmd(ACMD41, 1UL << 30)) {
+					for (volatile int d = 0; d < 1000; d++);
+				}
+				if (retries && send_cmd(CMD58, 0) == 0) {		/* Check CCS bit in the OCR */
 					for (n = 0; n < 4; n++) ocr[n] = rcvr_spi();
 					ty = (ocr[0] & 0x40) ? CT_SD2 | CT_BLOCK : CT_SD2;
 				}
@@ -1071,12 +1085,14 @@ DSTATUS MMC_disk_initialize(void)
 			} else {
 				ty = CT_MMC; cmd = CMD1;	/* MMC */
 			}
-			while (Timer1 && send_cmd(cmd, 0));			/* Wait for leaving idle state */
-			if (!Timer1 || send_cmd(CMD16, 512) != 0)	/* Set R/W block length to 512 */
+			while (retries-- && send_cmd(cmd, 0)) {
+				for (volatile int d = 0; d < 1000; d++);
+			}
+			if ((!retries) || send_cmd(CMD16, 512) != 0)	/* Set R/W block length to 512 */
 				ty = 0;
 		}
 	} else {
-		// xprintf("cmd 0 failed\n");
+		ty = 0;
 	}
 	CardType = ty;
 	release_spi();
