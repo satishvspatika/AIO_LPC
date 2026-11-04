@@ -94,8 +94,13 @@ static void parse_d_packet(const char *frame)
 
     if (field_idx >= 17) {
         if (strlen(present_time) >= 14 && strncmp(present_time, "20", 2) == 0) {
-            strncpy(s_latest_telemetry.present_time, present_time, 15);
-            s_latest_telemetry.present_time[15] = '\0';
+            int p_yr = (present_time[0]-'0')*1000 + (present_time[1]-'0')*100 + (present_time[2]-'0')*10 + (present_time[3]-'0');
+            int p_mo = (present_time[4]-'0')*10 + (present_time[5]-'0');
+            int p_da = (present_time[6]-'0')*10 + (present_time[7]-'0');
+            if (p_yr >= 2024 && p_mo >= 1 && p_mo <= 12 && p_da >= 1 && p_da <= 31) {
+                strncpy(s_latest_telemetry.present_time, present_time, 15);
+                s_latest_telemetry.present_time[15] = '\0';
+            }
         } else if (strlen(s_latest_telemetry.present_time) < 14) {
             strncpy(s_latest_telemetry.present_time, present_time, 15);
             s_latest_telemetry.present_time[15] = '\0';
@@ -187,5 +192,59 @@ void intermcu_update_time(const char *timestamp14)
     strncpy(s_latest_telemetry.present_time, timestamp14, 15);
     s_latest_telemetry.present_time[15] = '\0';
     s_latest_telemetry.is_valid = true;
+}
+
+void intermcu_tick_second(void)
+{
+    if (!s_latest_telemetry.is_valid || strlen(s_latest_telemetry.present_time) < 14) return;
+
+    int yr = 0, mo = 0, da = 0, hr = 0, mi = 0, se = 0;
+    char buf[5];
+
+    buf[4] = '\0';
+    memcpy(buf, s_latest_telemetry.present_time, 4);
+    yr = atoi(buf);
+
+    buf[2] = '\0';
+    memcpy(buf, s_latest_telemetry.present_time + 4, 2);
+    mo = atoi(buf);
+    memcpy(buf, s_latest_telemetry.present_time + 6, 2);
+    da = atoi(buf);
+    memcpy(buf, s_latest_telemetry.present_time + 8, 2);
+    hr = atoi(buf);
+    memcpy(buf, s_latest_telemetry.present_time + 10, 2);
+    mi = atoi(buf);
+    memcpy(buf, s_latest_telemetry.present_time + 12, 2);
+    se = atoi(buf);
+
+    if (yr < 2024 || mo < 1 || mo > 12 || da < 1 || da > 31) return;
+
+    se++;
+    if (se >= 60) {
+        se = 0;
+        mi++;
+        if (mi >= 60) {
+            mi = 0;
+            hr++;
+            if (hr >= 24) {
+                hr = 0;
+                da++;
+                static const int days_per_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+                int leap = ((yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0)) ? 1 : 0;
+                int mdays = (mo == 2) ? (28 + leap) : days_per_month[mo];
+                if (da > mdays) {
+                    da = 1;
+                    mo++;
+                    if (mo > 12) {
+                        mo = 1;
+                        yr++;
+                    }
+                }
+            }
+        }
+    }
+
+    snprintf(s_latest_telemetry.present_time, sizeof(s_latest_telemetry.present_time),
+             "%04d%02d%02d%02d%02d%02d", yr, mo, da, hr, mi, se);
 }
 

@@ -878,14 +878,43 @@ void sanitize_phone_number(char *dest, const char *src, size_t dest_size)
     if (!dest || !src || dest_size == 0) return;
     while (*src == ' ' || *src == '"') src++;
 
-    if (strncmp(src, "+1991", 5) == 0) src += 5;
-    else if (strncmp(src, "1991", 4) == 0) src += 4;
-    else if (strncmp(src, "+199", 4) == 0) src += 4;
-    else if (strncmp(src, "+91", 3) == 0) src += 3;
-    else if (*src == '0') src++;
+    /* Extract pure digits (and initial '+') */
+    char raw[32];
+    size_t ri = 0;
+    if (*src == '+') {
+        raw[ri++] = '+';
+        src++;
+    }
+    while (*src && ri < sizeof(raw) - 1) {
+        if (*src >= '0' && *src <= '9') {
+            raw[ri++] = *src;
+        }
+        src++;
+    }
+    raw[ri] = '\0';
 
-    strncpy(dest, src, dest_size - 1);
-    dest[dest_size - 1] = '\0';
+    const char *digits = raw;
+    if (digits[0] == '+') digits++;
+
+    /* Remove legacy 1991 or 199 prefixes */
+    if (strncmp(digits, "1991", 4) == 0) digits += 4;
+    else if (strncmp(digits, "199", 3) == 0) digits += 3;
+
+    /* If it starts with 91 and has 12 digits total -> 10-digit mobile */
+    if (strncmp(digits, "91", 2) == 0 && strlen(digits) == 12) {
+        digits += 2;
+    } else if (digits[0] == '0' && strlen(digits) == 11) {
+        digits += 1;
+    }
+
+    /* If it is a 10-digit Indian number, prepend +91 */
+    if (strlen(digits) == 10) {
+        snprintf(dest, dest_size, "+91%s", digits);
+    } else if (raw[0] == '+') {
+        snprintf(dest, dest_size, "+%s", digits);
+    } else {
+        snprintf(dest, dest_size, "%s", digits);
+    }
 }
 
 bool sim7600_send_sms(const char *dest_phone, const char *message)
@@ -895,21 +924,33 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
     char sanitized[24];
     sanitize_phone_number(sanitized, dest_phone, sizeof(sanitized));
 
+    /* Set character set to standard GSM 7-bit default alphabet */
+    send_raw("AT+CSCS=\"GSM\"\r\n");
+    wait_response("OK", 500, NULL, 0);
+
     send_raw("AT+CMGF=1\r\n");
     wait_response("OK", 500, NULL, 0);
 
-    char sms_cmd[48];
-    snprintf(sms_cmd, sizeof(sms_cmd), "AT+CMGS=\"%s\"\r\n", sanitized);
+    char sms_cmd[64];
+    /* SIM7600 requires \r termination for AT+CMGS */
+    snprintf(sms_cmd, sizeof(sms_cmd), "AT+CMGS=\"%s\"\r", sanitized);
     clear_rx();
     send_raw(sms_cmd);
-    if (!wait_response(">", 3000, NULL, 0)) return false;
+    if (!wait_response(">", 5000, NULL, 0)) {
+        /* Cancel input mode if prompt not received */
+        const char esc[] = {0x1B, '\0'};
+        send_raw(esc);
+        wait_response("OK", 1000, NULL, 0);
+        return false;
+    }
 
     clear_rx();
     send_raw(message);
     const char ctrl_z[] = {0x1A, '\0'};
     send_raw(ctrl_z);
 
-    return wait_response("+CMGS:", 10000, NULL, 0);
+    /* Allow up to 20 seconds for cellular network SMS acknowledgement */
+    return wait_response("+CMGS:", 20000, NULL, 0);
 }
 
 bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)

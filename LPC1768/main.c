@@ -28,8 +28,14 @@ static void vUi_Task(void *pvParameters)
 {
     (void)pvParameters;
     portTickType xLastWakeTime = xTaskGetTickCount();
+    uint8_t sec_accum = 0;
 
     for (;;) {
+        if (++sec_accum >= 20) {
+            sec_accum = 0;
+            intermcu_tick_second();
+        }
+
         telemetry_data_t telem;
         intermcu_get_telemetry(&telem);
 
@@ -78,6 +84,7 @@ static void execute_slot_transmission(telemetry_data_t *telem)
 
         if (post_ok) {
             storage_log_debug("HTTP", "Transmission succeeded (200 OK)!");
+            ui_dec_backlog_count();
             /* Archive to SD card /DATA/<YYMMDD>.TXT */
             char date6[8] = "";
             if (strlen(telem->slot_time) >= 8) {
@@ -103,12 +110,14 @@ static void execute_slot_transmission(telemetry_data_t *telem)
             }
         } else {
             storage_log_debug("HTTP", "Transmission failed, falling back to SD storage");
+            ui_inc_backlog_count();
         }
 
         /* Check and process incoming operator SMS */
         sim7600_check_incoming_sms(telem);
     } else {
         storage_log_debug("MODEM", "Modem power-on or network registration failed!");
+        ui_inc_backlog_count();
     }
 
     sim7600_release();

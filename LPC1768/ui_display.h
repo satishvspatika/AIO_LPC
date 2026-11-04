@@ -29,5 +29,11 @@ key_code_t ui_keypad_scan(void);
 void ui_reset_activity_timer(void);
 bool ui_is_operator_active(void);
 
+/* Backlog tracking */
+uint32_t ui_get_backlog_count(void);
+void ui_set_backlog_count(uint32_t count);
+void ui_inc_backlog_count(void);
+void ui_dec_backlog_count(void);
+
 #endif /* UI_DISPLAY_H */
 

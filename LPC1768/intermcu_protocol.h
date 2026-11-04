@@ -29,6 +29,7 @@ void intermcu_protocol_init(void);
 void intermcu_process_byte(uint8_t byte);
 bool intermcu_get_telemetry(telemetry_data_t *out_data);
 void intermcu_update_time(const char *timestamp14);
+void intermcu_tick_second(void);
 void intermcu_reset_cumulative_rain(void);
 
 #endif /* INTERMCU_PROTOCOL_H */

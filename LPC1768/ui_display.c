@@ -67,6 +67,7 @@ typedef enum {
     SCR_SOLAR,
     SCR_SIGNAL,
     SCR_LAST_LOGGED,
+    SCR_BACKLOG,
     SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA,
@@ -88,6 +89,7 @@ static const screen_type_t s_screens[] = {
     SCR_SOLAR,
     SCR_SIGNAL,
     SCR_LAST_LOGGED,
+    SCR_BACKLOG,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA,
     SCR_SLEEP
@@ -100,6 +102,7 @@ static const screen_type_t s_screens[] = {
     SCR_BATTERY,
     SCR_SIGNAL,
     SCR_LAST_LOGGED,
+    SCR_BACKLOG,
     SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA,
@@ -113,6 +116,7 @@ static const screen_type_t s_screens[] = {
     SCR_BATTERY,
     SCR_SIGNAL,
     SCR_LAST_LOGGED,
+    SCR_BACKLOG,
     SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA,
@@ -161,6 +165,29 @@ static uint32_t s_anim_counter = 0;
 
 /* Non-blocking popup timer for "VARSHA - TWS / No Rain Gauge" (50ms ticks) */
 static uint32_t s_no_rf_popup_timer = 0;
+
+/* HTTP Backlog Tracking */
+static uint32_t s_backlog_count = 0;
+
+uint32_t ui_get_backlog_count(void)
+{
+    return s_backlog_count;
+}
+
+void ui_set_backlog_count(uint32_t count)
+{
+    s_backlog_count = count;
+}
+
+void ui_inc_backlog_count(void)
+{
+    s_backlog_count++;
+}
+
+void ui_dec_backlog_count(void)
+{
+    if (s_backlog_count > 0) s_backlog_count--;
+}
 
 static void on_sms_progress(const char *step_text)
 {
@@ -622,6 +649,17 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 snprintf(line2, sizeof(line2), "%-16.16s", (last_log && last_log[0]) ? last_log : "NO DATA YET");
                 break;
 
+            case SCR_BACKLOG: {
+                uint32_t bl = ui_get_backlog_count();
+                snprintf(line1, sizeof(line1), "BACKLOG RECORDS ");
+                if (bl == 0) {
+                    snprintf(line2, sizeof(line2), "ALL SYNCED (00) ");
+                } else {
+                    snprintf(line2, sizeof(line2), "PENDING: %-4d PKTS", (int)bl);
+                }
+                break;
+            }
+
             case SCR_FIELD_CALIB:
                 snprintf(line1, sizeof(line1), "FIELD CALIB     ");
                 snprintf(line2, sizeof(line2), "PRESS EN OR CLB ");
@@ -656,8 +694,8 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 break;
 
             case SCR_SLEEP:
-                snprintf(line1, sizeof(line1), "SLEEP SYSTEM?");
-                snprintf(line2, sizeof(line2), "PRESS EN OR DSP");
+                snprintf(line1, sizeof(line1), "SLEEP SYSTEM?   ");
+                snprintf(line2, sizeof(line2), "PRESS EN: SLEEP ");
                 break;
 
             default:
@@ -719,19 +757,9 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         }
     }
 
-    /* Global DSP key handler: Wake or sleep display */
-    if (key == KEY_DSP) {
-        s_no_rf_popup_timer = 0;
-        if (s_display_active) {
-            if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
-                lcd_command(0x0C);
-            }
-            s_ui_mode = UI_MODE_BROWSE;
-            lcd_command(0x08);
-            LPC_GPIO2->FIOCLR = MASK_LCD_BL;
-            hal_power_lcd_off();
-            s_display_active = false;
-        } else {
+    /* If display is asleep, any keypress wakes it back up */
+    if (!s_display_active) {
+        if (key != KEY_NONE) {
             hal_power_lcd_on();
             lcd_init_hw();
             s_current_screen_idx = 0;
@@ -742,7 +770,19 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         return;
     }
 
-    if (!s_display_active) return;
+    /* Global DSP key handler: Sleep display on demand */
+    if (key == KEY_DSP) {
+        s_no_rf_popup_timer = 0;
+        if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+            lcd_command(0x0C);
+        }
+        s_ui_mode = UI_MODE_BROWSE;
+        lcd_command(0x08);
+        LPC_GPIO2->FIOCLR = MASK_LCD_BL;
+        hal_power_lcd_off();
+        s_display_active = false;
+        return;
+    }
 
     if (key != KEY_NONE) {
         ui_reset_activity_timer();
@@ -810,6 +850,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 lcd_print("PLEASE WAIT...  ");
 
                 intermcu_reset_cumulative_rain();
+                ui_set_backlog_count(0);
 
                 vTaskDelay(1500 / portTICK_RATE_MS);
                 lcd_command(0x80);
@@ -956,7 +997,17 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 }
             } else if (active_scr == SCR_SLEEP) {
                 /* Operator selected Sleep System */
-                hal_power_sleep_system();
+                lcd_command(0x80);
+                lcd_print("SYSTEM SLEEPING ");
+                lcd_command(0xC0);
+                lcd_print("POWERING DOWN...");
+                vTaskDelay(1200 / portTICK_RATE_MS);
+
+                lcd_command(0x08); /* Display OFF */
+                LPC_GPIO2->FIOCLR = MASK_LCD_BL; /* Backlight OFF */
+                hal_power_lcd_off(); /* Cut LCD rail */
+                sim7600_power_off(); /* Cut modem rail */
+                hal_power_sleep_system(); /* Sentry sleep command ($f1;) */
                 s_display_active = false;
                 return;
             }
