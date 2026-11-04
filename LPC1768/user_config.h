@@ -30,8 +30,8 @@
 #endif
 
 /* Firmware Version Identifier */
-#define FIRMWARE_VERSION    "AIO_6.0.7"
-#define LCD_VERSION_STRING  "v6.0.7"
+#define FIRMWARE_VERSION    "AIO_6.0.8"
+#define LCD_VERSION_STRING  "v6.0.8"
 #define STATION_ID_DEFAULT  "001922"
 
 /* Status SMS Destination & Network Identifiers */

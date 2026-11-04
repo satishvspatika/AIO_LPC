@@ -308,64 +308,64 @@ static void output_row(int row)
     LPC_GPIO1->FIOSET = (1UL << 21);
 
     /* Assert selected row LOW */
-    if (row == 0) LPC_GPIO3->FIOCLR = (1UL << 25);
-    else if (row == 1) LPC_GPIO3->FIOCLR = (1UL << 26);
-    else if (row == 2) LPC_GPIO1->FIOCLR = (1UL << 21);
+    if (row == 0) LPC_GPIO3->FIOCLR = (1UL << 26);      /* Row 0 = Top Row (P3.26): MENU, UP, CALIB */
+    else if (row == 1) LPC_GPIO3->FIOCLR = (1UL << 25); /* Row 1 = Middle Row (P3.25): LEFT, EN, RIGHT */
+    else if (row == 2) LPC_GPIO1->FIOCLR = (1UL << 21); /* Row 2 = Bottom Row (P1.21): BACK, DOWN, DSP */
 }
 
 /* Keypad Scanning Engine:
- * Matrix Wiring on hardware:
- * - Row 0 (P3.25): Left Column   [MENU, LEFT,  BACK]
- * - Row 1 (P3.26): Center Column [UP,   EN,    DOWN]
- * - Row 2 (P1.21): Right Column  [CALIB,RIGHT, DSP]
+ * Matrix Wiring on hardware (decoded & confirmed on hardware):
+ * - Row 0 (P3.26): Top Row    [MENU, UP,   CALIB]
+ * - Row 1 (P3.25): Middle Row [LEFT, EN,   RIGHT]
+ * - Row 2 (P1.21): Bottom Row [BACK, DOWN, DSP]
  *
- * - Col 1 (P0.21, bit 1): Top Row    [MENU, UP,   CALIB]
- * - Col 0 (P0.22, bit 2): Middle Row [LEFT, EN,   RIGHT]
- * - Col 2 (P0.20, bit 0): Bottom Row [BACK, DOWN, DSP]
+ * - Left Col   (P0.22, bit 2, mask 0x04): [MENU,  LEFT, BACK]
+ * - Center Col (P0.21, bit 1, mask 0x02): [UP,    EN,   DOWN]
+ * - Right Col  (P0.20, bit 0, mask 0x01): [CALIB, RIGHT, DSP]
  */
 key_code_t ui_keypad_scan(void)
 {
     static key_code_t last_key = KEY_NONE;
     static uint32_t press_hold_count = 0;
 
-    /* Row 0 LOW (P3.25) -> Left physical column */
+    /* Row 0 LOW (P3.26) -> Top Row: MENU, UP, CALIB */
     output_row(0);
     delay_us(2000);
-    uint32_t cols_r0 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
+    uint32_t cols_top = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
 
-    /* Row 1 LOW (P3.26) -> Center physical column */
+    /* Row 1 LOW (P3.25) -> Middle Row: LEFT, EN, RIGHT */
     output_row(1);
     delay_us(2000);
-    uint32_t cols_r1 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
+    uint32_t cols_mid = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
 
-    /* Row 2 LOW (P1.21) -> Right physical column */
+    /* Row 2 LOW (P1.21) -> Bottom Row: BACK, DOWN, DSP */
     output_row(2);
     delay_us(2000);
-    uint32_t cols_r2 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
+    uint32_t cols_bot = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
 
     /* All rows back to idle HIGH */
     output_row(-1);
 
-    g_dbg_cols_r0 = cols_r0;
-    g_dbg_cols_r1 = cols_r1;
-    g_dbg_cols_r2 = cols_r2;
+    g_dbg_cols_r0 = cols_top;
+    g_dbg_cols_r1 = cols_mid;
+    g_dbg_cols_r2 = cols_bot;
 
     key_code_t detected = KEY_NONE;
 
-    /* Row 0 (Left Column): P3.25 */
-    if (!(cols_r0 & 0x02))      detected = KEY_MENU;   /* Col 1 = Top */
-    else if (!(cols_r0 & 0x04)) detected = KEY_LEFT;   /* Col 0 = Middle */
-    else if (!(cols_r0 & 0x01)) detected = KEY_BACK;   /* Col 2 = Bottom */
+    /* Row 0: Top Row (P3.26) */
+    if (!(cols_top & 0x04))      detected = KEY_MENU;   /* Left Col (P0.22) */
+    else if (!(cols_top & 0x02)) detected = KEY_UP;     /* Center Col (P0.21) */
+    else if (!(cols_top & 0x01)) detected = KEY_CALIB;  /* Right Col (P0.20) */
 
-    /* Row 1 (Center Column): P3.26 */
-    else if (!(cols_r1 & 0x02)) detected = KEY_UP;     /* Col 1 = Top */
-    else if (!(cols_r1 & 0x04)) detected = KEY_EN;     /* Col 0 = Middle */
-    else if (!(cols_r1 & 0x01)) detected = KEY_DOWN;   /* Col 2 = Bottom */
+    /* Row 1: Middle Row (P3.25) */
+    else if (!(cols_mid & 0x04)) detected = KEY_LEFT;   /* Left Col (P0.22) */
+    else if (!(cols_mid & 0x02)) detected = KEY_EN;     /* Center Col (P0.21) */
+    else if (!(cols_mid & 0x01)) detected = KEY_RIGHT;  /* Right Col (P0.20) */
 
-    /* Row 2 (Right Column): P1.21 */
-    else if (!(cols_r2 & 0x02)) detected = KEY_CALIB;  /* Col 1 = Top */
-    else if (!(cols_r2 & 0x04)) detected = KEY_RIGHT;  /* Col 0 = Middle */
-    else if (!(cols_r2 & 0x01)) detected = KEY_DSP;    /* Col 2 = Bottom */
+    /* Row 2: Bottom Row (P1.21) */
+    else if (!(cols_bot & 0x04)) detected = KEY_BACK;   /* Left Col (P0.22) */
+    else if (!(cols_bot & 0x02)) detected = KEY_DOWN;   /* Center Col (P0.21) */
+    else if (!(cols_bot & 0x01)) detected = KEY_DSP;    /* Right Col (P0.20) */
 
     if (detected != KEY_NONE) {
         g_dbg_last_key = (uint32_t)detected;
