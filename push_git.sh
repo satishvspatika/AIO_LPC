@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# push_git.sh - Version Tag, Compile, Commit, Tag, and Push Script for AIO_LPC
+# push_git.sh - Auto-Version, Compile, Commit, Tag, and Push Script for AIO_LPC
 # ==============================================================================
 # Usage:
-#   ./push_git.sh -t <tag> [-m "<description>"]
+#   ./push_git.sh [-m "<description>"] [-t <tag>]
 #
 # Examples:
-#   ./push_git.sh -t "v6.0.1" -m "Fixed LCD boot timing"
-#   ./push_git.sh -t "v6.0.1"              # (-m is optional; defaults to "Release v6.0.1")
-#   ./push_git.sh -t "v6.0.2" --no-build  # Push without running build_all.sh
+#   ./push_git.sh                               # Auto-increments patch (e.g. v6.0.1 -> v6.0.2)
+#   ./push_git.sh -m "Fixed sensor ADC"         # Auto-increments patch with custom commit message
+#   ./push_git.sh -t "v6.1.0"                   # Explicitly specifies tag v6.1.0 (defaults to "Release v6.1.0")
+#   ./push_git.sh -t "v6.1.0" -m "Major rev"    # Explicit tag with custom commit message
 # ==============================================================================
 
 set -e
@@ -48,7 +49,7 @@ while [[ $# -gt 0 ]]; do
                 TARGET_VER="$2"
                 shift 2
             else
-                echo -e "${RED}[ERROR] Option $1 requires a version tag value (e.g. -t \"v6.0.1\")${NC}"
+                echo -e "${RED}[ERROR] Option $1 requires a version tag value (e.g. -t \"v6.0.2\")${NC}"
                 exit 1
             fi
             ;;
@@ -79,23 +80,26 @@ while [[ $# -gt 0 ]]; do
             ;;
         -h|--help)
             echo -e "${BOLD}Usage:${NC}"
-            echo "  ./push_git.sh -t <tag> [-m \"<message>\"] [--no-build] [-f]"
+            echo "  ./push_git.sh [-m \"<message>\"] [-t <tag>] [--no-build] [-f]"
             echo ""
             echo -e "${BOLD}Options:${NC}"
-            echo "  -t, --tag <tag>       (Required) Version tag (e.g. v6.0.1 or 6.0.1)"
-            echo "  -m, --message <msg>   (Optional) Commit message"
+            echo "  -t, --tag <tag>       Specify custom version tag (e.g. v6.1.0)."
+            echo "                        If omitted, automatically increments patch version (e.g. v6.0.1 -> v6.0.2)."
+            echo "  -m, --message <msg>   (Optional) Commit message. Defaults to 'Release <tag>'."
             echo "  --no-build            Skip build_all.sh compilation"
             echo "  -f, --force           Force overwrite tag if it already exists"
             echo "  -h, --help            Show this help"
             echo ""
             echo -e "${BOLD}Examples:${NC}"
-            echo "  ./push_git.sh -t \"v6.0.1\" -m \"Fixed LCD initialization\""
-            echo "  ./push_git.sh -t \"v6.0.1\""
+            echo "  ./push_git.sh                               # Auto-bumps patch version (e.g. v6.0.1 -> v6.0.2)"
+            echo "  ./push_git.sh -m \"Fixed LCD contrast\"       # Auto-bumps patch with custom commit message"
+            echo "  ./push_git.sh -t \"v6.1.0\"                   # Sets explicit tag v6.1.0, default commit message"
+            echo "  ./push_git.sh -t \"v6.1.0\" -m \"Major rev\"   # Sets explicit tag v6.1.0 with custom message"
             exit 0
             ;;
         *)
-            if [ -z "$TARGET_VER" ] && [[ ! "$1" =~ ^- ]]; then
-                TARGET_VER="$1"
+            if [ -z "$COMMIT_MSG" ] && [[ ! "$1" =~ ^- ]]; then
+                COMMIT_MSG="$1"
                 shift 1
             else
                 echo -e "${YELLOW}[WARNING] Unknown argument: $1${NC}"
@@ -111,23 +115,21 @@ if [ -z "$CURRENT_RAW_VER" ]; then
     CURRENT_RAW_VER="6.0.0"
 fi
 
-# If target version was not provided on CLI, prompt or exit
-if [ -z "$TARGET_VER" ]; then
-    if [ -t 0 ]; then
-        echo -e "${CYAN}Current configured version in LPC1768 is: ${YELLOW}v${CURRENT_RAW_VER}${NC}"
-        read -r -p "Enter new version tag to push (e.g. v6.0.1): " TARGET_VER
-    fi
-    if [ -z "$TARGET_VER" ]; then
-        echo -e "${RED}[ERROR] A version tag is required!${NC}"
-        echo -e "Usage:   ${BOLD}./push_git.sh -t <tag> [-m \"<description>\"]${NC}"
-        echo -e "Example: ${BOLD}./push_git.sh -t \"v6.0.1\" -m \"Fixed LCD boot timing\"${NC}"
-        echo -e "         ${BOLD}./push_git.sh -t \"v6.0.1\"${NC}"
-        exit 1
-    fi
+# Calculate new version
+if [ -n "$TARGET_VER" ]; then
+    NEW_RAW_VER="${TARGET_VER#v}"
+    IS_AUTO=0
+else
+    # Automatically bump patch version (e.g. 6.0.1 -> 6.0.2)
+    IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_RAW_VER"
+    MAJOR=${MAJOR:-6}
+    MINOR=${MINOR:-0}
+    PATCH=${PATCH:-0}
+    NEW_PATCH=$((PATCH + 1))
+    NEW_RAW_VER="${MAJOR}.${MINOR}.${NEW_PATCH}"
+    IS_AUTO=1
 fi
 
-# Clean up version string (strip leading 'v' for raw number, ensure 'v' for tag)
-NEW_RAW_VER="${TARGET_VER#v}"
 NEW_TAG="v${NEW_RAW_VER}"
 
 # LCD 16x2 sanity check: Line 2 format is "ID:001922 vX.Y.Z" (max 16 chars)
@@ -146,9 +148,13 @@ if [ "$CURRENT_BRANCH" = "HEAD" ]; then
 fi
 
 echo -e "${CYAN}======================================================${NC}"
-echo -e "${BOLD}AIO_LPC Firmware: Version, Build & Push${NC}"
+echo -e "${BOLD}AIO_LPC Firmware: Auto-Version, Build & Push${NC}"
 echo -e "  Current Version: ${YELLOW}v${CURRENT_RAW_VER}${NC}"
-echo -e "  Target Tag:      ${GREEN}${NEW_TAG}${NC} (Will display on LCD Line 2)"
+if [ "$IS_AUTO" -eq 1 ]; then
+    echo -e "  New Version:     ${GREEN}${NEW_TAG}${NC} (Auto-incremented for new changes)"
+else
+    echo -e "  New Version:     ${GREEN}${NEW_TAG}${NC} (Custom tag specified)"
+fi
 echo -e "  Branch:          ${GREEN}${CURRENT_BRANCH}${NC}"
 echo -e "  Commit Message:  ${BOLD}${COMMIT_MSG}${NC}"
 echo -e "${CYAN}======================================================${NC}"

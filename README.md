@@ -73,19 +73,25 @@ Connect your MCU-Link debug probe via SWD ribbon cable to the target header:
 
 ## 4. Git Synchronization & Versioning
 
-### Pushing Updates (with LCD Version Tag)
-To release a firmware update, specify the version tag with `-t` (commit message `-m` is optional):
-```bash
-# Push with custom commit message
-./push_git.sh -t "v6.0.1" -m "Fixed LCD boot timing"
+### Pushing Updates (with Auto-Versioning & Tags)
+Whenever you push changes, the script automatically increments the version tag (e.g. `v6.0.1` $\rightarrow$ `v6.0.2`), or you can supply an explicit tag with `-t`. The commit message (`-m`) is always optional:
 
-# Push with default commit message ("Release v6.0.1")
-./push_git.sh -t "v6.0.1"
+```bash
+# 1. Automatic version bump (e.g. v6.0.1 -> v6.0.2)
+./push_git.sh
+# Or with a custom description:
+./push_git.sh -m "Fixed sensor ADC sampling"
+
+# 2. Specify a custom tag explicitly (overrides auto-bump)
+./push_git.sh -t "v6.1.0"
+# Or with custom description:
+./push_git.sh -t "v6.1.0" -m "Major release with new telemetry protocol"
 ```
+
 The script will:
-1. Update `LCD_VERSION_STRING` in `LPC1768/user_config.h` (visible on 16x2 LCD Line 2 as `ID:001922 v6.0.1`).
+1. Update `LCD_VERSION_STRING` in `LPC1768/user_config.h` (visible on 16x2 LCD Line 2 as `ID:001922 v6.0.X`).
 2. Recompile all firmware targets via `./build_all.sh`.
-3. Commit, create/update Git tag `v6.0.1`, and push to GitHub.
+3. Commit all changes, create the Git tag, and push everything to GitHub.
 
 ### Pulling Updates on Another Laptop
 To pull the latest code or checkout a specific release tag on another machine:
