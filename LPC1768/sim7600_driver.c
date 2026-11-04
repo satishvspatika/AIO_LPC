@@ -3,6 +3,7 @@
 #include "storage_log.h"
 #include "user_config.h"
 #include "flash_nvram.h"
+#include "intermcu_protocol.h"
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
 #include "lpc17xx_gpio.h"
@@ -32,9 +33,36 @@ static modem_status_t s_modem_status = {
     .csq_dbm = -113,
     .ip_addr = "0.0.0.0",
     .iccid = "",
+    .carrier = "SEARCHING",
     .is_registered = false,
     .is_pdp_active = false
 };
+
+static volatile bool s_modem_busy = false;
+
+bool sim7600_acquire(uint32_t timeout_ms)
+{
+    uint32_t elapsed = 0;
+    while (s_modem_busy && elapsed < timeout_ms) {
+        vTaskDelay((50 + portTICK_RATE_MS - 1) / portTICK_RATE_MS);
+        elapsed += 50;
+    }
+    if (!s_modem_busy) {
+        s_modem_busy = true;
+        return true;
+    }
+    return false;
+}
+
+void sim7600_release(void)
+{
+    s_modem_busy = false;
+}
+
+bool sim7600_is_busy(void)
+{
+    return s_modem_busy;
+}
 
 static void delay_ms(uint32_t ms)
 {
@@ -109,6 +137,9 @@ void sim7600_init(void)
     LPC_GPIO0->FIOSET = (1UL << PIN_GPRS_POWER); /* HIGH = Power ON */
     LPC_GPIO0->FIODIR |= (1UL << PIN_GPRS_POWER);/* Output */
 
+    /* Immediately request LPC845 sentry to activate 3.8V switching regulator on boot */
+    hal_power_modem_on();
+
     UART_CFG_Type uart_cfg;
     UART_ConfigStructInit(&uart_cfg);
     uart_cfg.Baud_rate = 115200;
@@ -168,8 +199,90 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
     return false;
 }
 
+static void parse_cops_operator(const char *cops_resp, char *out_carrier, size_t max_len)
+{
+    if (!cops_resp || !out_carrier || max_len == 0) return;
+
+    const char *q1 = strchr(cops_resp, '\"');
+    if (!q1) return;
+    const char *q2 = strchr(q1 + 1, '\"');
+    if (!q2) return;
+
+    size_t len = q2 - (q1 + 1);
+    if (len >= max_len) len = max_len - 1;
+
+    char raw[32];
+    strncpy(raw, q1 + 1, len);
+    raw[len] = '\0';
+
+    if (strcmp(raw, "40445") == 0 || strcmp(raw, "40552") == 0) {
+        strncpy(out_carrier, "Airtel", max_len - 1);
+    } else if (strcmp(raw, "40471") == 0 || strcmp(raw, "40475") == 0) {
+        strncpy(out_carrier, "BSNL", max_len - 1);
+    } else if (strcmp(raw, "40586") == 0 || strcmp(raw, "40587") == 0) {
+        strncpy(out_carrier, "Jio", max_len - 1);
+    } else if (strcmp(raw, "40411") == 0 || strcmp(raw, "40420") == 0) {
+        strncpy(out_carrier, "Vi", max_len - 1);
+    } else if (strncasecmp(raw, "airtel", 6) == 0) {
+        strncpy(out_carrier, "Airtel", max_len - 1);
+    } else if (strncasecmp(raw, "bsnl", 4) == 0 || strncasecmp(raw, "cellone", 7) == 0) {
+        strncpy(out_carrier, "BSNL", max_len - 1);
+    } else if (strncasecmp(raw, "jio", 3) == 0) {
+        strncpy(out_carrier, "Jio", max_len - 1);
+    } else if (strncasecmp(raw, "vodafone", 8) == 0 || strncasecmp(raw, "vi", 2) == 0 || strncasecmp(raw, "idea", 4) == 0) {
+        strncpy(out_carrier, "Vi", max_len - 1);
+    } else {
+        strncpy(out_carrier, raw, max_len - 1);
+    }
+    out_carrier[max_len - 1] = '\0';
+}
+
+static bool sim7600_sync_time_step(void)
+{
+    char capture[128];
+    clear_rx();
+    send_raw("AT+CCLK?\r\n");
+    if (wait_response("+CCLK:", 2000, capture, sizeof(capture))) {
+        char *p = strstr(capture, "+CCLK: \"");
+        if (p) {
+            int yr = 0, mo = 0, da = 0, hr = 0, mi = 0, se = 0;
+            if (sscanf(p + 8, "%d/%d/%d,%d:%d:%d", &yr, &mo, &da, &hr, &mi, &se) >= 5) {
+                if (yr < 100) yr += 2000;
+                if (da >= 1 && da <= 31 && mo >= 1 && mo <= 12 && yr >= 2024 && yr <= 2079) {
+                    char ts14[16];
+                    snprintf(ts14, sizeof(ts14), "%04d%02d%02d%02d%02d%02d",
+                             yr, mo, da, hr, mi, (se >= 0 && se <= 59) ? se : 0);
+                    hal_power_sync_rtc(ts14);
+                    intermcu_update_time(ts14);
+                    storage_log_debug("RTC", "DS1338 RTC synced from cellular tower time");
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static void sim7600_ntp_sync_step(void)
+{
+    send_raw("AT+CNTP=\"time.google.com\",22\r\n");
+    wait_response("OK", 2000, NULL, 0);
+
+    clear_rx();
+    send_raw("AT+CNTP\r\n");
+    char capture[64];
+    if (wait_response("+CNTP: 0", 8000, capture, sizeof(capture))) {
+        storage_log_debug("NTP", "NTP network time synchronized successfully");
+        sim7600_sync_time_step();
+    }
+}
+
 bool sim7600_power_on(void)
 {
+    if (s_modem_status.is_registered) {
+        return true;
+    }
+
     report_progress("MODEM POWER ON ");
 
     /* 1. Turn ON 3.8V rail via LPC845 sentry command ($n2;) */
@@ -388,30 +501,21 @@ bool sim7600_power_on(void)
         }
     }
 
-    /* 10. Synchronize time from cellular network base station (NITZ) */
+    /* 10. Synchronize time from cellular network base station (NITZ) and query carrier */
     if (registered) {
-        clear_rx();
         send_raw("AT+CTZU=1\r\n"); /* Enable auto network time zone & time */
         wait_response("OK", 1000, NULL, 0);
 
+        send_raw("AT+COPS=3,0\r\n");
+        wait_response("OK", 1000, NULL, 0);
+
         clear_rx();
-        send_raw("AT+CCLK?\r\n");
-        if (wait_response("+CCLK:", 2000, capture, sizeof(capture))) {
-            char *p = strstr(capture, "+CCLK: \"");
-            if (p) {
-                int yr = 0, mo = 0, da = 0, hr = 0, mi = 0, se = 0;
-                if (sscanf(p + 8, "%d/%d/%d,%d:%d:%d", &yr, &mo, &da, &hr, &mi, &se) >= 5) {
-                    if (yr < 100) yr += 2000;
-                    if (da >= 1 && da <= 31 && mo >= 1 && mo <= 12 && yr >= 2024 && yr <= 2079) {
-                        char ts14[16];
-                        snprintf(ts14, sizeof(ts14), "%04d%02d%02d%02d%02d%02d",
-                                 yr, mo, da, hr, mi, (se >= 0 && se <= 59) ? se : 0);
-                        hal_power_sync_rtc(ts14);
-                        storage_log_debug("RTC", "DS1338 RTC synced from cellular tower time");
-                    }
-                }
-            }
+        send_raw("AT+COPS?\r\n");
+        if (wait_response("+COPS:", 1500, capture, sizeof(capture))) {
+            parse_cops_operator(capture, s_modem_status.carrier, sizeof(s_modem_status.carrier));
         }
+
+        sim7600_sync_time_step();
     }
 
     s_modem_status.is_registered = registered;
@@ -437,6 +541,193 @@ void sim7600_power_off(void)
     hal_power_modem_off();
     s_modem_status.is_registered = false;
     s_modem_status.is_pdp_active = false;
+    strncpy(s_modem_status.carrier, "OFFLINE", sizeof(s_modem_status.carrier) - 1);
+}
+
+typedef enum {
+    MODEM_ST_UNINIT = 0,
+    MODEM_ST_PROBING,
+    MODEM_ST_CONFIGURING,
+    MODEM_ST_RUNNING
+} modem_worker_state_t;
+
+static modem_worker_state_t s_worker_state = MODEM_ST_UNINIT;
+static bool s_time_synced_flag = false;
+static uint32_t s_cclk_poll_counter = 0;
+
+void sim7600_worker_step(void)
+{
+    if (s_modem_busy) return;
+
+    char capture[256];
+
+    switch (s_worker_state) {
+        case MODEM_ST_UNINIT:
+            hal_power_modem_on();
+            LPC_GPIO0->FIOCLR = (1UL << PIN_SIM_SEL);
+            LPC_GPIO0->FIODIR |= (1UL << PIN_SIM_SEL);
+            LPC_GPIO0->FIOSET = (1UL << PIN_GPRS_POWER);
+            LPC_GPIO0->FIODIR |= (1UL << PIN_GPRS_POWER);
+            s_worker_state = MODEM_ST_PROBING;
+            break;
+
+        case MODEM_ST_PROBING:
+            clear_rx();
+            send_raw("AT\r\n");
+            if (wait_response("OK", 400, NULL, 0) || wait_response("RDY", 200, NULL, 0)) {
+                storage_log_debug("MODEM", "SIM7600 responsive to AT probes");
+                s_worker_state = MODEM_ST_CONFIGURING;
+            }
+            break;
+
+        case MODEM_ST_CONFIGURING: {
+            send_raw("ATE0\r\n");
+            wait_response("OK", 500, NULL, 0);
+            send_raw("AT+CMEE=2\r\n");
+            wait_response("OK", 500, NULL, 0);
+            send_raw("AT+CGEREP=0\r\n");
+            wait_response("OK", 500, NULL, 0);
+            send_raw("AT&D0\r\n");
+            wait_response("OK", 500, NULL, 0);
+            send_raw("AT+CTZU=1\r\n");
+            wait_response("OK", 500, NULL, 0);
+            send_raw("AT+COPS=3,0\r\n");
+            wait_response("OK", 500, NULL, 0);
+            send_raw("AT+CNMP=2\r\n");
+            wait_response("OK", 1000, NULL, 0);
+
+            /* Read ICCID and IMSI for smart APN resolution */
+            clear_rx();
+            send_raw("AT+CICCID\r\n");
+            if (wait_response("+ICCID:", 1500, capture, sizeof(capture))) {
+                char *p = strstr(capture, "+ICCID: ");
+                if (p) sscanf(p, "+ICCID: %20s", s_modem_status.iccid);
+            }
+
+            char imsi[20] = "";
+            clear_rx();
+            send_raw("AT+CIMI\r\n");
+            if (wait_response("OK", 1500, capture, sizeof(capture))) {
+                char *p = capture;
+                while (*p && (*p < '0' || *p > '9')) p++;
+                if (*p) sscanf(p, "%15s", imsi);
+            }
+
+            const char *apn = "airtelgprs.com";
+            if (strncmp(s_modem_status.iccid, "899116", 6) == 0 ||
+                strncmp(s_modem_status.iccid, "899110", 6) == 0 ||
+                strncmp(s_modem_status.iccid, "899145", 6) == 0) {
+                apn = "airteliot.com";
+                strncpy(s_modem_status.carrier, "Airtel", sizeof(s_modem_status.carrier) - 1);
+            } else if (strncmp(imsi, "40471", 5) == 0 || strncmp(imsi, "40475", 5) == 0) {
+                apn = "bsnlnet";
+                strncpy(s_modem_status.carrier, "BSNL", sizeof(s_modem_status.carrier) - 1);
+            } else if (strncmp(imsi, "40586", 5) == 0 || strncmp(imsi, "40587", 5) == 0) {
+                apn = "jionet";
+                strncpy(s_modem_status.carrier, "Jio", sizeof(s_modem_status.carrier) - 1);
+            } else if (strncmp(imsi, "40411", 5) == 0 || strncmp(imsi, "40420", 5) == 0) {
+                apn = "www";
+                strncpy(s_modem_status.carrier, "Vi", sizeof(s_modem_status.carrier) - 1);
+            } else if (strncmp(imsi, "40445", 5) == 0 || strncmp(imsi, "40552", 5) == 0) {
+                apn = "airtelgprs.com";
+                strncpy(s_modem_status.carrier, "Airtel", sizeof(s_modem_status.carrier) - 1);
+            }
+
+            char apn_cmd[64];
+            snprintf(apn_cmd, sizeof(apn_cmd), "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", apn);
+            clear_rx();
+            send_raw(apn_cmd);
+            wait_response("OK", 1500, NULL, 0);
+
+            char sock_cmd[64];
+            snprintf(sock_cmd, sizeof(sock_cmd), "AT+CGSOCKCONT=1,\"IP\",\"%s\"\r\n", apn);
+            clear_rx();
+            send_raw(sock_cmd);
+            wait_response("OK", 1500, NULL, 0);
+
+            send_raw("AT+CSOCKSETPN=1\r\n");
+            wait_response("OK", 1000, NULL, 0);
+
+            s_worker_state = MODEM_ST_RUNNING;
+            storage_log_debug("MODEM", "SIM7600 background supervisor active");
+            break;
+        }
+
+        case MODEM_ST_RUNNING: {
+            /* 1. Poll CSQ */
+            clear_rx();
+            send_raw("AT+CSQ\r\n");
+            if (wait_response("+CSQ:", 800, capture, sizeof(capture))) {
+                int csq = 99, ber = 99;
+                char *p = strstr(capture, "+CSQ: ");
+                if (p) {
+                    sscanf(p, "+CSQ: %d,%d", &csq, &ber);
+                    s_modem_status.csq_val = csq;
+                    s_modem_status.csq_dbm = (csq == 99) ? -113 : (-113 + 2 * csq);
+                }
+            }
+
+            /* 2. Poll Registration Status (CEREG / CREG / CGREG) */
+            bool reg = false;
+            clear_rx();
+            send_raw("AT+CEREG?\r\n");
+            if (wait_response("+CEREG: ", 800, capture, sizeof(capture))) {
+                if (strstr(capture, ",1") || strstr(capture, ",5")) reg = true;
+            }
+            if (!reg) {
+                clear_rx();
+                send_raw("AT+CREG?\r\n");
+                if (wait_response("+CREG: ", 800, capture, sizeof(capture))) {
+                    if (strstr(capture, ",1") || strstr(capture, ",5")) reg = true;
+                }
+            }
+            if (!reg) {
+                clear_rx();
+                send_raw("AT+CGREG?\r\n");
+                if (wait_response("+CGREG: ", 800, capture, sizeof(capture))) {
+                    if (strstr(capture, ",1") || strstr(capture, ",5")) reg = true;
+                }
+            }
+            s_modem_status.is_registered = reg;
+
+            /* 3. If registered, query live Carrier and NITZ clock */
+            if (reg) {
+                /* Poll Carrier Name */
+                clear_rx();
+                send_raw("AT+COPS?\r\n");
+                if (wait_response("+COPS:", 1000, capture, sizeof(capture))) {
+                    parse_cops_operator(capture, s_modem_status.carrier, sizeof(s_modem_status.carrier));
+                }
+
+                /* Poll Cellular Clock (NITZ) */
+                s_cclk_poll_counter++;
+                if (!s_time_synced_flag || (s_cclk_poll_counter % 60 == 0)) {
+                    if (sim7600_sync_time_step()) {
+                        s_time_synced_flag = true;
+                    } else if (!s_time_synced_flag && s_cclk_poll_counter >= 3) {
+                        /* Fallback to NTP if tower does not broadcast NITZ */
+                        sim7600_ntp_sync_step();
+                    }
+                }
+
+                /* Check incoming SMS */
+                telemetry_data_t t;
+                if (intermcu_get_telemetry(&t)) {
+                    sim7600_check_incoming_sms(&t);
+                }
+            } else {
+                /* If not registered, reset carrier name to searching */
+                if (s_modem_status.carrier[0] == '\0') {
+                    strncpy(s_modem_status.carrier, "SEARCHING", sizeof(s_modem_status.carrier) - 1);
+                }
+            }
+            break;
+        }
+
+        default:
+            s_worker_state = MODEM_ST_UNINIT;
+            break;
+    }
 }
 
 bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, char *date_hdr_out, size_t date_hdr_size)

@@ -93,8 +93,15 @@ static void parse_d_packet(const char *frame)
     }
 
     if (field_idx >= 17) {
-        strncpy(s_latest_telemetry.present_time, present_time, 15);
+        if (strlen(present_time) >= 14 && strncmp(present_time, "20", 2) == 0) {
+            strncpy(s_latest_telemetry.present_time, present_time, 15);
+            s_latest_telemetry.present_time[15] = '\0';
+        } else if (strlen(s_latest_telemetry.present_time) < 14) {
+            strncpy(s_latest_telemetry.present_time, present_time, 15);
+            s_latest_telemetry.present_time[15] = '\0';
+        }
         strncpy(s_latest_telemetry.slot_time, slot_time, 15);
+        s_latest_telemetry.slot_time[15] = '\0';
 
         s_latest_telemetry.rf_tips_15m = (uint16_t)rf_tips;
         s_latest_telemetry.rf_15m_mm = rf_tips * RF_BUCKET_RESOLUTION;
@@ -172,5 +179,13 @@ bool intermcu_get_telemetry(telemetry_data_t *out_data)
     if (!out_data || !s_latest_telemetry.is_valid) return false;
     memcpy(out_data, &s_latest_telemetry, sizeof(telemetry_data_t));
     return true;
+}
+
+void intermcu_update_time(const char *timestamp14)
+{
+    if (!timestamp14 || strlen(timestamp14) < 14) return;
+    strncpy(s_latest_telemetry.present_time, timestamp14, 15);
+    s_latest_telemetry.present_time[15] = '\0';
+    s_latest_telemetry.is_valid = true;
 }
 

@@ -173,6 +173,16 @@ static void on_sms_progress(const char *step_text)
 static void vStatusSms_Task(void *pvParameters)
 {
     (void)pvParameters;
+
+    if (!sim7600_acquire(3000)) {
+        s_status_sms_state = STATUS_UI_FAILED;
+        strncpy(s_status_sms_substep, "MODEM BUSY      ", sizeof(s_status_sms_substep) - 1);
+        s_status_sms_timer = 40;
+        s_sms_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
     telemetry_data_t t;
     memset(&t, 0, sizeof(t));
     intermcu_get_telemetry(&t);
@@ -181,6 +191,8 @@ static void vStatusSms_Task(void *pvParameters)
     sim7600_get_status(&m);
 
     bool ok = sim7600_transmit_status_sms(&t, m.csq_dbm);
+
+    sim7600_release();
 
     if (sim7600_is_cancel_requested()) {
         s_status_sms_state = STATUS_UI_IDLE;
@@ -203,7 +215,7 @@ volatile uint32_t g_dbg_cols_r0 = 7;
 volatile uint32_t g_dbg_cols_r1 = 7;
 volatile uint32_t g_dbg_cols_r2 = 7;
 
-static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, int csq_dbm, const char *ip_addr);
+static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, const modem_status_t *modem_stat);
 
 static void delay_us(uint32_t us)
 {
@@ -508,13 +520,15 @@ void ui_display_init(void)
 
     telemetry_data_t telem;
     memset(&telem, 0, sizeof(telem));
-    render_screen(s_screens[0], &telem, -113, "0.0.0.0");
+    modem_status_t mstat;
+    memset(&mstat, 0, sizeof(mstat));
+    mstat.csq_dbm = -113;
+    render_screen(s_screens[0], &telem, &mstat);
 }
 
 /* Screen Rendering Engine */
-static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, int csq_dbm, const char *ip_addr)
+static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, const modem_status_t *modem_stat)
 {
-    (void)ip_addr;
     char line1[17] = "";
     char line2[17] = "";
 
@@ -542,14 +556,14 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 break;
 
             case SCR_DATETIME:
-                if (strlen(telemetry->present_time) >= 14) {
+                if (strlen(telemetry->present_time) >= 14 && strncmp(telemetry->present_time, "20", 2) == 0) {
                     snprintf(line1, sizeof(line1), "DATE: %.2s/%.2s/%.4s",
                         telemetry->present_time + 6, telemetry->present_time + 4, telemetry->present_time);
                     snprintf(line2, sizeof(line2), "TIME: %.2s:%.2s:%.2s",
                         telemetry->present_time + 8, telemetry->present_time + 10, telemetry->present_time + 12);
                 } else {
-                    snprintf(line1, sizeof(line1), "DATE: --/--/----");
-                    snprintf(line2, sizeof(line2), "TIME: --:--:--");
+                    snprintf(line1, sizeof(line1), "DATE: NOT SYNCED");
+                    snprintf(line2, sizeof(line2), "TIME: WAITING... ");
                 }
                 break;
 
@@ -592,12 +606,13 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 break;
 
             case SCR_SIGNAL:
-                if (csq_dbm <= -113) {
-                    snprintf(line1, sizeof(line1), "SIGNAL: NO NET  ");
-                    snprintf(line2, sizeof(line2), "REG: SEARCHING  ");
+                if (!modem_stat || !modem_stat->is_registered || modem_stat->csq_dbm <= -113) {
+                    snprintf(line1, sizeof(line1), "NET: SEARCHING  ");
+                    snprintf(line2, sizeof(line2), "SIG: NO NET     ");
                 } else {
-                    snprintf(line1, sizeof(line1), "SIGNAL: %d dBm  ", csq_dbm);
-                    snprintf(line2, sizeof(line2), "REG: 4G HOME    ");
+                    const char *car = (modem_stat->carrier[0] != '\0') ? modem_stat->carrier : "4G CELL";
+                    snprintf(line1, sizeof(line1), "NET: %-11.11s", car);
+                    snprintf(line2, sizeof(line2), "SIG: %4d dBm 4G ", modem_stat->csq_dbm);
                 }
                 break;
 
@@ -666,7 +681,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
     }
 }
 
-void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const char *ip_addr)
+void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_t *modem_stat)
 {
     s_anim_counter++;
 
@@ -948,5 +963,5 @@ void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const 
         }
     }
 
-    render_screen(s_screens[s_current_screen_idx], telemetry, csq_dbm, ip_addr);
+    render_screen(s_screens[s_current_screen_idx], telemetry, modem_stat);
 }

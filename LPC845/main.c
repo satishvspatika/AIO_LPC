@@ -272,10 +272,17 @@ void decode_command(void)
 			Set_Date_Time.date = ((gc_recv_buf[8]-'0')*10 + (gc_recv_buf[9]-'0'));
 			Set_Date_Time.hour = ((gc_recv_buf[10]-'0')*10 + (gc_recv_buf[11]-'0'));
 			Set_Date_Time.minute = ((gc_recv_buf[12]-'0')*10 + (gc_recv_buf[13]-'0'));
-			Set_Date_Time.sec = ((gc_recv_buf[14]-'0')*10 + (gc_recv_buf[14]-'0'));
+			Set_Date_Time.sec = ((gc_recv_buf[14]-'0')*10 + (gc_recv_buf[15]-'0'));
 
 			Set_Time();
 
+			Present_Date_Time.century = Set_Date_Time.century;
+			Present_Date_Time.year = Set_Date_Time.year;
+			Present_Date_Time.month = Set_Date_Time.month;
+			Present_Date_Time.date = Set_Date_Time.date;
+			Present_Date_Time.hour = Set_Date_Time.hour;
+			Present_Date_Time.minute = Set_Date_Time.minute;
+			Present_Date_Time.sec = Set_Date_Time.sec;
 			break;
 
 		case 'C':
@@ -291,19 +298,23 @@ void decode_command(void)
 			break;
 
 		case 'n':									//User active
-			if(chr2 & 4){
+			if((chr2 & 4) || (chr2 == '4')){
 				GPIO_PortClear(GPIO, LPC845_PORT, 1u << LCD_PWR_STDN); //turn on 5V
-
+			}
+			if((chr2 & 2) || (chr2 == '2')){
+				GPIO_PortClear(GPIO, LPC845_PORT, 1u << SIM7600_PWR_STDN); //turn on 3.8V modem
 			}
 			break;
 
-
 		case 'f':
-			if(chr2 & 4){
+			if((chr2 & 4) || (chr2 == '4')){
 				GPIO_PortSet(GPIO, LPC845_PORT, 1u << LCD_PWR_STDN); //turn off 5V
 			}
+			if((chr2 & 2) || (chr2 == '2')){
+				GPIO_PortSet(GPIO, LPC845_PORT, 1u << SIM7600_PWR_STDN); //turn off 3.8V modem
+			}
 
-			if(chr2 & 1){
+			if((chr2 & 1) || (chr2 == '1')){
 				time_since_reset_interval = 0;
 				GPIO_PortSet(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);
 				GPIO_PortSet(GPIO, LPC845_PORT, 1u << SIM7600_PWR_STDN);
@@ -311,9 +322,7 @@ void decode_command(void)
 				//	GPIO_PortClear(GPIO, LPC845_PORT, 1u << UI_ROW_PIN);
 
 				row2_output_configuration();
-
 			}
-
 			break;
 
 		default:

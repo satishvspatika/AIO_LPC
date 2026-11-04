@@ -36,7 +36,7 @@ static void vUi_Task(void *pvParameters)
         modem_status_t modem_stat;
         sim7600_get_status(&modem_stat);
 
-        ui_display_task_step(&telem, modem_stat.csq_dbm, modem_stat.ip_addr);
+        ui_display_task_step(&telem, &modem_stat);
 
         vTaskDelayUntil(&xLastWakeTime, 50 / portTICK_RATE_MS);
     }
@@ -44,7 +44,12 @@ static void vUi_Task(void *pvParameters)
 
 static void execute_slot_transmission(telemetry_data_t *telem)
 {
-    storage_log_debug("MODEM", "Booting SIM7600 4G LTE Modem...");
+    if (!sim7600_acquire(5000)) {
+        storage_log_debug("MODEM", "Modem busy, deferring slot transmission");
+        return;
+    }
+
+    storage_log_debug("MODEM", "SIM7600 slot transmission starting...");
     if (sim7600_power_on()) {
         modem_status_t status;
         sim7600_get_status(&status);
@@ -102,12 +107,11 @@ static void execute_slot_transmission(telemetry_data_t *telem)
 
         /* Check and process incoming operator SMS */
         sim7600_check_incoming_sms(telem);
-
-        /* Deterministic modem power off */
-        sim7600_power_off();
     } else {
         storage_log_debug("MODEM", "Modem power-on or network registration failed!");
     }
+
+    sim7600_release();
 }
 
 static void vMain_Task(void *pvParameters)
@@ -122,7 +126,7 @@ static void vMain_Task(void *pvParameters)
         telemetry_data_t telem;
         bool telem_ready = intermcu_get_telemetry(&telem);
 
-        if (telem_ready && strlen(telem.present_time) >= 14) {
+        if (telem_ready && strlen(telem.present_time) >= 14 && strncmp(telem.present_time, "20", 2) == 0) {
             int min = (telem.present_time[10] - '0') * 10 + (telem.present_time[11] - '0');
             int sec = (telem.present_time[12] - '0') * 10 + (telem.present_time[13] - '0');
 
@@ -163,15 +167,16 @@ static void vMain_Task(void *pvParameters)
     }
 }
 
-/* UART3 Inter-MCU Receiver Task */
-static void vUart3_Task(void *pvParameters)
+/* SIM7600 Modem Supervisor Task (Boots modem, monitors registration, polls CSQ/carrier/time) */
+static void vModem_Task(void *pvParameters)
 {
     (void)pvParameters;
 
+    storage_log_debug("MODEM", "Modem Supervisor Task Started");
+
     for (;;) {
-        /* Hardware ISR UART3_IRQHandler handles all incoming bytes from LPC845 in real-time.
-         * Periodic sleep keeps task context alive. */
-        vTaskDelay(1000 / portTICK_RATE_MS);
+        sim7600_worker_step();
+        vTaskDelay(2000 / portTICK_RATE_MS);
     }
 }
 
@@ -190,7 +195,7 @@ int main(void)
     /* Create FreeRTOS Tasks */
     /* UiTask at Priority 3 guarantees instant keypad scan and screen responsiveness */
     xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     512, NULL, 3, NULL);
-    xTaskCreate(vUart3_Task,  (const signed char *)"Uart3Task",  256, NULL, 2, NULL);
+    xTaskCreate(vModem_Task,  (const signed char *)"ModemTask",  768, NULL, 2, NULL);
     xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   768, NULL, 1, NULL);
     xTaskCreate(vDisk_Task,   (const signed char *)"DiskTask",   512, NULL, 1, NULL);
 

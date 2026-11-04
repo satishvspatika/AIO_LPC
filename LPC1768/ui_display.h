@@ -2,6 +2,7 @@
 #define UI_DISPLAY_H
 
 #include "intermcu_protocol.h"
+#include "sim7600_driver.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -21,7 +22,7 @@ typedef enum {
 } key_code_t;
 
 void ui_display_init(void);
-void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const char *ip_addr);
+void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_t *modem_stat);
 key_code_t ui_keypad_scan(void);
 
 /* Activity timer reset on user interactions */
