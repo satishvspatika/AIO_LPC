@@ -163,7 +163,7 @@ int main(void)
 
     /* Create FreeRTOS Tasks */
     xTaskCreate(vDisk_Task,   (const signed char *)"DiskTask",   256, NULL, 3, NULL);
-    xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   512, NULL, 2, NULL);
+    xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   768, NULL, 2, NULL);
     xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     384, NULL, 1, NULL);
     xTaskCreate(vUart3_Task,  (const signed char *)"Uart3Task",  256, NULL, 2, NULL);
 

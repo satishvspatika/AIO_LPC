@@ -18,6 +18,12 @@ static char s_rx_buf[RX_BUFFER_SIZE];
 static volatile uint16_t s_rx_head = 0;
 static volatile uint16_t s_rx_tail = 0;
 
+/* Static buffers to prevent task stack overflows in FreeRTOS */
+static char s_rx_temp[RX_BUFFER_SIZE];
+static char s_http_req[1024];
+static char s_http_capture[1024];
+static char s_sms_capture[512];
+
 static modem_status_t s_modem_status = {
     .csq_val = 99,
     .csq_dbm = -113,
@@ -111,24 +117,23 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
     uint32_t elapsed = 0;
     while (elapsed < timeout_ms) {
         if (s_rx_tail != s_rx_head) {
-            /* Snapshot current buffer content */
-            char temp[RX_BUFFER_SIZE];
+            /* Snapshot current buffer content using static buffer (prevents stack overflow) */
             uint16_t tail = s_rx_tail;
             uint16_t head = s_rx_head;
             uint16_t idx = 0;
 
-            while (tail != head && idx < sizeof(temp) - 1) {
-                temp[idx++] = s_rx_buf[tail];
+            while (tail != head && idx < sizeof(s_rx_temp) - 1) {
+                s_rx_temp[idx++] = s_rx_buf[tail];
                 tail = (tail + 1) % RX_BUFFER_SIZE;
             }
-            temp[idx] = '\0';
+            s_rx_temp[idx] = '\0';
 
-            if (strstr(temp, expected) != NULL) {
+            if (strstr(s_rx_temp, expected) != NULL) {
                 if (out_capture && capture_size > 0) {
-                    strncpy(out_capture, temp, capture_size - 1);
+                    strncpy(out_capture, s_rx_temp, capture_size - 1);
                     out_capture[capture_size - 1] = '\0';
                 }
-                storage_log_debug("MODEM_RX", temp);
+                storage_log_debug("MODEM_RX", s_rx_temp);
                 return true;
             }
         }
@@ -368,8 +373,7 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
 
     /* Build HTTP Request Headers */
     const char *content_type = (endpoint->format == FORMAT_JSON) ? "application/json" : "application/x-www-form-urlencoded";
-    char http_req[1024];
-    int req_len = snprintf(http_req, sizeof(http_req),
+    int req_len = snprintf(s_http_req, sizeof(s_http_req),
         "POST %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Content-Type: %s\r\n"
@@ -392,18 +396,17 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
     }
 
     clear_rx();
-    send_raw(http_req);
+    send_raw(s_http_req);
 
     /* Wait for HTTP Response */
-    char capture[1024];
     bool success = false;
-    if (wait_response("+IPD", 10000, capture, sizeof(capture))) {
-        if (strstr(capture, "200 OK") || strstr(capture, "Success") || strstr(capture, "accepted")) {
+    if (wait_response("+IPD", 10000, s_http_capture, sizeof(s_http_capture))) {
+        if (strstr(s_http_capture, "200 OK") || strstr(s_http_capture, "Success") || strstr(s_http_capture, "accepted")) {
             success = true;
-            storage_log_http(capture);
+            storage_log_http(s_http_capture);
 
             /* Extract server Date: header */
-            char *d_ptr = strstr(capture, "Date: ");
+            char *d_ptr = strstr(s_http_capture, "Date: ");
             if (d_ptr && date_hdr_out && date_hdr_size > 0) {
                 char *end = strstr(d_ptr, "\r\n");
                 if (end) {
@@ -470,12 +473,11 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
 
 void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
 {
-    char capture[512];
     clear_rx();
     send_raw("AT+CMGL=\"REC UNREAD\"\r\n");
-    if (wait_response("+CMGL:", 2000, capture, sizeof(capture))) {
+    if (wait_response("+CMGL:", 2000, s_sms_capture, sizeof(s_sms_capture))) {
         char sender_phone[32] = "";
-        char *p = strstr(capture, "+CMGL: ");
+        char *p = strstr(s_sms_capture, "+CMGL: ");
         if (p) {
             /* Extract sender number */
             char *num_start = strchr(p, '\"');
@@ -497,7 +499,7 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
             }
         }
 
-        if (strstr(capture, "#STATUS") || strstr(capture, "#STAT")) {
+        if (strstr(s_sms_capture, "#STATUS") || strstr(s_sms_capture, "#STAT")) {
             char reply[160];
             snprintf(reply, sizeof(reply),
                 "AIO STN:%s\nTIME:%s\nBAT:%04.2fV\nSIG:%ddBm\nRAIN 15M:%04.1fmm\nCUM:%04.1fmm",
