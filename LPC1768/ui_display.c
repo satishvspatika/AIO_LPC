@@ -355,29 +355,34 @@ static void keypad_init_hw(void)
     LPC_GPIO0->FIOMASK &= ~((1UL << 20) | (1UL << 21) | (1UL << 22));          /* Explicitly unmasked */
 }
 
-static void output_row(int col)
+static void output_row(int row)
 {
-    /* All column strobes idle HIGH first */
+    /* All row strobe lines idle HIGH first */
     LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26));
     LPC_GPIO1->FIOSET = (1UL << 21);
 
-    /* Assert selected column strobe LOW */
-    if (col == 0) {
-        LPC_GPIO3->FIOCLR = (1UL << 25); /* Col 0 (P3.25): MENU, LEFT, BACK */
-    } else if (col == 1) {
-        LPC_GPIO3->FIOCLR = (1UL << 26); /* Col 1 (P3.26): UP, EN, DOWN */
-    } else if (col == 2) {
-        LPC_GPIO1->FIOCLR = (1UL << 21); /* Col 2 (P1.21): CALIB, RIGHT, DSP */
+    /* Assert selected row strobe LOW:
+     * Row 0 (P3.26): Top row    [MENU, UP, CALIB]
+     * Row 1 (P3.25): Middle row [LEFT, EN, RIGHT]
+     * Row 2 (P1.21): Bottom row [BACK, DOWN, DSP]
+     */
+    if (row == 0) {
+        LPC_GPIO3->FIOCLR = (1UL << 26); /* Row 0 (P3.26) */
+    } else if (row == 1) {
+        LPC_GPIO3->FIOCLR = (1UL << 25); /* Row 1 (P3.25) */
+    } else if (row == 2) {
+        LPC_GPIO1->FIOCLR = (1UL << 21); /* Row 2 (P1.21) */
     }
 }
 
 /* Keypad Scanning Engine:
- * Matrix Wiring on hardware (decoded & confirmed on physical hardware):
+ * Matrix Wiring verified against hardware & recovered TWS codebase (kbd.c / kbd.h):
  *
- *                Col 0 (P3.25)     Col 1 (P3.26)     Col 2 (P1.21)
- *  Row 0 (P0.21): MENU              UP                CALIB
- *  Row 1 (P0.22): LEFT              EN                RIGHT
- *  Row 2 (P0.20): BACK              DOWN              DSP
+ *                 Col 0 (P0.22)   Col 1 (P0.21)   Col 2 (P0.20)
+ *                 (bit 2, 0x04)   (bit 1, 0x02)   (bit 0, 0x01)
+ *  Row 0 (P3.26):  MENU            UP              CALIB
+ *  Row 1 (P3.25):  LEFT            EN              RIGHT
+ *  Row 2 (P1.21):  BACK            DOWN            DSP
  */
 key_code_t ui_keypad_scan(void)
 {
@@ -386,60 +391,60 @@ key_code_t ui_keypad_scan(void)
     static uint32_t s_debounce_count = 0;
     static uint32_t s_hold_timer = 0;
 
-    /* 1. Baseline qualification: all column strobes idle HIGH */
+    /* 1. Baseline qualification: all row strobes idle HIGH */
     output_row(-1);
     delay_us(500);
 
-    /* Baseline stuck row check:
-     * When all strobes are HIGH, row inputs (P0.20, P0.21, P0.22) MUST read HIGH (pulled up).
-     * If any pin reads 0 when all strobes are 1, that line has external leakage
-     * and must be ignored during scanning to avoid phantom keys. */
+    /* Baseline stuck column check:
+     * When all row outputs are HIGH, column inputs (P0.20, P0.21, P0.22) MUST read HIGH (pulled up).
+     * If any pin reads 0 when all rows are 1, that line has external leakage or short. */
     uint32_t baseline = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
-    uint32_t stuck_rows = (~baseline) & 0x07;
+    uint32_t stuck_cols = (~baseline) & 0x07;
 
     key_code_t raw = KEY_NONE;
 
-    /* 2. Scan Col 0 (P3.25 LOW) -> [MENU, LEFT, BACK] */
+    /* 2. Scan Row 0 (P3.26 LOW) -> [MENU, UP, CALIB] */
     output_row(0);
     delay_us(1000);
-    uint32_t rows_c0 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
+    uint32_t cols_r0 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     output_row(-1);
 
-    /* 3. Scan Col 1 (P3.26 LOW) -> [UP, EN, DOWN] */
+    /* 3. Scan Row 1 (P3.25 LOW) -> [LEFT, EN, RIGHT] */
     output_row(1);
     delay_us(1000);
-    uint32_t rows_c1 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
+    uint32_t cols_r1 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     output_row(-1);
 
-    /* 4. Scan Col 2 (P1.21 LOW) -> [CALIB, RIGHT, DSP] */
+    /* 4. Scan Row 2 (P1.21 LOW) -> [BACK, DOWN, DSP] */
     output_row(2);
     delay_us(1000);
-    uint32_t rows_c2 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
+    uint32_t cols_r2 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     output_row(-1);
 
-    g_dbg_cols_r0 = rows_c0;
-    g_dbg_cols_r1 = rows_c1;
-    g_dbg_cols_r2 = rows_c2;
+    g_dbg_cols_r0 = cols_r0;
+    g_dbg_cols_r1 = cols_r1;
+    g_dbg_cols_r2 = cols_r2;
 
     /* Decode Key:
-     * P0.21 (bit 1, mask 0x02) = Row 0 (Top:    MENU,  UP,    CALIB)
-     * P0.22 (bit 2, mask 0x04) = Row 1 (Middle: LEFT,  EN,    RIGHT)
-     * P0.20 (bit 0, mask 0x01) = Row 2 (Bottom: BACK,  DOWN,  DSP)
+     * P0.22 (bit 2, mask 0x04) = Col 0 (Left Column:   MENU,  LEFT,  BACK)
+     * P0.21 (bit 1, mask 0x02) = Col 1 (Center Column: UP,    EN,    DOWN)
+     * P0.20 (bit 0, mask 0x01) = Col 2 (Right Column:  CALIB, RIGHT, DSP)
      */
-    /* Col 0 (P3.25 LOW): Left Column */
-    if (!(rows_c0 & 0x02) && !(stuck_rows & 0x02))      raw = KEY_MENU;   /* Row 0 (P0.21) */
-    else if (!(rows_c0 & 0x04) && !(stuck_rows & 0x04)) raw = KEY_LEFT;   /* Row 1 (P0.22) */
-    else if (!(rows_c0 & 0x01) && !(stuck_rows & 0x01)) raw = KEY_BACK;   /* Row 2 (P0.20) */
 
-    /* Col 1 (P3.26 LOW): Center Column */
-    else if (!(rows_c1 & 0x02) && !(stuck_rows & 0x02)) raw = KEY_UP;     /* Row 0 (P0.21) */
-    else if (!(rows_c1 & 0x04) && !(stuck_rows & 0x04)) raw = KEY_EN;     /* Row 1 (P0.22) */
-    else if (!(rows_c1 & 0x01) && !(stuck_rows & 0x01)) raw = KEY_DOWN;   /* Row 2 (P0.20) */
+    /* Row 0 (P3.26 LOW): Top Row */
+    if (!(cols_r0 & 0x04) && !(stuck_cols & 0x04))      raw = KEY_MENU;   /* Col 0 (P0.22) */
+    else if (!(cols_r0 & 0x02) && !(stuck_cols & 0x02)) raw = KEY_UP;     /* Col 1 (P0.21) */
+    else if (!(cols_r0 & 0x01) && !(stuck_cols & 0x01)) raw = KEY_CALIB;  /* Col 2 (P0.20) */
 
-    /* Col 2 (P1.21 LOW): Right Column */
-    else if (!(rows_c2 & 0x02) && !(stuck_rows & 0x02)) raw = KEY_CALIB;  /* Row 0 (P0.21) */
-    else if (!(rows_c2 & 0x04) && !(stuck_rows & 0x04)) raw = KEY_RIGHT;  /* Row 1 (P0.22) */
-    else if (!(rows_c2 & 0x01) && !(stuck_rows & 0x01)) raw = KEY_DSP;    /* Row 2 (P0.20) */
+    /* Row 1 (P3.25 LOW): Middle Row */
+    else if (!(cols_r1 & 0x04) && !(stuck_cols & 0x04)) raw = KEY_LEFT;   /* Col 0 (P0.22) */
+    else if (!(cols_r1 & 0x02) && !(stuck_cols & 0x02)) raw = KEY_EN;     /* Col 1 (P0.21) */
+    else if (!(cols_r1 & 0x01) && !(stuck_cols & 0x01)) raw = KEY_RIGHT;  /* Col 2 (P0.20) */
+
+    /* Row 2 (P1.21 LOW): Bottom Row */
+    else if (!(cols_r2 & 0x04) && !(stuck_cols & 0x04)) raw = KEY_BACK;   /* Col 0 (P0.22) */
+    else if (!(cols_r2 & 0x02) && !(stuck_cols & 0x02)) raw = KEY_DOWN;   /* Col 1 (P0.21) */
+    else if (!(cols_r2 & 0x01) && !(stuck_cols & 0x01)) raw = KEY_DSP;    /* Col 2 (P0.20) */
 
     /* 5. 2-Stage Debounce & Release Filter (50ms scan interval) */
     if (raw != KEY_NONE) {
