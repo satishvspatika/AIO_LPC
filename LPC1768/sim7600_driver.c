@@ -2,6 +2,7 @@
 #include "hal_power.h"
 #include "storage_log.h"
 #include "user_config.h"
+#include "flash_nvram.h"
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
 #include "lpc17xx_gpio.h"
@@ -496,6 +497,75 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
     return wait_response("+CMGS:", 10000, NULL, 0);
 }
 
+bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
+{
+    if (!telem) return false;
+
+    bool we_powered = false;
+    /* Ensure modem is powered on and registered */
+    if (!s_modem_status.is_registered) {
+        storage_log_debug("SMS", "Modem idle, booting SIM7600 for status SMS...");
+        if (!sim7600_power_on()) {
+            storage_log_debug("SMS", "Failed to boot/register modem for SMS!");
+            return false;
+        }
+        we_powered = true;
+    }
+
+    const char *dest_phone = STATUS_SMS_DEST_NUMBER;
+    const char *network_name = STATUS_SMS_NETWORK_NAME;
+    const char *stn_type = (ACTIVE_SYSTEM == SYSTEM_TRG) ? "TRG" : "TWS";
+    const char *stn_id = flash_nvram_get_station_id();
+
+    /* Format timestamp in ISO: YYYY-MM-DDTHH:MM */
+    char time_iso[24] = "2026-01-01T00:00";
+    if (strlen(telem->present_time) >= 12) {
+        snprintf(time_iso, sizeof(time_iso), "%.4s-%.2s-%.2sT%.2s:%.2s",
+                 telem->present_time, telem->present_time + 4, telem->present_time + 6,
+                 telem->present_time + 8, telem->present_time + 10);
+    }
+
+    /* Format slot time in ISO: YYYY-MM-DDTHH:MM */
+    char slot_iso[24] = "2026-01-01T00:00";
+    if (strlen(telem->slot_time) >= 12) {
+        snprintf(slot_iso, sizeof(slot_iso), "%.4s-%.2s-%.2sT%.2s:%.2s",
+                 telem->slot_time, telem->slot_time + 4, telem->slot_time + 6,
+                 telem->slot_time + 8, telem->slot_time + 10);
+    }
+
+    /* Format calib date: YYYY-MM-DD */
+    char calib_date[16] = "2026-01-01";
+    if (strlen(telem->present_time) >= 8) {
+        snprintf(calib_date, sizeof(calib_date), "%.4s-%.2s-%.2s",
+                 telem->present_time, telem->present_time + 4, telem->present_time + 6);
+    }
+
+    /* Exact ESP32 format:
+     * <NETWORK>,<STATION_TYPE>,STATUS-F,<STATION_ID>,<YYYY-MM-DDTHH:MM>,<UNIT_VER>,15,<CSQ_DBM>,<BAT1>,<BAT2>,<SOLAR_CHARGING>,<SD_STATUS>,<CALIB_STATUS>,<CALIB_DATE>,<LAST_REC_DATE_TIME>,0\r\n
+     */
+    char status_msg[256];
+    snprintf(status_msg, sizeof(status_msg),
+        "%s,%s,STATUS-F,%s,%s,%s,15,%d,03.3,%04.1f,%c,SDC-OK,CLB-OK,%s,%s,0\r\n",
+        network_name,
+        stn_type,
+        stn_id,
+        time_iso,
+        LCD_VERSION_STRING,
+        csq_dbm,
+        telem->bat1_volt,
+        (telem->solar_status == 'C' || telem->solar_volt > 4.0f) ? 'Y' : 'N',
+        calib_date,
+        slot_iso
+    );
+
+    storage_log_debug("SMS", status_msg);
+    bool ok = sim7600_send_sms(dest_phone, status_msg);
+    if (we_powered) {
+        sim7600_power_off();
+    }
+    return ok;
+}
+
 void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
 {
     clear_rx();
@@ -528,11 +598,10 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
             char reply[160];
             snprintf(reply, sizeof(reply),
                 "AIO STN:%s\nTIME:%s\nBAT:%04.2fV\nSIG:%ddBm\nRAIN 15M:%04.1fmm\nCUM:%04.1fmm",
-                STATION_ID_DEFAULT, telemetry->present_time, telemetry->bat1_volt,
+                flash_nvram_get_station_id(), telemetry->present_time, telemetry->bat1_volt,
                 s_modem_status.csq_dbm, telemetry->rf_15m_mm, telemetry->rf_cum_mm);
 
-            const char *target = (strlen(sender_phone) > 5) ? sender_phone :
-                ((ACTIVE_CONFIG == CFG_BIHAR_TRG) ? "9741391102" : "9980945474");
+            const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
             sim7600_send_sms(target, reply);
         } else if (strstr(s_sms_capture, "#TIME=") || strstr(s_sms_capture, "#SET_TIME=")) {
             /* Operator manual time set: #TIME=YYYYMMDDHHMMSS */
@@ -548,8 +617,8 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
                     storage_log_debug("RTC", "DS1338 RTC manually updated via SMS");
 
                     char reply[80];
-                    snprintf(reply, sizeof(reply), "AIO STN:%s\nRTC SET OK: %.14s", STATION_ID_DEFAULT, ts);
-                    const char *target = (strlen(sender_phone) > 5) ? sender_phone : "9980945474";
+                    snprintf(reply, sizeof(reply), "AIO STN:%s\nRTC SET OK: %.14s", flash_nvram_get_station_id(), ts);
+                    const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
                     sim7600_send_sms(target, reply);
                 }
             }

@@ -30,9 +30,18 @@
 #endif
 
 /* Firmware Version Identifier */
-#define FIRMWARE_VERSION    "AIO_6.0.5"
-#define LCD_VERSION_STRING  "v6.0.5"
+#define FIRMWARE_VERSION    "AIO_6.0.6"
+#define LCD_VERSION_STRING  "v6.0.6"
 #define STATION_ID_DEFAULT  "001922"
+
+/* Status SMS Destination & Network Identifiers */
+#if (ACTIVE_CONFIG == CFG_BIHAR_TRG)
+#define STATUS_SMS_DEST_NUMBER    "9741391102"
+#define STATUS_SMS_NETWORK_NAME   "DES-BIH"
+#else
+#define STATUS_SMS_DEST_NUMBER    "9980945474"
+#define STATUS_SMS_NETWORK_NAME   "KSNDMC"
+#endif
 
 /* Debug Dump Engine Settings */
 #define SDC_DEBUG_DUMP_DEFAULT  1       /* 1 = verbose debug dump enabled by default */

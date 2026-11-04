@@ -19,6 +19,8 @@ typedef struct __attribute__((packed)) {
 } station_nvram_params_t;
 
 void flash_nvram_init(void);
+const char *flash_nvram_get_station_id(void);
+bool flash_nvram_set_station_id(const char *new_id);
 bool flash_nvram_read(station_nvram_params_t *out_params);
 bool flash_nvram_write(const station_nvram_params_t *in_params);
 

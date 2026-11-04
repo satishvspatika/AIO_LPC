@@ -6,6 +6,7 @@
 #include "sim7600_driver.h"
 #include "ui_display.h"
 #include "storage_log.h"
+#include "flash_nvram.h"
 #include "user_config.h"
 #include "lpc17xx_uart.h"
 #include <stdio.h>
@@ -82,13 +83,14 @@ static void vMain_Task(void *pvParameters)
             /* Format HTTP payload based on active configuration */
             char payload[512] = "";
             const http_endpoint_t *endpoint = telemetry_get_endpoint(ACTIVE_CONFIG);
+            const char *stn_id = flash_nvram_get_station_id();
 
             #if (ACTIVE_CONFIG == CFG_KSNDMC_TRG)
-            format_payload_ksndmc_trg(payload, sizeof(payload), STATION_ID_DEFAULT, &telem, status.csq_dbm);
+            format_payload_ksndmc_trg(payload, sizeof(payload), stn_id, &telem, status.csq_dbm);
             #elif (ACTIVE_CONFIG == CFG_BIHAR_TRG)
-            format_payload_bihar_trg(payload, sizeof(payload), STATION_ID_DEFAULT, &telem, status.csq_dbm);
+            format_payload_bihar_trg(payload, sizeof(payload), stn_id, &telem, status.csq_dbm);
             #else
-            format_payload_ksndmc_tws(payload, sizeof(payload), STATION_ID_DEFAULT, &telem, status.csq_dbm);
+            format_payload_ksndmc_tws(payload, sizeof(payload), stn_id, &telem, status.csq_dbm);
             #endif
 
             /* Transmit payload via direct Layer-4 TCP socket */
@@ -153,6 +155,7 @@ int main(void)
     for (volatile int d = 0; d < 50000; d++);
 
     hal_power_init();
+    flash_nvram_init();
     ui_display_init();
     intermcu_protocol_init();
     storage_log_init();
@@ -160,7 +163,7 @@ int main(void)
 
     /* Create FreeRTOS Tasks */
     /* UiTask at Priority 3 guarantees instant keypad scan and screen responsiveness */
-    xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     384, NULL, 3, NULL);
+    xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     512, NULL, 3, NULL);
     xTaskCreate(vUart3_Task,  (const signed char *)"Uart3Task",  256, NULL, 2, NULL);
     xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   768, NULL, 1, NULL);
     xTaskCreate(vDisk_Task,   (const signed char *)"DiskTask",   256, NULL, 1, NULL);

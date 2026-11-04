@@ -9,7 +9,8 @@
 typedef enum {
     KEY_NONE = 0,
     KEY_MENU,       /* Row 0, Col 0 */
-    KEY_TOP,        /* Row 0, Col 1 (Up) */
+    KEY_UP,         /* Row 0, Col 1 (Up) */
+    KEY_TOP = KEY_UP,
     KEY_CALIB,      /* Row 0, Col 2 */
     KEY_LEFT,       /* Row 1, Col 0 */
     KEY_EN,         /* Row 1, Col 1 (Enter/Set) */
