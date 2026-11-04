@@ -18,19 +18,33 @@ static char s_active_last_logged[20] = "NO DATA YET";
 void flash_nvram_init(void)
 {
     const char *flash_str = (const char *)PARAM_SECTOR_ADDR;
-    /* Legacy / Factory layout: offset 0 contains station ID string (e.g. "001922") */
+    /* Legacy / Factory layout: offset 0 contains station ID string (e.g. "001061") */
     if (flash_str[0] >= '0' && flash_str[0] <= '9') {
         int len = 0;
         while (len < 6 && flash_str[len] >= '0' && flash_str[len] <= '9') {
             len++;
         }
         if (len >= 4) {
-            strncpy(s_active_station_id, flash_str, len);
-            s_active_station_id[len] = '\0';
+            char temp_id[8] = "";
+            strncpy(temp_id, flash_str, len);
+            temp_id[len] = '\0';
+
+            /* If flash contains legacy placeholder default "001922", migrate to new default "001061" */
+            if (strcmp(temp_id, "001922") == 0) {
+                strncpy(s_active_station_id, STATION_ID_DEFAULT, sizeof(s_active_station_id) - 1);
+                s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
+                flash_nvram_set_station_id(STATION_ID_DEFAULT);
+            } else {
+                /* User-configured custom Station ID: preserve permanently */
+                strncpy(s_active_station_id, temp_id, sizeof(s_active_station_id) - 1);
+                s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
+            }
         }
     } else {
+        /* Blank/uninitialized sector: write new default station ID */
         strncpy(s_active_station_id, STATION_ID_DEFAULT, sizeof(s_active_station_id) - 1);
         s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
+        flash_nvram_set_station_id(STATION_ID_DEFAULT);
     }
 
     /* Load Last Logged timestamp from Sector 1 if present */

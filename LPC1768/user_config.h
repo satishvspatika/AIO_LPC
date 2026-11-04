@@ -29,9 +29,9 @@
 #define ACTIVE_SYSTEM   ((UNIT_CFG == KSNDMC_TWS) ? SYSTEM_TWS : SYSTEM_TRG)
 
 /* Firmware Version Identifier */
-#define FIRMWARE_VERSION    "AIO_6.1.3"
-#define LCD_VERSION_STRING  "v6.1.3"
-#define STATION_ID_DEFAULT  "001922"
+#define FIRMWARE_VERSION    "AIO_6.1.4"
+#define LCD_VERSION_STRING  "v6.1.4"
+#define STATION_ID_DEFAULT  "001061"
 
 /* Status SMS Destination & Network Identifiers */
 #if (UNIT_CFG == BIHAR_TRG)
