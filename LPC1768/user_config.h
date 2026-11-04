@@ -30,8 +30,8 @@
 #endif
 
 /* Firmware Version Identifier */
-#define FIRMWARE_VERSION    "AIO_6.0.3"
-#define LCD_VERSION_STRING  "v6.0.3"
+#define FIRMWARE_VERSION    "AIO_6.0.4"
+#define LCD_VERSION_STRING  "v6.0.4"
 #define STATION_ID_DEFAULT  "001922"
 
 /* Debug Dump Engine Settings */

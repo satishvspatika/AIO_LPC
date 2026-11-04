@@ -162,10 +162,11 @@ int main(void)
     sim7600_init();
 
     /* Create FreeRTOS Tasks */
-    xTaskCreate(vDisk_Task,   (const signed char *)"DiskTask",   256, NULL, 3, NULL);
-    xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   768, NULL, 2, NULL);
-    xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     384, NULL, 1, NULL);
+    /* UiTask at Priority 3 guarantees instant keypad scan and screen responsiveness */
+    xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     384, NULL, 3, NULL);
     xTaskCreate(vUart3_Task,  (const signed char *)"Uart3Task",  256, NULL, 2, NULL);
+    xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   768, NULL, 1, NULL);
+    xTaskCreate(vDisk_Task,   (const signed char *)"DiskTask",   256, NULL, 1, NULL);
 
     /* Start the scheduler */
     vTaskStartScheduler();

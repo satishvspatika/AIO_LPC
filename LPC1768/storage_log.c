@@ -61,6 +61,7 @@ void storage_log_http(const char *entry)
 void storage_log_drain_step(void)
 {
     if (!s_fs_mounted) return;
+    if (s_head == s_tail) return; /* No data to flush */
 
     static bool s_checked_trigger = false;
     if (!s_checked_trigger) {
@@ -70,8 +71,6 @@ void storage_log_drain_step(void)
             s_debug_dump_enabled = true;
         }
     }
-
-    if (s_head == s_tail) return;
 
     FIL file;
     if (f_open(&file, DEBUG_LOG_FILENAME, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {

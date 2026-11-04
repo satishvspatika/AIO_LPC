@@ -170,19 +170,23 @@ static void keypad_init_hw(void)
 {
     /* Rows as GPIO Outputs */
     LPC_PINCON->PINSEL7 &= ~((0x03UL << 18) | (0x03UL << 20)); /* P3.25, P3.26 */
-    LPC_PINCON->PINMODE7 &= ~((0x03UL << 18) | (0x03UL << 20));
+    LPC_PINCON->PINMODE7 &= ~((0x03UL << 18) | (0x03UL << 20)); /* Pull-Up */
+    LPC_PINCON->PINMODE_OD3 &= ~((1UL << 25) | (1UL << 26));    /* Push-Pull */
     LPC_GPIO3->FIODIR |= ((1UL << 25) | (1UL << 26));
-    LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26)); /* Idle HIGH */
+    LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26));            /* Idle HIGH */
 
-    LPC_PINCON->PINSEL3 &= ~(0x03UL << 10); /* P1.21 */
-    LPC_PINCON->PINMODE3 &= ~(0x03UL << 10);
+    LPC_PINCON->PINSEL3 &= ~(0x03UL << 10);                     /* P1.21 */
+    LPC_PINCON->PINMODE3 &= ~(0x03UL << 10);                    /* Pull-Up */
+    LPC_PINCON->PINMODE_OD1 &= ~(1UL << 21);                    /* Push-Pull */
     LPC_GPIO1->FIODIR |= (1UL << 21);
-    LPC_GPIO1->FIOSET = (1UL << 21); /* Idle HIGH */
+    LPC_GPIO1->FIOSET = (1UL << 21);                            /* Idle HIGH */
 
     /* Columns as GPIO Inputs with Pull-Up */
     LPC_PINCON->PINSEL1 &= ~((0x03UL << 8) | (0x03UL << 10) | (0x03UL << 12)); /* P0.20, P0.21, P0.22 */
-    LPC_PINCON->PINMODE1 &= ~((0x03UL << 8) | (0x03UL << 10) | (0x03UL << 12)); /* Pull-Up */
-    LPC_GPIO0->FIODIR &= ~((1UL << 20) | (1UL << 21) | (1UL << 22));
+    LPC_PINCON->PINMODE1 &= ~((0x03UL << 8) | (0x03UL << 10) | (0x03UL << 12)); /* Internal Pull-Up */
+    LPC_PINCON->PINMODE_OD0 &= ~((1UL << 20) | (1UL << 21) | (1UL << 22));      /* Normal */
+    LPC_GPIO0->FIODIR &= ~((1UL << 20) | (1UL << 21) | (1UL << 22));           /* Inputs */
+    LPC_GPIO0->FIOMASK &= ~((1UL << 20) | (1UL << 21) | (1UL << 22));          /* Explicitly unmasked */
 }
 
 key_code_t ui_keypad_scan(void)
@@ -190,21 +194,25 @@ key_code_t ui_keypad_scan(void)
     static key_code_t last_key = KEY_NONE;
     static uint32_t press_hold_count = 0;
 
+    /* Ensure all rows are idle HIGH before scanning */
+    LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26));
+    LPC_GPIO1->FIOSET = (1UL << 21);
+
     /* Row 0 LOW */
     LPC_GPIO3->FIOCLR = (1UL << 25);
-    delay_us(5);
+    delay_us(100);
     uint32_t cols_r0 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     LPC_GPIO3->FIOSET = (1UL << 25);
 
     /* Row 1 LOW */
     LPC_GPIO3->FIOCLR = (1UL << 26);
-    delay_us(5);
+    delay_us(100);
     uint32_t cols_r1 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     LPC_GPIO3->FIOSET = (1UL << 26);
 
     /* Row 2 LOW */
     LPC_GPIO1->FIOCLR = (1UL << 21);
-    delay_us(5);
+    delay_us(100);
     uint32_t cols_r2 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     LPC_GPIO1->FIOSET = (1UL << 21);
 
@@ -224,10 +232,10 @@ key_code_t ui_keypad_scan(void)
     if (detected != KEY_NONE) {
         if (detected == last_key) {
             press_hold_count++;
-            if (press_hold_count == 4) {
-                return detected; /* Debounced single press */
+            if (press_hold_count == 2) {
+                return detected; /* Fast, responsive 100ms debounced keypress */
             }
-            if (press_hold_count > 40 && (press_hold_count % 8 == 0)) {
+            if (press_hold_count > 15 && (press_hold_count % 4 == 0)) {
                 return detected; /* Auto-repeat */
             }
         } else {

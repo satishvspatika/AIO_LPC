@@ -5,6 +5,8 @@
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
 #include "lpc17xx_gpio.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -35,10 +37,7 @@ static modem_status_t s_modem_status = {
 
 static void delay_ms(uint32_t ms)
 {
-    for (uint32_t i = 0; i < ms; i++) {
-        volatile uint32_t count = 25000;
-        while (count--) { __asm volatile("nop"); }
-    }
+    vTaskDelay((ms + portTICK_RATE_MS - 1) / portTICK_RATE_MS);
 }
 
 void UART2_IRQHandler(void)

@@ -488,8 +488,12 @@ static inline void spi_rcvr_block (
 	}
 
 	do {
+		uint32_t to = 50000;
 		while ( !(LPC_SSP1->SR & SSP_SR_RNE ) ) {
-			// wait for data in RX FIFO (RNE set)
+			if (--to == 0) {
+				LPC_SSP1->CR0 = ( LPC_SSP1->CR0 & ~SSP_CR0_DSS(16) ) | SSP_CR0_DSS(8);
+				return;
+			}
 		}
 		rec = LPC_SSP1->DR;
 		if ( i < ( hwtr - startcnt ) ) {
@@ -803,8 +807,12 @@ static inline void spi_rcvr_block (
 	}
 
 	do {
+		uint32_t to = 50000;
 		while ( !(LPC_SSP0->SR & SSP_SR_RNE ) ) {
-			// wait for data in RX FIFO (RNE set)
+			if (--to == 0) {
+				LPC_SSP0->CR0 = ( LPC_SSP0->CR0 & ~SSP_CR0_DSS(16) ) | SSP_CR0_DSS(8);
+				return;
+			}
 		}
 		rec = LPC_SSP0->DR;
 		if ( i < ( hwtr - startcnt ) ) {
