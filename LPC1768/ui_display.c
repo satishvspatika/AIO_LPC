@@ -282,7 +282,7 @@ static void render_screen(int scr, const telemetry_data_t *telemetry, int csq_db
             #else
             snprintf(line1, sizeof(line1), "KSNDMC - TWS");
             #endif
-            snprintf(line2, sizeof(line2), "ID:%-6s  v6.0", STATION_ID_DEFAULT);
+            snprintf(line2, sizeof(line2), "ID:%-6s %s", STATION_ID_DEFAULT, LCD_VERSION_STRING);
             break;
         case 1: /* Date & Time */
             if (strlen(telemetry->present_time) >= 14) {
