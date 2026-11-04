@@ -706,7 +706,7 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
         stn_type,
         stn_id,
         time_iso,
-        LCD_VERSION_STRING,
+        FIRMWARE_VERSION,
         csq_dbm,
         telem->bat1_volt,
         (telem->solar_status == 'C' || telem->solar_volt > 4.0f) ? 'Y' : 'N',

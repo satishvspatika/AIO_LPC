@@ -110,7 +110,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Read current version from user_config.h
-CURRENT_RAW_VER=$(grep "#define LCD_VERSION_STRING" "$CONFIG_FILE" | head -n1 | sed -E 's/.*"v?([^"]+)".*/\1/' || true)
+CURRENT_RAW_VER=$(grep "#define FIRMWARE_VERSION" "$CONFIG_FILE" | head -n1 | sed -E 's/.*"v?([^"]+)".*/\1/' || true)
 if [ -z "$CURRENT_RAW_VER" ]; then
     CURRENT_RAW_VER="6.0.0"
 fi
@@ -132,7 +132,7 @@ fi
 
 NEW_TAG="v${NEW_RAW_VER}"
 
-# LCD 16x2 sanity check: Line 2 format is "ID:001922 vX.Y.Z" (max 16 chars)
+# LCD 16x2 sanity check: Line 2 format is "ID:001061 vX.Y.Z" (max 16 chars)
 if [ ${#NEW_TAG} -gt 9 ]; then
     echo -e "${YELLOW}[WARNING] Version '${NEW_TAG}' is ${#NEW_TAG} characters. Line 2 on 16x2 LCD may be truncated.${NC}"
 fi
@@ -164,8 +164,7 @@ python3 -c "
 import re
 with open('${CONFIG_FILE}', 'r') as f:
     content = f.read()
-content = re.sub(r'#define FIRMWARE_VERSION\s+\"[^\"]+\"', '#define FIRMWARE_VERSION    \"AIO_${NEW_RAW_VER}\"', content)
-content = re.sub(r'#define LCD_VERSION_STRING\s+\"[^\"]+\"', '#define LCD_VERSION_STRING  \"${NEW_TAG}\"', content)
+content = re.sub(r'#define FIRMWARE_VERSION\s+\"[^\"]+\"', '#define FIRMWARE_VERSION    \"${NEW_TAG}\"', content)
 with open('${CONFIG_FILE}', 'w') as f:
     f.write(content)
 "

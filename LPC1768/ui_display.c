@@ -533,7 +533,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 #else
                 snprintf(line1, sizeof(line1), "KSNDMC - TWS");
                 #endif
-                snprintf(line2, sizeof(line2), "ID:%-6s %s", flash_nvram_get_station_id(), LCD_VERSION_STRING);
+                snprintf(line2, sizeof(line2), "ID:%-6s %s", flash_nvram_get_station_id(), FIRMWARE_VERSION);
                 break;
 
             case SCR_DATETIME:

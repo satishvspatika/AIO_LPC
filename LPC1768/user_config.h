@@ -19,18 +19,8 @@
 #define UNIT_CFG        KSNDMC_TWS
 #endif
 
-/* Backward-compatibility aliases */
-#define ACTIVE_CONFIG   UNIT_CFG
-#define CFG_KSNDMC_TRG  KSNDMC_TRG
-#define CFG_BIHAR_TRG   BIHAR_TRG
-#define CFG_KSNDMC_TWS  KSNDMC_TWS
-#define SYSTEM_TRG      0
-#define SYSTEM_TWS      1
-#define ACTIVE_SYSTEM   ((UNIT_CFG == KSNDMC_TWS) ? SYSTEM_TWS : SYSTEM_TRG)
-
-/* Firmware Version Identifier */
-#define FIRMWARE_VERSION    "AIO_6.1.4"
-#define LCD_VERSION_STRING  "v6.1.4"
+/* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
+#define FIRMWARE_VERSION    "v6.1.5"
 #define STATION_ID_DEFAULT  "001061"
 
 /* Status SMS Destination & Network Identifiers */

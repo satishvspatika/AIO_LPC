@@ -89,7 +89,7 @@ Whenever you push changes, the script automatically increments the version tag (
 ```
 
 The script will:
-1. Update `LCD_VERSION_STRING` in `LPC1768/user_config.h` (visible on 16x2 LCD Line 2 as `ID:001922 v6.0.X`).
+1. Update `FIRMWARE_VERSION` in `LPC1768/user_config.h` (visible on 16x2 LCD Line 2 as `ID:001061 v6.X.Y`).
 2. Recompile all firmware targets via `./build_all.sh`.
 3. Commit all changes, create the Git tag, and push everything to GitHub.
 

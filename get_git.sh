@@ -81,7 +81,7 @@ fi
 
 # Print active version on LCD
 CONFIG_FILE="${ROOT_DIR}/LPC1768/user_config.h"
-ACTIVE_VER=$(grep "#define LCD_VERSION_STRING" "$CONFIG_FILE" | sed -E 's/.*"([^"]+)".*/\1/' || echo "Unknown")
+ACTIVE_VER=$(grep "#define FIRMWARE_VERSION" "$CONFIG_FILE" | sed -E 's/.*"([^"]+)".*/\1/' || echo "Unknown")
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo -e "\n${YELLOW}3. Compiling firmware...${NC}"
