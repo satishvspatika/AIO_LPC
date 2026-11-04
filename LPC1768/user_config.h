@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.2.1"
+#define FIRMWARE_VERSION    "v6.2.2"
 #define STATION_ID_DEFAULT  "001061"
 
 /* Status SMS Destination & Network Identifiers */

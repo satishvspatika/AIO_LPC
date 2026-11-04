@@ -248,6 +248,18 @@ bool storage_backlog_get_next_unsent(uint32_t start_offset, uint32_t *out_offset
 
     while (f_read(&s_backlog_file, &entry, sizeof(entry), &br) == FR_OK && br == sizeof(entry)) {
         if (entry.sent == 0) {
+            /* Guard: Discard legacy corrupted entries (e.g. from previous broken format with empty fields) */
+            if (strstr(entry.payload, "temp=&") != NULL ||
+                strstr(entry.payload, "bat_volt=&") != NULL ||
+                strstr(entry.payload, "rainfall=&") != NULL ||
+                strstr(entry.payload, "rec_time=2026-01-01,00:00") != NULL) {
+                storage_log_debug("BACKLOG", "Discarding malformed legacy backlog record");
+                uint32_t bad_pos = current_pos;
+                f_close(&s_backlog_file);
+                storage_backlog_mark_sent(bad_pos);
+                return storage_backlog_get_next_unsent(start_offset, out_offset, out_payload, max_len);
+            }
+
             *out_offset = current_pos;
             strncpy(out_payload, entry.payload, max_len - 1);
             out_payload[max_len - 1] = '\0';

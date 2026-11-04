@@ -93,6 +93,7 @@ echo "=== 2. Linking LPC1768_AIO.axf ==="
 ${CC} \
   -mcpu=cortex-m3 -mthumb \
   --specs=nano.specs --specs=nosys.specs \
+  -u _printf_float \
   -L"${PROJECT_ROOT}/CMSISv1p30_LPC17xx/Debug" \
   -L"${PROJECT_ROOT}/FreeRTOS_Library/Debug" \
   -L"${OUT_DIR}" \

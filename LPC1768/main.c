@@ -99,23 +99,21 @@ static void execute_slot_transmission(telemetry_data_t *telem)
 
         if (post_ok) {
             /* Archive to SD card /DATA/<YYMMDD>.TXT */
+            const char *ts = (strlen(telem->slot_time) >= 8 && strncmp(telem->slot_time, "20", 2) == 0 && telem->slot_time[2] != '0')
+                             ? telem->slot_time : telem->present_time;
             char date6[8] = "";
-            if (strlen(telem->slot_time) >= 8) {
-                snprintf(date6, sizeof(date6), "%.6s", telem->slot_time + 2);
+            if (strlen(ts) >= 8) {
+                snprintf(date6, sizeof(date6), "%.6s", ts + 2);
                 storage_archive_slot(date6, payload);
                 storage_log_debug("SDC", "Archived slot record to SD card");
             }
 
             /* Persist Last Logged date/time in Sector 1 Flash NVRAM (survives power off) */
             char last_log_ts[20] = "";
-            if (strlen(telem->slot_time) >= 12) {
+            if (strlen(ts) >= 12) {
                 snprintf(last_log_ts, sizeof(last_log_ts), "%.2s-%.2s-%.4s %.2s:%.2s",
-                         telem->slot_time + 6, telem->slot_time + 4, telem->slot_time,
-                         telem->slot_time + 8, telem->slot_time + 10);
-            } else if (strlen(telem->present_time) >= 12) {
-                snprintf(last_log_ts, sizeof(last_log_ts), "%.2s-%.2s-%.4s %.2s:%.2s",
-                         telem->present_time + 6, telem->present_time + 4, telem->present_time,
-                         telem->present_time + 8, telem->present_time + 10);
+                         ts + 6, ts + 4, ts,
+                         ts + 8, ts + 10);
             }
             if (last_log_ts[0] != '\0') {
                 flash_nvram_set_last_logged(last_log_ts);
@@ -151,9 +149,11 @@ static void execute_slot_transmission(telemetry_data_t *telem)
             storage_log_debug("HTTP", "All 3 HTTP attempts failed! Saving slot as pending backlog.");
             storage_backlog_save(telem->slot_time, payload);
 
+            const char *ts = (strlen(telem->slot_time) >= 8 && strncmp(telem->slot_time, "20", 2) == 0 && telem->slot_time[2] != '0')
+                             ? telem->slot_time : telem->present_time;
             char date6[8] = "";
-            if (strlen(telem->slot_time) >= 8) {
-                snprintf(date6, sizeof(date6), "%.6s", telem->slot_time + 2);
+            if (strlen(ts) >= 8) {
+                snprintf(date6, sizeof(date6), "%.6s", ts + 2);
                 storage_archive_slot(date6, payload);
             }
         }
@@ -172,6 +172,14 @@ static void execute_slot_transmission(telemetry_data_t *telem)
         format_payload_ksndmc_tws(payload, sizeof(payload), stn_id, telem, -113);
         #endif
         storage_backlog_save(telem->slot_time, payload);
+
+        const char *ts = (strlen(telem->slot_time) >= 8 && strncmp(telem->slot_time, "20", 2) == 0 && telem->slot_time[2] != '0')
+                         ? telem->slot_time : telem->present_time;
+        char date6[8] = "";
+        if (strlen(ts) >= 8) {
+            snprintf(date6, sizeof(date6), "%.6s", ts + 2);
+            storage_archive_slot(date6, payload);
+        }
     }
 
     sim7600_release();
