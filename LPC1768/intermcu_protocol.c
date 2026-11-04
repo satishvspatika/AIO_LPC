@@ -24,6 +24,9 @@ void intermcu_protocol_init(void)
 void intermcu_reset_cumulative_rain(void)
 {
     s_daily_cumulative_rain_mm = 0.0f;
+    s_latest_telemetry.rf_cum_mm = 0.0f;
+    s_latest_telemetry.rf_15m_mm = 0.0f;
+    s_latest_telemetry.rf_tips_15m = 0;
 }
 
 static void parse_d_packet(const char *frame)

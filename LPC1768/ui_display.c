@@ -2,6 +2,7 @@
 #include "hal_power.h"
 #include "sim7600_driver.h"
 #include "flash_nvram.h"
+#include "intermcu_protocol.h"
 #include "user_config.h"
 #include "lpc17xx_gpio.h"
 #include "lpc17xx_pinsel.h"
@@ -31,21 +32,21 @@
 #define MASK_LCD_BL     (1UL << PIN_LCD_BL)
 
 /* --- 3x3 Keypad Matrix Pin Definitions --- */
-/* Rows: Outputs */
+/* Rows: Outputs (P3.25, P3.26, P1.21) */
 #define KBD_ROW0_PORT   3
-#define KBD_ROW0_PIN    25
+#define KBD_ROW0_PIN    25      /* Left Column:   MENU, LEFT, BACK */
 #define KBD_ROW1_PORT   3
-#define KBD_ROW1_PIN    26
+#define KBD_ROW1_PIN    26      /* Center Column: UP,   EN,   DOWN */
 #define KBD_ROW2_PORT   1
-#define KBD_ROW2_PIN    21
+#define KBD_ROW2_PIN    21      /* Right Column:  CALIB,RIGHT,DSP */
 
-/* Columns: Inputs with pull-ups */
+/* Columns: Inputs with pull-ups (P0.20, P0.21, P0.22) */
 #define KBD_COL0_PORT   0
-#define KBD_COL0_PIN    22
+#define KBD_COL0_PIN    22      /* Middle Row:    LEFT, EN,   RIGHT */
 #define KBD_COL1_PORT   0
-#define KBD_COL1_PIN    21
+#define KBD_COL1_PIN    21      /* Top Row:       MENU, UP,   CALIB */
 #define KBD_COL2_PORT   0
-#define KBD_COL2_PIN    20
+#define KBD_COL2_PIN    20      /* Bottom Row:    BACK, DOWN, DSP */
 
 /* Screen Type Enumeration */
 typedef enum {
@@ -57,31 +58,52 @@ typedef enum {
     SCR_BATTERY,
     SCR_SOLAR,
     SCR_SIGNAL,
+    SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
+    SCR_ERASE_DATA,
     SCR_SLEEP
 } screen_type_t;
 
-#if (ACTIVE_SYSTEM == SYSTEM_TRG)
+/* Dynamic Carousel per System Configuration:
+ * 1. KSNDMC_TWS: NO rain gauge / RF fields. Full weather sensors.
+ * 2. KSNDMC_TRG: NO weather sensors. ONLY cumulative rain. Field Calib.
+ * 3. BIHAR_TRG:  NO weather sensors. BOTH 15M and cumulative rain. Field Calib.
+ */
+#if (ACTIVE_CONFIG == CFG_KSNDMC_TWS)
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
     SCR_DATETIME,
-    SCR_RAINFALL,
-    SCR_BATTERY,
-    SCR_SIGNAL,
-    SCR_SEND_STATUS,
-    SCR_SLEEP
-};
-#else
-static const screen_type_t s_screens[] = {
-    SCR_STATION_ID,
-    SCR_DATETIME,
-    SCR_RAINFALL,
     SCR_TEMP_HUM,
     SCR_WIND,
     SCR_BATTERY,
     SCR_SOLAR,
     SCR_SIGNAL,
     SCR_SEND_STATUS,
+    SCR_ERASE_DATA,
+    SCR_SLEEP
+};
+#elif (ACTIVE_CONFIG == CFG_KSNDMC_TRG)
+static const screen_type_t s_screens[] = {
+    SCR_STATION_ID,
+    SCR_DATETIME,
+    SCR_RAINFALL,       /* Shows ONLY Cumulative Rainfall */
+    SCR_BATTERY,
+    SCR_SIGNAL,
+    SCR_FIELD_CALIB,
+    SCR_SEND_STATUS,
+    SCR_ERASE_DATA,
+    SCR_SLEEP
+};
+#else /* CFG_BIHAR_TRG */
+static const screen_type_t s_screens[] = {
+    SCR_STATION_ID,
+    SCR_DATETIME,
+    SCR_RAINFALL,       /* Shows BOTH 15M and Cumulative Rainfall */
+    SCR_BATTERY,
+    SCR_SIGNAL,
+    SCR_FIELD_CALIB,
+    SCR_SEND_STATUS,
+    SCR_ERASE_DATA,
     SCR_SLEEP
 };
 #endif
@@ -90,7 +112,9 @@ static const screen_type_t s_screens[] = {
 /* UI Operating Modes */
 typedef enum {
     UI_MODE_BROWSE = 0,
-    UI_MODE_EDIT_STN_ID
+    UI_MODE_EDIT_STN_ID,
+    UI_MODE_CALIB,
+    UI_MODE_ERASE_CONFIRM
 } ui_mode_t;
 
 /* Status SMS UI State */
@@ -110,6 +134,13 @@ static ui_mode_t s_ui_mode = UI_MODE_BROWSE;
 static char s_edit_stn_id[8] = "000000";
 static int s_edit_pos = 0;
 
+/* Calibration State */
+static int s_calib_tips = 0;
+static uint16_t s_calib_last_raw_tips = 0;
+static bool s_calib_status_pass = true;
+static char s_calib_last_date[16] = "2026-01-01";
+
+/* Status SMS Feedback */
 static status_ui_state_t s_status_sms_state = STATUS_UI_IDLE;
 static uint32_t s_status_sms_timer = 0;
 
@@ -122,7 +153,6 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
 
 static void delay_us(uint32_t us)
 {
-    /* Approx calibration for 100MHz Cortex-M3 */
     volatile uint32_t count = us * 30;
     while (count--) { __asm volatile("nop"); }
 }
@@ -283,22 +313,32 @@ static void output_row(int row)
     else if (row == 2) LPC_GPIO1->FIOCLR = (1UL << 21);
 }
 
+/* Keypad Scanning Engine:
+ * Matrix Wiring on hardware:
+ * - Row 0 (P3.25): Left Column   [MENU, LEFT,  BACK]
+ * - Row 1 (P3.26): Center Column [UP,   EN,    DOWN]
+ * - Row 2 (P1.21): Right Column  [CALIB,RIGHT, DSP]
+ *
+ * - Col 1 (P0.21, bit 1): Top Row    [MENU, UP,   CALIB]
+ * - Col 0 (P0.22, bit 2): Middle Row [LEFT, EN,   RIGHT]
+ * - Col 2 (P0.20, bit 0): Bottom Row [BACK, DOWN, DSP]
+ */
 key_code_t ui_keypad_scan(void)
 {
     static key_code_t last_key = KEY_NONE;
     static uint32_t press_hold_count = 0;
 
-    /* Row 0 LOW (P3.25) */
+    /* Row 0 LOW (P3.25) -> Left physical column */
     output_row(0);
     delay_us(2000);
     uint32_t cols_r0 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
 
-    /* Row 1 LOW (P3.26) */
+    /* Row 1 LOW (P3.26) -> Center physical column */
     output_row(1);
     delay_us(2000);
     uint32_t cols_r1 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
 
-    /* Row 2 LOW (P1.21) */
+    /* Row 2 LOW (P1.21) -> Right physical column */
     output_row(2);
     delay_us(2000);
     uint32_t cols_r2 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
@@ -312,16 +352,20 @@ key_code_t ui_keypad_scan(void)
 
     key_code_t detected = KEY_NONE;
 
-    /* Columns: bit 0 = P0.20 (Col 2), bit 1 = P0.21 (Col 1), bit 2 = P0.22 (Col 0) */
-    if (!(cols_r0 & 0x04)) detected = KEY_MENU;
-    else if (!(cols_r0 & 0x02)) detected = KEY_UP;
-    else if (!(cols_r0 & 0x01)) detected = KEY_CALIB;
-    else if (!(cols_r1 & 0x04)) detected = KEY_LEFT;
-    else if (!(cols_r1 & 0x02)) detected = KEY_EN;
-    else if (!(cols_r1 & 0x01)) detected = KEY_RIGHT;
-    else if (!(cols_r2 & 0x04)) detected = KEY_BACK;
-    else if (!(cols_r2 & 0x02)) detected = KEY_DOWN;
-    else if (!(cols_r2 & 0x01)) detected = KEY_DSP;
+    /* Row 0 (Left Column): P3.25 */
+    if (!(cols_r0 & 0x02))      detected = KEY_MENU;   /* Col 1 = Top */
+    else if (!(cols_r0 & 0x04)) detected = KEY_LEFT;   /* Col 0 = Middle */
+    else if (!(cols_r0 & 0x01)) detected = KEY_BACK;   /* Col 2 = Bottom */
+
+    /* Row 1 (Center Column): P3.26 */
+    else if (!(cols_r1 & 0x02)) detected = KEY_UP;     /* Col 1 = Top */
+    else if (!(cols_r1 & 0x04)) detected = KEY_EN;     /* Col 0 = Middle */
+    else if (!(cols_r1 & 0x01)) detected = KEY_DOWN;   /* Col 2 = Bottom */
+
+    /* Row 2 (Right Column): P1.21 */
+    else if (!(cols_r2 & 0x02)) detected = KEY_CALIB;  /* Col 1 = Top */
+    else if (!(cols_r2 & 0x04)) detected = KEY_RIGHT;  /* Col 0 = Middle */
+    else if (!(cols_r2 & 0x01)) detected = KEY_DSP;    /* Col 2 = Bottom */
 
     if (detected != KEY_NONE) {
         g_dbg_last_key = (uint32_t)detected;
@@ -366,6 +410,7 @@ void ui_display_init(void)
     s_ui_mode = UI_MODE_BROWSE;
     s_status_sms_state = STATUS_UI_IDLE;
     s_status_sms_timer = 0;
+    s_calib_tips = 0;
     s_display_active = true;
     ui_reset_activity_timer();
 
@@ -384,6 +429,13 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
     if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
         snprintf(line1, sizeof(line1), "SET STATION ID  ");
         snprintf(line2, sizeof(line2), "ID: %-6.6s      ", s_edit_stn_id);
+    } else if (s_ui_mode == UI_MODE_CALIB) {
+        float rf_mm = s_calib_tips * RF_BUCKET_RESOLUTION;
+        snprintf(line1, sizeof(line1), "CALIB: TIPS   RF");
+        snprintf(line2, sizeof(line2), "Count:%-3d %3d.%02dmm", s_calib_tips, (int)rf_mm, (int)((rf_mm - (int)rf_mm) * 100));
+    } else if (s_ui_mode == UI_MODE_ERASE_CONFIRM) {
+        snprintf(line1, sizeof(line1), "ARE YOU SURE?   ");
+        snprintf(line2, sizeof(line2), "PRESS EN: CONFIRM");
     } else {
         switch (scr) {
             case SCR_STATION_ID:
@@ -410,8 +462,15 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 break;
 
             case SCR_RAINFALL:
+                #if (ACTIVE_CONFIG == CFG_BIHAR_TRG)
+                /* BIHAR_TRG shows both 15M and Cumulative Rainfall */
                 snprintf(line1, sizeof(line1), "RF 15M: %04.1f mm", telemetry->rf_15m_mm);
                 snprintf(line2, sizeof(line2), "CUM RF: %04.1f mm", telemetry->rf_cum_mm);
+                #else
+                /* KSNDMC_TRG shows ONLY Cumulative Rainfall */
+                snprintf(line1, sizeof(line1), "CUM RAINFALL    ");
+                snprintf(line2, sizeof(line2), "    %04.1f mm    ", telemetry->rf_cum_mm);
+                #endif
                 break;
 
             case SCR_TEMP_HUM:
@@ -439,6 +498,11 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 snprintf(line2, sizeof(line2), "REG: 4G HOME");
                 break;
 
+            case SCR_FIELD_CALIB:
+                snprintf(line1, sizeof(line1), "FIELD CALIB     ");
+                snprintf(line2, sizeof(line2), "PRESS EN OR CLB ");
+                break;
+
             case SCR_SEND_STATUS:
                 snprintf(line1, sizeof(line1), "SEND STATUS SMS");
                 if (s_status_sms_state == STATUS_UI_SENDING) {
@@ -450,6 +514,11 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 } else {
                     snprintf(line2, sizeof(line2), "PRESS EN TO SEND");
                 }
+                break;
+
+            case SCR_ERASE_DATA:
+                snprintf(line1, sizeof(line1), "ERASE DATA?     ");
+                snprintf(line2, sizeof(line2), "PRESS EN: YES   ");
                 break;
 
             case SCR_SLEEP:
@@ -488,21 +557,29 @@ void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const 
         }
     }
 
+    /* In Calibration Mode, sync tipping bucket count from coprocessor */
+    if (s_ui_mode == UI_MODE_CALIB) {
+        if (telemetry->rf_tips_15m != s_calib_last_raw_tips) {
+            uint16_t diff = telemetry->rf_tips_15m - s_calib_last_raw_tips;
+            s_calib_tips += diff;
+            s_calib_last_raw_tips = telemetry->rf_tips_15m;
+        }
+    }
+
     key_code_t key = ui_keypad_scan();
 
+    /* Global DSP key handler: Wake or sleep display */
     if (key == KEY_DSP) {
         if (s_display_active) {
-            /* Blank screen and sleep LCD */
             if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
                 lcd_command(0x0C);
-                s_ui_mode = UI_MODE_BROWSE;
             }
+            s_ui_mode = UI_MODE_BROWSE;
             lcd_command(0x08);
             LPC_GPIO2->FIOCLR = MASK_LCD_BL;
             hal_power_lcd_off();
             s_display_active = false;
         } else {
-            /* Wake LCD */
             hal_power_lcd_on();
             lcd_init_hw();
             s_current_screen_idx = 0;
@@ -518,8 +595,93 @@ void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const 
     if (key != KEY_NONE) {
         ui_reset_activity_timer();
 
+        /* Global CALIB key handler */
+        if (key == KEY_CALIB && s_ui_mode == UI_MODE_BROWSE) {
+            #if (ACTIVE_CONFIG == CFG_KSNDMC_TWS)
+            /* TWS has no rain gauge */
+            lcd_command(0x80);
+            lcd_print("  VARSHA - TWS  ");
+            lcd_command(0xC0);
+            lcd_print(" No Rain Gauge  ");
+            vTaskDelay(1500 / portTICK_RATE_MS);
+            #else
+            /* TRG enters Field Calibration directly */
+            s_ui_mode = UI_MODE_CALIB;
+            s_calib_tips = 0;
+            s_calib_last_raw_tips = telemetry->rf_tips_15m;
+            #endif
+            return;
+        }
+
+        /* --- Mode: Field Calibration --- */
+        if (s_ui_mode == UI_MODE_CALIB) {
+            if (key == KEY_UP) {
+                /* Operator manual bench test tip */
+                s_calib_tips++;
+            } else if (key == KEY_BACK) {
+                /* Cancel calibration */
+                lcd_command(0x80);
+                lcd_print("Calibration     ");
+                lcd_command(0xC0);
+                lcd_print("CANCELLED       ");
+                vTaskDelay(1500 / portTICK_RATE_MS);
+                s_ui_mode = UI_MODE_BROWSE;
+            } else if (key == KEY_EN) {
+                /* Confirm calibration test */
+                s_calib_status_pass = (s_calib_tips == 10);
+                if (strlen(telemetry->present_time) >= 8) {
+                    snprintf(s_calib_last_date, sizeof(s_calib_last_date), "%.4s-%.2s-%.2s",
+                             telemetry->present_time, telemetry->present_time + 4, telemetry->present_time + 6);
+                }
+
+                lcd_command(0x80);
+                lcd_print("CALIB RESULT:   ");
+                lcd_command(0xC0);
+                if (s_calib_status_pass) {
+                    lcd_print("PASS (10 tips)  ");
+                } else {
+                    lcd_print("FAIL (<>10 tips)");
+                }
+                vTaskDelay(3000 / portTICK_RATE_MS);
+                s_ui_mode = UI_MODE_BROWSE;
+            }
+            return;
+        }
+
+        /* --- Mode: Erase Data Confirmation --- */
+        if (s_ui_mode == UI_MODE_ERASE_CONFIRM) {
+            if (key == KEY_EN) {
+                /* Erase confirmed */
+                lcd_command(0x80);
+                lcd_print("ERASING DATA... ");
+                lcd_command(0xC0);
+                lcd_print("PLEASE WAIT...  ");
+
+                intermcu_reset_cumulative_rain();
+
+                vTaskDelay(1500 / portTICK_RATE_MS);
+                lcd_command(0x80);
+                lcd_print("DATA ERASED OK  ");
+                lcd_command(0xC0);
+                lcd_print("RESET COMPLETE  ");
+                vTaskDelay(2000 / portTICK_RATE_MS);
+
+                s_current_screen_idx = 0;
+                s_ui_mode = UI_MODE_BROWSE;
+            } else {
+                /* Cancel erase on any other key */
+                lcd_command(0x80);
+                lcd_print("ERASE CANCELLED ");
+                lcd_command(0xC0);
+                lcd_print("                ");
+                vTaskDelay(1000 / portTICK_RATE_MS);
+                s_ui_mode = UI_MODE_BROWSE;
+            }
+            return;
+        }
+
+        /* --- Mode: Edit Station ID --- */
         if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
-            /* --- Edit Mode Key Handlers --- */
             if (key == KEY_UP) {
                 if (s_edit_stn_id[s_edit_pos] >= '9') {
                     s_edit_stn_id[s_edit_pos] = '0';
@@ -541,7 +703,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const 
             } else if (key == KEY_RIGHT) {
                 s_edit_pos = (s_edit_pos < 5) ? (s_edit_pos + 1) : 0;
             } else if (key == KEY_BACK) {
-                /* Clear buffer: check if all digits are already '0' */
+                /* Clear buffer: if any non-zero, clear all to '0' */
                 bool all_zero = true;
                 for (int i = 0; i < 6; i++) {
                     if (s_edit_stn_id[i] != '0') {
@@ -577,58 +739,69 @@ void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const 
                 vTaskDelay(1500 / portTICK_RATE_MS);
                 s_ui_mode = UI_MODE_BROWSE;
             }
-        } else {
-            /* --- Browse Mode Key Handlers --- */
-            if (key == KEY_DOWN || key == KEY_RIGHT) {
-                s_current_screen_idx = (s_current_screen_idx + 1) % NUM_SCREENS;
-            } else if (key == KEY_UP || key == KEY_LEFT) {
-                s_current_screen_idx = (s_current_screen_idx + NUM_SCREENS - 1) % NUM_SCREENS;
-            } else if (key == KEY_MENU) {
-                /* Jump directly between Station ID and Send Status */
-                if (s_current_screen_idx == 0) {
-                    for (size_t i = 0; i < NUM_SCREENS; i++) {
-                        if (s_screens[i] == SCR_SEND_STATUS) {
-                            s_current_screen_idx = i;
-                            break;
-                        }
-                    }
-                } else {
-                    s_current_screen_idx = 0;
-                }
-            } else if (key == KEY_BACK) {
-                s_current_screen_idx = 0;
-            } else if (key == KEY_EN) {
-                if (s_screens[s_current_screen_idx] == SCR_STATION_ID) {
-                    /* Enter Station ID Edit Mode */
-                    s_ui_mode = UI_MODE_EDIT_STN_ID;
-                    const char *cur = flash_nvram_get_station_id();
-                    memset(s_edit_stn_id, '0', 6);
-                    s_edit_stn_id[6] = '\0';
-                    if (cur) {
-                        size_t len = strlen(cur);
-                        if (len > 6) len = 6;
-                        for (size_t i = 0; i < len; i++) {
-                            if (cur[i] >= '0' && cur[i] <= '9') {
-                                s_edit_stn_id[i] = cur[i];
-                            }
-                        }
-                    }
-                    s_edit_pos = 0;
-                    lcd_command(0x0F); /* Display ON, Cursor ON, Blink ON */
-                } else if (s_screens[s_current_screen_idx] == SCR_SEND_STATUS) {
-                    /* Transmit Status SMS */
-                    s_status_sms_state = STATUS_UI_SENDING;
-                    render_screen(s_screens[s_current_screen_idx], telemetry, csq_dbm, ip_addr);
+            return;
+        }
 
-                    bool ok = sim7600_transmit_status_sms(telemetry, csq_dbm);
-                    s_status_sms_state = ok ? STATUS_UI_SUCCESS : STATUS_UI_FAILED;
-                    s_status_sms_timer = 60; /* 60 * 50ms = 3.0s */
-                } else if (s_screens[s_current_screen_idx] == SCR_SLEEP) {
-                    /* Operator selected Sleep System */
-                    hal_power_sleep_system();
-                    s_display_active = false;
-                    return;
+        /* --- Mode: Browse Mode Navigation --- */
+        if (key == KEY_DOWN || key == KEY_RIGHT) {
+            s_current_screen_idx = (s_current_screen_idx + 1) % NUM_SCREENS;
+        } else if (key == KEY_UP || key == KEY_LEFT) {
+            s_current_screen_idx = (s_current_screen_idx + NUM_SCREENS - 1) % NUM_SCREENS;
+        } else if (key == KEY_MENU) {
+            /* Quick jump between Station ID (0) and Send Status */
+            if (s_current_screen_idx == 0) {
+                for (size_t i = 0; i < NUM_SCREENS; i++) {
+                    if (s_screens[i] == SCR_SEND_STATUS) {
+                        s_current_screen_idx = i;
+                        break;
+                    }
                 }
+            } else {
+                s_current_screen_idx = 0;
+            }
+        } else if (key == KEY_BACK) {
+            s_current_screen_idx = 0;
+        } else if (key == KEY_EN) {
+            screen_type_t active_scr = s_screens[s_current_screen_idx];
+
+            if (active_scr == SCR_STATION_ID) {
+                /* Enter Station ID Edit Mode */
+                s_ui_mode = UI_MODE_EDIT_STN_ID;
+                const char *cur = flash_nvram_get_station_id();
+                memset(s_edit_stn_id, '0', 6);
+                s_edit_stn_id[6] = '\0';
+                if (cur) {
+                    size_t len = strlen(cur);
+                    if (len > 6) len = 6;
+                    for (size_t i = 0; i < len; i++) {
+                        if (cur[i] >= '0' && cur[i] <= '9') {
+                            s_edit_stn_id[i] = cur[i];
+                        }
+                    }
+                }
+                s_edit_pos = 0;
+                lcd_command(0x0F); /* Turn ON blinking hardware cursor */
+            } else if (active_scr == SCR_FIELD_CALIB) {
+                /* Enter Field Calibration */
+                s_ui_mode = UI_MODE_CALIB;
+                s_calib_tips = 0;
+                s_calib_last_raw_tips = telemetry->rf_tips_15m;
+            } else if (active_scr == SCR_ERASE_DATA) {
+                /* Prompt Erase Confirmation */
+                s_ui_mode = UI_MODE_ERASE_CONFIRM;
+            } else if (active_scr == SCR_SEND_STATUS) {
+                /* Transmit Status SMS */
+                s_status_sms_state = STATUS_UI_SENDING;
+                render_screen(active_scr, telemetry, csq_dbm, ip_addr);
+
+                bool ok = sim7600_transmit_status_sms(telemetry, csq_dbm);
+                s_status_sms_state = ok ? STATUS_UI_SUCCESS : STATUS_UI_FAILED;
+                s_status_sms_timer = 60; /* 60 * 50ms = 3.0s */
+            } else if (active_scr == SCR_SLEEP) {
+                /* Operator selected Sleep System */
+                hal_power_sleep_system();
+                s_display_active = false;
+                return;
             }
         }
     }
