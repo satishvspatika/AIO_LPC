@@ -78,13 +78,26 @@ static void execute_slot_transmission(telemetry_data_t *telem)
         storage_log_debug("HTTP", log_buf);
         storage_log_debug("HTTP_POST", payload);
 
-        /* Transmit payload via direct Layer-4 TCP socket */
+        /* Transmit current slot with up to 2 retries (3 attempts total) */
         char date_hdr[64] = "";
-        bool post_ok = sim7600_http_post(endpoint, payload, date_hdr, sizeof(date_hdr));
+        bool post_ok = false;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            char att_msg[48];
+            snprintf(att_msg, sizeof(att_msg), "HTTP Post Attempt %d/3...", attempt);
+            storage_log_debug("HTTP", att_msg);
+
+            post_ok = sim7600_http_post(endpoint, payload, date_hdr, sizeof(date_hdr));
+            if (post_ok) {
+                storage_log_debug("HTTP", "Transmission succeeded (200 OK)!");
+                break;
+            }
+            if (attempt < 3) {
+                storage_log_debug("HTTP", "Attempt failed, waiting 3s before retry...");
+                vTaskDelay(3000 / portTICK_RATE_MS);
+            }
+        }
 
         if (post_ok) {
-            storage_log_debug("HTTP", "Transmission succeeded (200 OK)!");
-            ui_dec_backlog_count();
             /* Archive to SD card /DATA/<YYMMDD>.TXT */
             char date6[8] = "";
             if (strlen(telem->slot_time) >= 8) {
@@ -108,16 +121,57 @@ static void execute_slot_transmission(telemetry_data_t *telem)
                 flash_nvram_set_last_logged(last_log_ts);
                 storage_log_debug("NVRAM", "Saved Last Logged timestamp to Sector 1 Flash");
             }
+
+            /* Current slot succeeded: Check and process pending backlogs (max 15, no retries) */
+            uint8_t backlogs_sent = 0;
+            uint32_t bk_offset = 0;
+            char bk_payload[384];
+
+            while (backlogs_sent < 15 && storage_backlog_get_next_unsent(0, &bk_offset, bk_payload, sizeof(bk_payload))) {
+                char bk_msg[64];
+                snprintf(bk_msg, sizeof(bk_msg), "Sending Backlog #%d (offset %u)...", backlogs_sent + 1, (unsigned int)bk_offset);
+                storage_log_debug("BACKLOG", bk_msg);
+
+                char bk_date_hdr[64] = "";
+                bool bk_ok = sim7600_http_post(endpoint, bk_payload, bk_date_hdr, sizeof(bk_date_hdr));
+
+                if (bk_ok) {
+                    storage_log_debug("BACKLOG", "Backlog delivered OK, marking SENT");
+                    storage_backlog_mark_sent(bk_offset);
+                    backlogs_sent++;
+                    vTaskDelay(1500 / portTICK_RATE_MS);
+                } else {
+                    storage_log_debug("BACKLOG", "Backlog transmission failed! Aborting backlog cycle.");
+                    break;
+                }
+            }
+            storage_backlog_cleanup_if_all_sent();
+
         } else {
-            storage_log_debug("HTTP", "Transmission failed, falling back to SD storage");
-            ui_inc_backlog_count();
+            storage_log_debug("HTTP", "All 3 HTTP attempts failed! Saving slot as pending backlog.");
+            storage_backlog_save(telem->slot_time, payload);
+
+            char date6[8] = "";
+            if (strlen(telem->slot_time) >= 8) {
+                snprintf(date6, sizeof(date6), "%.6s", telem->slot_time + 2);
+                storage_archive_slot(date6, payload);
+            }
         }
 
         /* Check and process incoming operator SMS */
         sim7600_check_incoming_sms(telem);
     } else {
-        storage_log_debug("MODEM", "Modem power-on or network registration failed!");
-        ui_inc_backlog_count();
+        storage_log_debug("MODEM", "Modem power-on or network registration failed! Saving to backlog.");
+        char payload[512] = "";
+        const char *stn_id = flash_nvram_get_station_id();
+        #if (UNIT_CFG == KSNDMC_TRG)
+        format_payload_ksndmc_trg(payload, sizeof(payload), stn_id, telem, -113);
+        #elif (UNIT_CFG == BIHAR_TRG)
+        format_payload_bihar_trg(payload, sizeof(payload), stn_id, telem, -113);
+        #else
+        format_payload_ksndmc_tws(payload, sizeof(payload), stn_id, telem, -113);
+        #endif
+        storage_backlog_save(telem->slot_time, payload);
     }
 
     sim7600_release();
@@ -148,7 +202,9 @@ static void vMain_Task(void *pvParameters)
                     char sched_msg[64];
                     snprintf(sched_msg, sizeof(sched_msg), "Slot boundary %02d:00 reached, holding %ds", min, wait_sec);
                     storage_log_debug("SCHED", sched_msg);
-                    vTaskDelay((wait_sec * 1000) / portTICK_RATE_MS);
+                    for (int w = 0; w < wait_sec; w++) {
+                        vTaskDelay(1000 / portTICK_RATE_MS);
+                    }
                     /* Re-read fresh telemetry */
                     intermcu_get_telemetry(&telem);
                 }
@@ -164,6 +220,7 @@ static void vMain_Task(void *pvParameters)
                 /* If operator is not actively interacting with LCD/keypad, sleep system */
                 if (!ui_is_operator_active()) {
                     storage_log_debug("PWR", "Slot transmission complete and no operator active -> sleeping ($f1;)");
+                    sim7600_power_off();
                     vTaskDelay(200 / portTICK_RATE_MS);
                     hal_power_sleep_system();
                 } else {
@@ -184,7 +241,9 @@ static void vModem_Task(void *pvParameters)
     storage_log_debug("MODEM", "Modem Supervisor Task Started");
 
     for (;;) {
-        sim7600_worker_step();
+        if (ui_is_operator_active()) {
+            sim7600_worker_step();
+        }
         vTaskDelay(2000 / portTICK_RATE_MS);
     }
 }

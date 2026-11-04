@@ -3,6 +3,7 @@
 #include "sim7600_driver.h"
 #include "flash_nvram.h"
 #include "intermcu_protocol.h"
+#include "storage_log.h"
 #include "user_config.h"
 #include "lpc17xx_gpio.h"
 #include "lpc17xx_pinsel.h"
@@ -143,7 +144,7 @@ typedef enum {
 
 static bool s_lcd_initialized = false;
 static bool s_display_active = true;
-static uint32_t s_activity_timestamp = 0;
+static uint32_t s_inactivity_ticks = 0; /* 50ms ticks, 2 mins = 2400 */
 static size_t s_current_screen_idx = 0;
 
 static ui_mode_t s_ui_mode = UI_MODE_BROWSE;
@@ -520,7 +521,7 @@ key_code_t ui_keypad_scan(void)
 
 void ui_reset_activity_timer(void)
 {
-    s_activity_timestamp = 0;
+    s_inactivity_ticks = 0;
 }
 
 bool ui_is_operator_active(void)
@@ -765,9 +766,30 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             s_current_screen_idx = 0;
             s_ui_mode = UI_MODE_BROWSE;
             s_display_active = true;
-            ui_reset_activity_timer();
+            s_inactivity_ticks = 0;
         }
         return;
+    }
+
+    /* Auto-sleep after 2 minutes of inactivity (120s = 2400 ticks of 50ms) */
+    if (key != KEY_NONE) {
+        s_inactivity_ticks = 0;
+    } else if (s_status_sms_state != STATUS_UI_SENDING) {
+        s_inactivity_ticks++;
+        if (s_inactivity_ticks >= (120 * 20)) {
+            if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+                lcd_command(0x0C);
+            }
+            s_ui_mode = UI_MODE_BROWSE;
+            lcd_command(0x08); /* Display OFF */
+            LPC_GPIO2->FIOCLR = MASK_LCD_BL; /* Backlight OFF */
+            hal_power_lcd_off(); /* Cut 5V LCD rail */
+            sim7600_power_off(); /* Power off modem to turn off NETLIGHT */
+            hal_power_sleep_system(); /* Sentry sleep command ($f1;) */
+            s_display_active = false;
+            s_inactivity_ticks = 0;
+            return;
+        }
     }
 
     /* Global DSP key handler: Sleep display on demand */
@@ -780,7 +802,10 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         lcd_command(0x08);
         LPC_GPIO2->FIOCLR = MASK_LCD_BL;
         hal_power_lcd_off();
+        sim7600_power_off();
+        hal_power_sleep_system();
         s_display_active = false;
+        s_inactivity_ticks = 0;
         return;
     }
 
@@ -850,7 +875,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 lcd_print("PLEASE WAIT...  ");
 
                 intermcu_reset_cumulative_rain();
-                ui_set_backlog_count(0);
+                storage_backlog_clear_all();
 
                 vTaskDelay(1500 / portTICK_RATE_MS);
                 lcd_command(0x80);

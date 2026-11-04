@@ -163,9 +163,10 @@ static void send_raw(const char *cmd)
 
 static void clear_rx(void)
 {
+    NVIC_DisableIRQ(UART2_IRQn);
     s_rx_head = 0;
     s_rx_tail = 0;
-    memset(s_rx_buf, 0, sizeof(s_rx_buf));
+    NVIC_EnableIRQ(UART2_IRQn);
 }
 
 static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_capture, size_t capture_size)
@@ -184,13 +185,26 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
             }
             s_rx_temp[idx] = '\0';
 
-            if (strstr(s_rx_temp, expected) != NULL) {
+            char *match = strstr(s_rx_temp, expected);
+            if (match != NULL) {
                 if (out_capture && capture_size > 0) {
                     strncpy(out_capture, s_rx_temp, capture_size - 1);
                     out_capture[capture_size - 1] = '\0';
                 }
                 storage_log_debug("MODEM_RX", s_rx_temp);
+                s_rx_tail = head;
                 return true;
+            }
+
+            /* Detect error response to avoid useless long timeouts */
+            if (strstr(s_rx_temp, "ERROR") != NULL && strstr(expected, "ERROR") == NULL) {
+                if (out_capture && capture_size > 0) {
+                    strncpy(out_capture, s_rx_temp, capture_size - 1);
+                    out_capture[capture_size - 1] = '\0';
+                }
+                storage_log_debug("MODEM_ERR", s_rx_temp);
+                s_rx_tail = head;
+                return false;
             }
         }
         delay_ms(10);
@@ -557,7 +571,7 @@ static uint32_t s_cclk_poll_counter = 0;
 
 void sim7600_worker_step(void)
 {
-    if (s_modem_busy) return;
+    if (!sim7600_acquire(100)) return;
 
     char capture[256];
 
@@ -728,6 +742,7 @@ void sim7600_worker_step(void)
             s_worker_state = MODEM_ST_UNINIT;
             break;
     }
+    sim7600_release();
 }
 
 bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, char *date_hdr_out, size_t date_hdr_size)
@@ -924,33 +939,88 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
     char sanitized[24];
     sanitize_phone_number(sanitized, dest_phone, sizeof(sanitized));
 
-    /* Set character set to standard GSM 7-bit default alphabet */
-    send_raw("AT+CSCS=\"GSM\"\r\n");
+    char cap[128] = "";
+
+    clear_rx();
+    send_raw("ATE0\r\n");
     wait_response("OK", 500, NULL, 0);
 
+    /* 1. Set text mode */
+    clear_rx();
     send_raw("AT+CMGF=1\r\n");
-    wait_response("OK", 500, NULL, 0);
+    if (!wait_response("OK", 1000, cap, sizeof(cap))) {
+        report_progress("CMGF=1 FAIL     ");
+        return false;
+    }
 
+    /* 2. Character set */
+    clear_rx();
+    send_raw("AT+CSCS=\"GSM\"\r\n");
+    wait_response("OK", 1000, NULL, 0);
+
+    /* 3. Query SMS Service Center Address (SMSC) - fallback to KA standard if empty */
+    clear_rx();
+    send_raw("AT+CSCA?\r\n");
+    if (wait_response("+CSCA:", 1000, cap, sizeof(cap))) {
+        if (strstr(cap, "\"\"") || !strstr(cap, "+")) {
+            send_raw("AT+CSCA=\"+919845080001\",145\r\n");
+            wait_response("OK", 1000, NULL, 0);
+        }
+    }
+
+    /* 4. Initiate AT+CMGS */
     char sms_cmd[64];
-    /* SIM7600 requires \r termination for AT+CMGS */
     snprintf(sms_cmd, sizeof(sms_cmd), "AT+CMGS=\"%s\"\r", sanitized);
     clear_rx();
     send_raw(sms_cmd);
-    if (!wait_response(">", 5000, NULL, 0)) {
+    if (!wait_response(">", 5000, cap, sizeof(cap))) {
         /* Cancel input mode if prompt not received */
         const char esc[] = {0x1B, '\0'};
         send_raw(esc);
         wait_response("OK", 1000, NULL, 0);
+        if (strstr(cap, "+CMS ERROR:")) {
+            char *p = strstr(cap, "+CMS ERROR:");
+            char err_txt[17];
+            snprintf(err_txt, sizeof(err_txt), "%-16.16s", p + 1);
+            report_progress(err_txt);
+        } else {
+            report_progress("NO '>' PROMPT   ");
+        }
         return false;
     }
 
-    clear_rx();
-    send_raw(message);
-    const char ctrl_z[] = {0x1A, '\0'};
-    send_raw(ctrl_z);
+    /* 5. Build clean message payload terminated by single Ctrl+Z (0x1A) */
+    char send_buf[300];
+    size_t slen = 0;
+    while (*message && slen < sizeof(send_buf) - 2) {
+        if (*message != 0x1A) {
+            send_buf[slen++] = *message;
+        }
+        message++;
+    }
+    send_buf[slen++] = 0x1A; /* Ctrl+Z */
+    send_buf[slen] = '\0';
 
-    /* Allow up to 20 seconds for cellular network SMS acknowledgement */
-    return wait_response("+CMGS:", 20000, NULL, 0);
+    clear_rx();
+    UART_Send(UART_MODEM, (uint8_t *)send_buf, slen, BLOCKING);
+
+    /* 6. Wait for cellular network SMS acknowledgement */
+    if (wait_response("+CMGS:", 20000, cap, sizeof(cap))) {
+        report_progress("STATUS SENT OK  ");
+        return true;
+    } else {
+        if (strstr(cap, "+CMS ERROR:")) {
+            char *p = strstr(cap, "+CMS ERROR:");
+            char err_txt[17];
+            snprintf(err_txt, sizeof(err_txt), "%-16.16s", p + 1);
+            report_progress(err_txt);
+        } else if (strstr(cap, "ERROR")) {
+            report_progress("CMD ERROR       ");
+        } else {
+            report_progress("NET TIMEOUT 20S ");
+        }
+        return false;
+    }
 }
 
 bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
@@ -1049,11 +1119,6 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     report_progress("SENDING SMS...  ");
     storage_log_debug("SMS", status_msg);
     bool ok = sim7600_send_sms(dest_phone, status_msg);
-    if (ok) {
-        report_progress("STATUS SENT OK  ");
-    } else {
-        report_progress("STATUS FAILED   ");
-    }
 
     if (we_powered) {
         delay_ms(1500);

@@ -1,5 +1,6 @@
 #include "storage_log.h"
 #include "user_config.h"
+#include "ui_display.h"
 #include "ff.h"
 #include "diskio.h"
 #include "FreeRTOS.h"
@@ -21,11 +22,15 @@ static volatile uint16_t s_tail = 0;
 static FIL s_drain_file;
 static FIL s_http_file;
 static FIL s_archive_file;
+static FIL s_backlog_file;
 
 void storage_log_init(void)
 {
     FRESULT res = f_mount(0, &s_fatfs);
     s_fs_mounted = (res == FR_OK);
+    if (s_fs_mounted) {
+        storage_backlog_init();
+    }
 }
 
 void storage_log_timer_step_10ms(void)
@@ -138,4 +143,160 @@ bool storage_archive_slot(const char *date6, const char *record)
         return true;
     }
     return false;
+}
+
+/* =========================================================================
+ *  Backlog Records Management on SD Card
+ * ========================================================================= */
+
+typedef struct __attribute__((packed)) {
+    uint8_t sent;         /* 0 = unsent/pending, 1 = sent */
+    char slot_time[16];   /* "20261104220000" */
+    char payload[384];    /* HTTP payload string */
+} storage_backlog_entry_t;
+
+#define BACKLOG_FILENAME "BACKLOG.DAT"
+
+void storage_backlog_init(void)
+{
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    uint32_t count = storage_backlog_get_pending_count();
+    ui_set_backlog_count(count);
+}
+
+bool storage_backlog_save(const char *slot_time, const char *payload)
+{
+    if (!payload) return false;
+
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
+        f_lseek(&s_backlog_file, s_backlog_file.fsize);
+
+        storage_backlog_entry_t entry;
+        memset(&entry, 0, sizeof(entry));
+        entry.sent = 0; /* Unsent */
+        if (slot_time) {
+            strncpy(entry.slot_time, slot_time, sizeof(entry.slot_time) - 1);
+        }
+        strncpy(entry.payload, payload, sizeof(entry.payload) - 1);
+
+        UINT bw;
+        f_write(&s_backlog_file, &entry, sizeof(entry), &bw);
+        f_close(&s_backlog_file);
+
+        ui_inc_backlog_count();
+        storage_log_debug("BACKLOG", "Saved pending record to BACKLOG.DAT");
+        return true;
+    }
+    return false;
+}
+
+uint32_t storage_backlog_get_pending_count(void)
+{
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ) != FR_OK) {
+        return 0;
+    }
+
+    uint32_t count = 0;
+    storage_backlog_entry_t entry;
+    UINT br;
+
+    while (f_read(&s_backlog_file, &entry, sizeof(entry), &br) == FR_OK && br == sizeof(entry)) {
+        if (entry.sent == 0) {
+            count++;
+        }
+    }
+    f_close(&s_backlog_file);
+    return count;
+}
+
+bool storage_backlog_get_next_unsent(uint32_t start_offset, uint32_t *out_offset, char *out_payload, size_t max_len)
+{
+    if (!out_offset || !out_payload || max_len == 0) return false;
+
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ) != FR_OK) {
+        return false;
+    }
+
+    if (start_offset > 0) {
+        if (f_lseek(&s_backlog_file, start_offset) != FR_OK) {
+            f_close(&s_backlog_file);
+            return false;
+        }
+    }
+
+    storage_backlog_entry_t entry;
+    UINT br;
+    uint32_t current_pos = s_backlog_file.fptr;
+
+    while (f_read(&s_backlog_file, &entry, sizeof(entry), &br) == FR_OK && br == sizeof(entry)) {
+        if (entry.sent == 0) {
+            *out_offset = current_pos;
+            strncpy(out_payload, entry.payload, max_len - 1);
+            out_payload[max_len - 1] = '\0';
+            f_close(&s_backlog_file);
+            return true;
+        }
+        current_pos = s_backlog_file.fptr;
+    }
+
+    f_close(&s_backlog_file);
+    return false;
+}
+
+bool storage_backlog_mark_sent(uint32_t entry_offset)
+{
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_WRITE) != FR_OK) {
+        return false;
+    }
+
+    if (f_lseek(&s_backlog_file, entry_offset) != FR_OK) {
+        f_close(&s_backlog_file);
+        return false;
+    }
+
+    uint8_t sent_flag = 1;
+    UINT bw;
+    f_write(&s_backlog_file, &sent_flag, 1, &bw);
+    f_close(&s_backlog_file);
+
+    ui_dec_backlog_count();
+    return true;
+}
+
+void storage_backlog_cleanup_if_all_sent(void)
+{
+    if (storage_backlog_get_pending_count() == 0) {
+        f_unlink(BACKLOG_FILENAME);
+        storage_log_debug("BACKLOG", "All backlogs sent, reclaimed BACKLOG.DAT");
+    }
+}
+
+void storage_backlog_clear_all(void)
+{
+    f_unlink(BACKLOG_FILENAME);
+    ui_set_backlog_count(0);
+    storage_log_debug("BACKLOG", "Backlog file erased (Erase Data)");
 }
