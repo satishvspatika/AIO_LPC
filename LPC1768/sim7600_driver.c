@@ -323,6 +323,32 @@ bool sim7600_power_on(void)
         }
     }
 
+    /* 10. Synchronize time from cellular network base station (NITZ) */
+    if (registered) {
+        clear_rx();
+        send_raw("AT+CTZU=1\r\n"); /* Enable auto network time zone & time */
+        wait_response("OK", 1000, NULL, 0);
+
+        clear_rx();
+        send_raw("AT+CCLK?\r\n");
+        if (wait_response("+CCLK:", 2000, capture, sizeof(capture))) {
+            char *p = strstr(capture, "+CCLK: \"");
+            if (p) {
+                int yr = 0, mo = 0, da = 0, hr = 0, mi = 0, se = 0;
+                if (sscanf(p + 8, "%d/%d/%d,%d:%d:%d", &yr, &mo, &da, &hr, &mi, &se) >= 5) {
+                    if (yr < 100) yr += 2000;
+                    if (da >= 1 && da <= 31 && mo >= 1 && mo <= 12 && yr >= 2024 && yr <= 2079) {
+                        char ts14[16];
+                        snprintf(ts14, sizeof(ts14), "%04d%02d%02d%02d%02d%02d",
+                                 yr, mo, da, hr, mi, (se >= 0 && se <= 59) ? se : 0);
+                        hal_power_sync_rtc(ts14);
+                        storage_log_debug("RTC", "DS1338 RTC synced from cellular tower time");
+                    }
+                }
+            }
+        }
+    }
+
     s_modem_status.is_registered = registered;
     return registered;
 }
@@ -508,6 +534,25 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
             const char *target = (strlen(sender_phone) > 5) ? sender_phone :
                 ((ACTIVE_CONFIG == CFG_BIHAR_TRG) ? "9741391102" : "9980945474");
             sim7600_send_sms(target, reply);
+        } else if (strstr(s_sms_capture, "#TIME=") || strstr(s_sms_capture, "#SET_TIME=")) {
+            /* Operator manual time set: #TIME=YYYYMMDDHHMMSS */
+            char *tp = strstr(s_sms_capture, "#TIME=");
+            if (!tp) tp = strstr(s_sms_capture, "#SET_TIME=");
+            if (tp) {
+                tp = strchr(tp, '=');
+                if (tp && strlen(tp + 1) >= 14) {
+                    char ts[16];
+                    strncpy(ts, tp + 1, 14);
+                    ts[14] = '\0';
+                    hal_power_sync_rtc(ts);
+                    storage_log_debug("RTC", "DS1338 RTC manually updated via SMS");
+
+                    char reply[80];
+                    snprintf(reply, sizeof(reply), "AIO STN:%s\nRTC SET OK: %.14s", STATION_ID_DEFAULT, ts);
+                    const char *target = (strlen(sender_phone) > 5) ? sender_phone : "9980945474";
+                    sim7600_send_sms(target, reply);
+                }
+            }
         }
 
         /* Delete processed read SMS */

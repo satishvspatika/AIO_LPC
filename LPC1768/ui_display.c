@@ -165,6 +165,11 @@ static void lcd_print(const char *str)
     }
 }
 
+volatile uint32_t g_dbg_last_key = 0;
+volatile uint32_t g_dbg_cols_r0 = 7;
+volatile uint32_t g_dbg_cols_r1 = 7;
+volatile uint32_t g_dbg_cols_r2 = 7;
+
 /* --- Keypad Initialization & Scanning --- */
 static void keypad_init_hw(void)
 {
@@ -197,24 +202,32 @@ key_code_t ui_keypad_scan(void)
     /* Ensure all rows are idle HIGH before scanning */
     LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26));
     LPC_GPIO1->FIOSET = (1UL << 21);
+    delay_us(50);
 
-    /* Row 0 LOW */
+    /* Row 0 LOW (P3.25) */
     LPC_GPIO3->FIOCLR = (1UL << 25);
-    delay_us(100);
+    delay_us(500);
     uint32_t cols_r0 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     LPC_GPIO3->FIOSET = (1UL << 25);
+    delay_us(50);
 
-    /* Row 1 LOW */
+    /* Row 1 LOW (P3.26) */
     LPC_GPIO3->FIOCLR = (1UL << 26);
-    delay_us(100);
+    delay_us(500);
     uint32_t cols_r1 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     LPC_GPIO3->FIOSET = (1UL << 26);
+    delay_us(50);
 
-    /* Row 2 LOW */
+    /* Row 2 LOW (P1.21) */
     LPC_GPIO1->FIOCLR = (1UL << 21);
-    delay_us(100);
+    delay_us(500);
     uint32_t cols_r2 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     LPC_GPIO1->FIOSET = (1UL << 21);
+    delay_us(50);
+
+    g_dbg_cols_r0 = cols_r0;
+    g_dbg_cols_r1 = cols_r1;
+    g_dbg_cols_r2 = cols_r2;
 
     key_code_t detected = KEY_NONE;
 
@@ -230,17 +243,22 @@ key_code_t ui_keypad_scan(void)
     else if (!(cols_r2 & 0x01)) detected = KEY_DSP;
 
     if (detected != KEY_NONE) {
-        if (detected == last_key) {
-            press_hold_count++;
-            if (press_hold_count == 2) {
-                return detected; /* Fast, responsive 100ms debounced keypress */
-            }
-            if (press_hold_count > 15 && (press_hold_count % 4 == 0)) {
-                return detected; /* Auto-repeat */
-            }
-        } else {
+        g_dbg_last_key = (uint32_t)detected;
+        if (last_key == KEY_NONE) {
+            /* Instant trigger on fresh press */
             last_key = detected;
             press_hold_count = 1;
+            return detected;
+        } else if (detected == last_key) {
+            press_hold_count++;
+            if (press_hold_count >= 10 && (press_hold_count % 3 == 0)) {
+                return detected; /* Auto-repeat after 500ms hold */
+            }
+        } else {
+            /* Switched keys without releasing previous */
+            last_key = detected;
+            press_hold_count = 1;
+            return detected;
         }
     } else {
         last_key = KEY_NONE;
@@ -386,12 +404,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const 
         if (key == KEY_DOWN || key == KEY_RIGHT) {
             s_current_screen = (s_current_screen + 1) % max_screens;
         } else if (key == KEY_TOP || key == KEY_LEFT) {
-            /* Clamped wrap: prevent backwards jumping from Screen 0 into sleep screen */
-            if (s_current_screen == 0) {
-                s_current_screen = 2; /* Wrap to sensors */
-            } else {
-                s_current_screen--;
-            }
+            s_current_screen = (s_current_screen + max_screens - 1) % max_screens;
         } else if (key == KEY_MENU) {
             s_current_screen = (s_current_screen < 5) ? 7 : 0;
         } else if (key == KEY_BACK) {

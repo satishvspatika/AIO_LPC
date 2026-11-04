@@ -105,10 +105,7 @@ static void vMain_Task(void *pvParameters)
                     storage_archive_slot(date6, payload);
                 }
 
-                /* Synchronize DS1338 RTC on LPC845 if Date header parsed */
-                if (strlen(date_hdr) > 10) {
-                    hal_power_sync_rtc(telem.present_time);
-                }
+
             } else {
                 storage_log_debug("HTTP", "Transmission failed, falling back to storage");
             }
