@@ -11,8 +11,8 @@
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     char stn_id[8];          /* 6 chars + null (e.g. "001922") */
-    uint8_t system_type;     /* SYSTEM_TRG, SYSTEM_TWS */
-    uint8_t unit_cfg;        /* CFG_KSNDMC_TRG, CFG_BIHAR_TRG, CFG_KSNDMC_TWS */
+    uint8_t system_type;     /* 0 = TRG, 1 = TWS (NVRAM byte alignment) */
+    uint8_t unit_cfg;        /* KSNDMC_TRG, BIHAR_TRG, KSNDMC_TWS */
     float rf_resolution;     /* e.g. 0.25mm */
     uint8_t sd_debug_dump;   /* 1 = enabled, 0 = disabled */
     char last_logged[20];    /* e.g. "04-11-2026 18:45" */

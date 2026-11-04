@@ -9,33 +9,32 @@
  *  Platform: NXP LPC1768 Master + NXP LPC845 Sentry + SIMCom SIM7600 4G LTE
  * ========================================================================= */
 
-/* System Types */
-#define SYSTEM_TRG      0   /* Telemetric Rain Gauge (Rainfall only) */
-#define SYSTEM_TWS      1   /* Telemetric Weather Station (Full AWS) */
-#define SYSTEM_TWSRF    2   /* Telemetric Weather Station + Rain Addon */
-#define SYSTEM_TWSRP    3   /* Telemetric Weather Station + Rain + Pressure */
+/* Station Unit Profiles */
+#define KSNDMC_TRG      0   /* Karnataka TRG (Rainfall only, cumulative mm, port 80) */
+#define BIHAR_TRG       1   /* Bihar Govt RTDAS (Rainfall only, incremental + cumulative mm, port 8085) */
+#define KSNDMC_TWS      2   /* Karnataka AWS (Full Weather Station suite, port 80) */
 
-/* Station Configuration Profiles */
-#define CFG_KSNDMC_TRG  0   /* Karnataka TRG (URL-encoded slot cumulative, port 80) */
-#define CFG_BIHAR_TRG   1   /* Bihar Govt RTDAS (JSON incremental + cumulative, port 8085) */
-#define CFG_KSNDMC_TWS  2   /* Karnataka AWS (URL-encoded full AWS suite, port 80) */
-
-/* Active Configuration Selection */
-#ifndef ACTIVE_SYSTEM
-#define ACTIVE_SYSTEM   SYSTEM_TWS
+/* Active Station Selection: Choose one of KSNDMC_TRG, BIHAR_TRG, KSNDMC_TWS */
+#ifndef UNIT_CFG
+#define UNIT_CFG        KSNDMC_TWS
 #endif
 
-#ifndef ACTIVE_CONFIG
-#define ACTIVE_CONFIG   CFG_KSNDMC_TWS
-#endif
+/* Backward-compatibility aliases */
+#define ACTIVE_CONFIG   UNIT_CFG
+#define CFG_KSNDMC_TRG  KSNDMC_TRG
+#define CFG_BIHAR_TRG   BIHAR_TRG
+#define CFG_KSNDMC_TWS  KSNDMC_TWS
+#define SYSTEM_TRG      0
+#define SYSTEM_TWS      1
+#define ACTIVE_SYSTEM   ((UNIT_CFG == KSNDMC_TWS) ? SYSTEM_TWS : SYSTEM_TRG)
 
 /* Firmware Version Identifier */
-#define FIRMWARE_VERSION    "AIO_6.1.1"
-#define LCD_VERSION_STRING  "v6.1.1"
+#define FIRMWARE_VERSION    "AIO_6.1.2"
+#define LCD_VERSION_STRING  "v6.1.2"
 #define STATION_ID_DEFAULT  "001922"
 
 /* Status SMS Destination & Network Identifiers */
-#if (ACTIVE_CONFIG == CFG_BIHAR_TRG)
+#if (UNIT_CFG == BIHAR_TRG)
 #define STATUS_SMS_DEST_NUMBER    "9741391102"
 #define STATUS_SMS_NETWORK_NAME   "DES-BIH"
 #else

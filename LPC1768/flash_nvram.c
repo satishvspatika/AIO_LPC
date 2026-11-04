@@ -201,8 +201,8 @@ bool flash_nvram_read(station_nvram_params_t *out_params)
     memset(out_params, 0, sizeof(station_nvram_params_t));
     out_params->magic = PARAM_MAGIC;
     strncpy(out_params->stn_id, STATION_ID_DEFAULT, sizeof(out_params->stn_id) - 1);
-    out_params->system_type = ACTIVE_SYSTEM;
-    out_params->unit_cfg = ACTIVE_CONFIG;
+    out_params->system_type = (UNIT_CFG == KSNDMC_TWS) ? 1 : 0;
+    out_params->unit_cfg = UNIT_CFG;
     out_params->rf_resolution = RF_BUCKET_RESOLUTION;
     out_params->sd_debug_dump = SDC_DEBUG_DUMP_DEFAULT;
     return false;

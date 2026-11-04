@@ -51,12 +51,12 @@ static void execute_slot_transmission(telemetry_data_t *telem)
 
         /* Format HTTP payload based on active configuration */
         char payload[512] = "";
-        const http_endpoint_t *endpoint = telemetry_get_endpoint(ACTIVE_CONFIG);
+        const http_endpoint_t *endpoint = telemetry_get_endpoint(UNIT_CFG);
         const char *stn_id = flash_nvram_get_station_id();
 
-        #if (ACTIVE_CONFIG == CFG_KSNDMC_TRG)
+        #if (UNIT_CFG == KSNDMC_TRG)
         format_payload_ksndmc_trg(payload, sizeof(payload), stn_id, telem, status.csq_dbm);
-        #elif (ACTIVE_CONFIG == CFG_BIHAR_TRG)
+        #elif (UNIT_CFG == BIHAR_TRG)
         format_payload_bihar_trg(payload, sizeof(payload), stn_id, telem, status.csq_dbm);
         #else
         format_payload_ksndmc_tws(payload, sizeof(payload), stn_id, telem, status.csq_dbm);

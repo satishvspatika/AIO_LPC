@@ -70,7 +70,7 @@ typedef enum {
  * 2. KSNDMC_TRG: NO weather sensors. ONLY cumulative rain. Field Calib.
  * 3. BIHAR_TRG:  NO weather sensors. BOTH 15M and cumulative rain. Field Calib.
  */
-#if (ACTIVE_CONFIG == CFG_KSNDMC_TWS)
+#if (UNIT_CFG == KSNDMC_TWS)
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
     SCR_DATETIME,
@@ -84,7 +84,7 @@ static const screen_type_t s_screens[] = {
     SCR_ERASE_DATA,
     SCR_SLEEP
 };
-#elif (ACTIVE_CONFIG == CFG_KSNDMC_TRG)
+#elif (UNIT_CFG == KSNDMC_TRG)
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
     SCR_DATETIME,
@@ -97,7 +97,7 @@ static const screen_type_t s_screens[] = {
     SCR_ERASE_DATA,
     SCR_SLEEP
 };
-#else /* CFG_BIHAR_TRG */
+#else /* BIHAR_TRG */
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
     SCR_DATETIME,
@@ -515,9 +515,9 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
     } else {
         switch (scr) {
             case SCR_STATION_ID:
-                #if (ACTIVE_CONFIG == CFG_KSNDMC_TRG)
+                #if (UNIT_CFG == KSNDMC_TRG)
                 snprintf(line1, sizeof(line1), "KSNDMC - TRG");
-                #elif (ACTIVE_CONFIG == CFG_BIHAR_TRG)
+                #elif (UNIT_CFG == BIHAR_TRG)
                 snprintf(line1, sizeof(line1), "BIHAR - TRG");
                 #else
                 snprintf(line1, sizeof(line1), "KSNDMC - TWS");
@@ -538,7 +538,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 break;
 
             case SCR_RAINFALL:
-                #if (ACTIVE_CONFIG == CFG_BIHAR_TRG)
+                #if (UNIT_CFG == BIHAR_TRG)
                 /* BIHAR_TRG shows both 15M and Cumulative Rainfall */
                 snprintf(line1, sizeof(line1), "RF 15M: %04.1f mm", telemetry->rf_15m_mm);
                 snprintf(line2, sizeof(line2), "CUM RF: %04.1f mm", telemetry->rf_cum_mm);
@@ -718,7 +718,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, int csq_dbm, const 
 
         /* Global CALIB key handler */
         if (key == KEY_CALIB && s_ui_mode == UI_MODE_BROWSE) {
-            #if (ACTIVE_CONFIG == CFG_KSNDMC_TWS)
+            #if (UNIT_CFG == KSNDMC_TWS)
             /* TWS has no rain gauge: start non-blocking 1.5s popup notification */
             s_no_rf_popup_timer = 30; /* 30 ticks * 50ms = 1.5 seconds */
             lcd_command(0x80);

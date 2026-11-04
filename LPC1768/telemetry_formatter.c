@@ -4,7 +4,7 @@
 #include <string.h>
 
 static const http_endpoint_t s_endpoints[] = {
-    [CFG_KSNDMC_TRG] = {
+    [KSNDMC_TRG] = {
         .domain = "rtdas.ksndmc.net",
         .ip = "117.216.42.181",
         .path = "/trg_gprs/update_data_sit_v3",
@@ -12,7 +12,7 @@ static const http_endpoint_t s_endpoints[] = {
         .api_key = "pse2420",
         .format = FORMAT_URL_ENCODED
     },
-    [CFG_BIHAR_TRG] = {
+    [BIHAR_TRG] = {
         .domain = "rtdasbmsk.spatika.net",
         .ip = "164.100.130.199",
         .path = "/Home/UpdateTRGData",
@@ -20,7 +20,7 @@ static const http_endpoint_t s_endpoints[] = {
         .api_key = "bmsk1234",
         .format = FORMAT_JSON
     },
-    [CFG_KSNDMC_TWS] = {
+    [KSNDMC_TWS] = {
         .domain = "rtdas.ksndmc.net",
         .ip = "117.216.42.181",
         .path = "/tws_gprs/update_tws_data_v3",
@@ -32,8 +32,8 @@ static const http_endpoint_t s_endpoints[] = {
 
 const http_endpoint_t* telemetry_get_endpoint(int config_id)
 {
-    if (config_id < 0 || config_id > CFG_KSNDMC_TWS) {
-        config_id = CFG_KSNDMC_TWS;
+    if (config_id < 0 || config_id > KSNDMC_TWS) {
+        config_id = KSNDMC_TWS;
     }
     return &s_endpoints[config_id];
 }

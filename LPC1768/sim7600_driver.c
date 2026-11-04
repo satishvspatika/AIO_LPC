@@ -670,7 +670,7 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
 
     const char *dest_phone = STATUS_SMS_DEST_NUMBER;
     const char *network_name = STATUS_SMS_NETWORK_NAME;
-    const char *stn_type = (ACTIVE_SYSTEM == SYSTEM_TRG) ? "TRG" : "TWS";
+    const char *stn_type = (UNIT_CFG == KSNDMC_TWS) ? "TWS" : "TRG";
     const char *stn_id = flash_nvram_get_station_id();
 
     /* Format timestamp in ISO: YYYY-MM-DDTHH:MM */
