@@ -1,0 +1,44 @@
+{
+  "copyright": "Copyright 2026 NXP",
+  "license": "SPDX-License-Identifier: BSD-3-Clause",
+  "version": "1.0.0",
+  "vendor": "NXP",
+  "devices": [
+    {
+      "board": "LPC845BREAKOUT",
+      "device": {
+        "name": "LPC845",
+        "family": "LPC84x",
+        "memory": [
+          {
+            "location": "0x00000000",
+            "size": "0x00010000",
+            "type": "Flash",
+            "flash-driver": "LPC84x_64.cfx"
+          },
+          {
+            "location": "0x10000000",
+            "size": "0x00003fe0",
+            "type": "RAM"
+          },
+          {
+            "location": "0x10003fe0",
+            "size": "0x00000020",
+            "type": "RAM"
+          }
+        ],
+        "cores": [
+          {
+            "type": "cm0plus",
+            "name": "cm0plus"
+          }
+        ]
+      },
+      "debug": {
+        "protocol": "swd",
+        "swo": false,
+        "connect-reset": "default"
+      }
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+# macOS system files
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Do not commit host-specific toolchain symlink or 1GB GCC binaries
+/tools
+
+# Logs & temp files
+*.log
+/tmp/
+
+# Intermediate build objects generated during LPC1768 build
+LPC1768/Debug/*.o
+LPC1768/Debug/*/*.o
+LPC1768/Debug/*/*/*.o
+LPC1768/Debug/*/*/*/*.o
+LPC1768/Debug/*.d
+LPC1768/Debug/*/*.d
+LPC1768/Debug/*.map
+LPC1768/Debug/*.elf
+
+# Intermediate build objects in FreeRTOS
+FreeRTOS_Library/Debug/*.o
+FreeRTOS_Library/Debug/*/*.o
+FreeRTOS_Library/Debug/*.d
+FreeRTOS_Library/Debug/*/*.d
+
+# Intermediate build objects in CMSIS
+CMSISv1p30_LPC17xx/Debug/*/*.o
+CMSISv1p30_LPC17xx/Debug/*/*.d
+
+# LPC845 intermediate single-file compile output
+LPC845/main.o
+
+# CRITICAL: Keep Linker Scripts and Precompiled SDK Libraries/Objects!
+# (These are required for linking and building out-of-the-box)
+!*.ld
+!*.a
+!LPC845/build_v2/**
+!LPC1768/Debug/example01*.ld
+!LPC845/Debug/*.ld
+!CMSISv1p30_LPC17xx/Debug/libCMSISv1p30_LPC17xx.a
+!FreeRTOS_Library/Debug/libFreeRTOS_Library.a
+
+# Keep ready-to-flash verified hex/bin images
+!LPC1768/Debug/*.hex
+!LPC1768/Debug/*.bin
+!LPC845/*.hex
+!LPC845/*.bin

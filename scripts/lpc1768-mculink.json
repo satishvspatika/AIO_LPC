@@ -1,0 +1,47 @@
+{
+  "copyright": "Copyright 2026 NXP",
+  "license": "SPDX-License-Identifier: BSD-3-Clause",
+  "version": "1.0.0",
+  "vendor": "NXP",
+  "devices": [
+    {
+      "board": "",
+      "device": {
+        "name": "LPC1768",
+        "family": "LPC17xx",
+        "memory": [
+          {
+            "location": "0x00000000",
+            "size": "0x80000",
+            "type": "Flash",
+            "flash-driver": "LPC175x_6x_512.cfx"
+          },
+          {
+            "location": "0x10000000",
+            "size": "0x8000",
+            "type": "RAM"
+          },
+          {
+            "location": "0x2007c000",
+            "size": "0x8000",
+            "type": "RAM"
+          }
+        ],
+        "cores": [
+          {
+            "name": "cm3"
+          }
+        ]
+      },
+      "debug": {
+        "wirespeed": 100000,
+        "protocol": "swd",
+        "no-packed": true,
+        "connect-reset": "system",
+        "flash-driver-reset": "system",
+        "reset": "system"
+      }
+    }
+  ]
+}
+
