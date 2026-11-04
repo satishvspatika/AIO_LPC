@@ -44,9 +44,11 @@
 #define KBD_COL2_PIN    20
 
 static bool s_lcd_initialized = false;
-static bool s_display_active = false;
+static bool s_display_active = true;
 static uint32_t s_activity_timestamp = 0;
 static int s_current_screen = 0;
+
+static void render_screen(int scr, const telemetry_data_t *telemetry, int csq_dbm, const char *ip_addr);
 
 static void delay_us(uint32_t us)
 {
@@ -57,10 +59,11 @@ static void delay_us(uint32_t us)
 
 static void lcd_pulse_en(void)
 {
+    delay_us(1); /* Setup time: data lines stable before EN rises */
     LPC_GPIO2->FIOSET = MASK_LCD_EN;
-    delay_us(2);
+    delay_us(2); /* Pulse width HIGH: min 230ns */
     LPC_GPIO2->FIOCLR = MASK_LCD_EN;
-    delay_us(40);
+    delay_us(50); /* Hold & execution recovery */
 }
 
 static void lcd_write_nibble(uint8_t nibble, bool is_data)
@@ -91,13 +94,16 @@ static void lcd_command(uint8_t cmd)
 {
     lcd_write_byte(cmd, false);
     if (cmd == 0x01 || cmd == 0x02) {
-        delay_us(2000); /* Clear / Home requires > 1.6ms */
+        delay_us(3000); /* Clear / Home requires > 1.64ms */
+    } else {
+        delay_us(100);  /* Standard command execution time */
     }
 }
 
 static void lcd_data(uint8_t data)
 {
     lcd_write_byte(data, true);
+    delay_us(50);
 }
 
 static void lcd_init_hw(void)
@@ -117,23 +123,30 @@ static void lcd_init_hw(void)
 
     LPC_GPIO2->FIODIR |= (MASK_LCD_RS | MASK_LCD_RW | MASK_LCD_EN | MASK_LCD_D4 | MASK_LCD_D5 | MASK_LCD_D6 | MASK_LCD_D7 | MASK_LCD_BL);
     LPC_GPIO2->FIOCLR = (MASK_LCD_RS | MASK_LCD_RW | MASK_LCD_EN | MASK_LCD_D4 | MASK_LCD_D5 | MASK_LCD_D6 | MASK_LCD_D7);
-    LPC_GPIO2->FIOSET = MASK_LCD_BL; /* Turn on backlight */
+    LPC_GPIO2->FIOSET = MASK_LCD_BL; /* Turn on backlight immediately */
 
     /* HD44780 4-bit startup sequence */
-    delay_us(50000); /* Wait > 40ms after VDD rises */
+    delay_us(60000); /* Wait > 40ms after VDD rises */
     lcd_write_nibble(0x03, false);
-    delay_us(5000);
+    delay_us(5000);  /* > 4.1 ms */
     lcd_write_nibble(0x03, false);
-    delay_us(150);
+    delay_us(200);   /* > 100 us */
     lcd_write_nibble(0x03, false);
-    delay_us(150);
-    lcd_write_nibble(0x02, false); /* Set 4-bit mode */
-    delay_us(150);
+    delay_us(200);   /* > 100 us */
+    lcd_write_nibble(0x02, false); /* Set 4-bit interface */
+    delay_us(200);
 
+    /* 4-bit mode commands matching proven Example01 sequence */
     lcd_command(0x28); /* 4-bit, 2-line, 5x8 font */
-    lcd_command(0x0C); /* Display ON, Cursor OFF, Blink OFF */
-    lcd_command(0x06); /* Entry mode: Auto-increment, no shift */
+    delay_us(2000);
+    lcd_command(0x08); /* Display OFF */
+    delay_us(2000);
     lcd_command(0x01); /* Clear display */
+    delay_us(5000);
+    lcd_command(0x06); /* Entry mode: Auto-increment, no shift */
+    delay_us(2000);
+    lcd_command(0x0C); /* Display ON, Cursor OFF, Blink OFF */
+    delay_us(2000);
 
     s_lcd_initialized = true;
     s_display_active = true;
@@ -242,9 +255,16 @@ bool ui_is_operator_active(void)
 void ui_display_init(void)
 {
     keypad_init_hw();
-    if (hal_power_is_5v_on()) {
-        lcd_init_hw();
-    }
+    hal_power_lcd_on();
+    lcd_init_hw();
+    s_current_screen = 0;
+    s_display_active = true;
+    ui_reset_activity_timer();
+
+    /* Render initial boot screen immediately */
+    telemetry_data_t telem;
+    memset(&telem, 0, sizeof(telem));
+    render_screen(0, &telem, -113, "0.0.0.0");
 }
 
 /* Screen Renderers */
@@ -257,6 +277,8 @@ static void render_screen(int scr, const telemetry_data_t *telemetry, int csq_db
         case 0: /* Landing Screen */
             #if (ACTIVE_SYSTEM == SYSTEM_TRG)
             snprintf(line1, sizeof(line1), "KSNDMC - TRG");
+            #elif (ACTIVE_CONFIG == CFG_BIHAR_TRG)
+            snprintf(line1, sizeof(line1), "BIHAR - TRG");
             #else
             snprintf(line1, sizeof(line1), "KSNDMC - TWS");
             #endif

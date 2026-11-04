@@ -3,7 +3,7 @@
 #include "lpc17xx_pinsel.h"
 #include <string.h>
 
-static volatile bool s_is_5v_on = false;
+static volatile bool s_is_5v_on = true;
 static volatile bool s_is_modem_on = false;
 
 void hal_power_init(void)
@@ -34,6 +34,9 @@ void hal_power_init(void)
     UART_FIFOConfig(LPC_UART3, &fifo_cfg);
 
     UART_TxCmd(LPC_UART3, ENABLE);
+
+    /* Ensure 5V LCD power rail is active on LPC845 coprocessor */
+    hal_power_lcd_on();
 }
 
 static void send_intermcu_cmd(const char *cmd)

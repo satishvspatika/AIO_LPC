@@ -156,9 +156,9 @@ int main(void)
     for (volatile int d = 0; d < 50000; d++);
 
     hal_power_init();
+    ui_display_init();
     intermcu_protocol_init();
     storage_log_init();
-    ui_display_init();
     sim7600_init();
 
     /* Create FreeRTOS Tasks */

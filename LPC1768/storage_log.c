@@ -18,16 +18,7 @@ static uint16_t s_tail = 0;
 void storage_log_init(void)
 {
     FRESULT res = f_mount(0, &s_fatfs);
-    if (res == FR_OK) {
-        s_fs_mounted = true;
-        /* Check if trigger file /DEBUG.TXT exists on card root */
-        FILINFO fno;
-        if (f_stat(DEBUG_TRIGGER_FILENAME, &fno) == FR_OK) {
-            s_debug_dump_enabled = true;
-        }
-    } else {
-        s_fs_mounted = false;
-    }
+    s_fs_mounted = (res == FR_OK);
 }
 
 void storage_log_timer_step_10ms(void)
@@ -69,7 +60,18 @@ void storage_log_http(const char *entry)
 
 void storage_log_drain_step(void)
 {
-    if (!s_fs_mounted || s_head == s_tail) return;
+    if (!s_fs_mounted) return;
+
+    static bool s_checked_trigger = false;
+    if (!s_checked_trigger) {
+        s_checked_trigger = true;
+        FILINFO fno;
+        if (f_stat(DEBUG_TRIGGER_FILENAME, &fno) == FR_OK) {
+            s_debug_dump_enabled = true;
+        }
+    }
+
+    if (s_head == s_tail) return;
 
     FIL file;
     if (f_open(&file, DEBUG_LOG_FILENAME, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
