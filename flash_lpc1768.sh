@@ -1,7 +1,28 @@
 #!/bin/bash
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LINKSERVER="/tmp/linkserver/LinkServer"
+
+# Auto-detect LinkServer executable
+if command -v LinkServer >/dev/null 2>&1; then
+    LINKSERVER="LinkServer"
+elif [ -x "/tmp/linkserver/LinkServer" ]; then
+    LINKSERVER="/tmp/linkserver/LinkServer"
+elif [ -x "/usr/local/bin/LinkServer" ]; then
+    LINKSERVER="/usr/local/bin/LinkServer"
+else
+    MCUX_LS=$(ls -d /Applications/MCUXpresso*/**/LinkServer 2>/dev/null | head -n 1 || true)
+    if [ -n "$MCUX_LS" ]; then
+        LINKSERVER="$MCUX_LS"
+    else
+        LINKSERVER="/tmp/linkserver/LinkServer"
+    fi
+fi
+
+if ! command -v "${LINKSERVER}" >/dev/null 2>&1 && [ ! -x "${LINKSERVER}" ]; then
+    echo "[ERROR] LinkServer executable not found!"
+    echo "Please ensure NXP LinkServer or MCUXpresso IDE is installed, or put LinkServer in PATH or /tmp/linkserver/."
+    exit 127
+fi
 CONFIG="${ROOT}/scripts/lpc1768-mculink.json"
 HEX="${ROOT}/LPC1768/Debug/LPC1768_AIO_FULL.hex"
 AXF="${ROOT}/LPC1768/Debug/LPC1768_AIO.axf"
