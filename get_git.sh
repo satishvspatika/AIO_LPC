@@ -96,3 +96,4 @@ echo -e "${BOLD}${GREEN}✔ FIRMWARE SYNCED!${NC}"
 echo -e "  Active LCD Version: ${BOLD}${CYAN}${ACTIVE_VER}${NC}"
 echo -e "  Ready to flash:     ${BOLD}./flash_lpc1768.sh && ./flash_lpc845.sh${NC}"
 echo -e "${GREEN}======================================================${NC}\n"
+

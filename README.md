@@ -71,7 +71,38 @@ Connect your MCU-Link debug probe via SWD ribbon cable to the target header:
 
 ---
 
-## 4. Repository Structure
+## 4. Git Synchronization & Versioning
+
+### Pushing Updates (with LCD Version Tag)
+To release a firmware update, specify the version tag with `-t` (commit message `-m` is optional):
+```bash
+# Push with custom commit message
+./push_git.sh -t "v6.0.1" -m "Fixed LCD boot timing"
+
+# Push with default commit message ("Release v6.0.1")
+./push_git.sh -t "v6.0.1"
+```
+The script will:
+1. Update `LCD_VERSION_STRING` in `LPC1768/user_config.h` (visible on 16x2 LCD Line 2 as `ID:001922 v6.0.1`).
+2. Recompile all firmware targets via `./build_all.sh`.
+3. Commit, create/update Git tag `v6.0.1`, and push to GitHub.
+
+### Pulling Updates on Another Laptop
+To pull the latest code or checkout a specific release tag on another machine:
+```bash
+# Pull latest main and automatically build
+./get_git.sh
+
+# Or checkout a specific tag
+./get_git.sh -tag v6.0.1
+
+# Then flash to board
+./flash_lpc1768.sh
+```
+
+---
+
+## 5. Repository Structure
 
 ```
 AIO_LPC/
