@@ -6,6 +6,9 @@
 #include "storage_log.h"
 #include "telemetry_formatter.h"
 #include "flash_log.h"
+#include "fw_update.h"
+#include "fw_app.h"
+#include "boot/fw_journal.h"
 #include "user_config.h"
 #include "lpc17xx_gpio.h"
 #include "lpc17xx_pinsel.h"
@@ -151,7 +154,8 @@ typedef enum {
     UI_MODE_MENU,
     UI_MODE_SLEEP_CONFIRM,
     UI_MODE_KEY_TEST,
-    UI_MODE_TEST_SEND
+    UI_MODE_TEST_SEND,
+    UI_MODE_FW_UPDATE
 } ui_mode_t;
 
 /* MENU key: operator shortcuts. Screen items jump to that screen, so actions such as
@@ -160,7 +164,8 @@ typedef enum {
     MENU_GOTO_SCREEN = 0,
     MENU_KEY_TEST,
     MENU_POWER_SAVE,
-    MENU_TEST_SEND
+    MENU_TEST_SEND,
+    MENU_FW_UPDATE
 } menu_action_t;
 
 typedef struct {
@@ -188,6 +193,7 @@ static const menu_item_t s_menu_items[] = {
     { "FIELD CALIB",     MENU_GOTO_SCREEN, SCR_FIELD_CALIB },
     #endif
     { "ERASE DATA",      MENU_GOTO_SCREEN, SCR_ERASE_DATA },
+    { "FIRMWARE UPDATE", MENU_FW_UPDATE,   SCR_STATION_ID },
     { "KEY TEST",        MENU_KEY_TEST,    SCR_STATION_ID },
     { "POWER SAVE",      MENU_POWER_SAVE,  SCR_STATION_ID }
 };
@@ -607,6 +613,276 @@ static void gps_fetch_start(const telemetry_data_t *telemetry)
         s_gps_running = false;
         s_gps_status = "NO MEMORY";
         storage_log_debug("ERROR", "Not enough memory to start the GPS task");
+    }
+}
+
+/* MENU > FIRMWARE UPDATE. Nothing is erased until the operator has seen the checked file's version
+ * and pressed EN. Shares the SMS task slot, as nothing else should use the modem or card meanwhile. */
+#define FW_MIN_SECONDS_TO_SLOT 180
+
+typedef enum { FW_UI_MENU = 0, FW_UI_BUSY, FW_UI_CONFIRM_TYPE, FW_UI_CONFIRM_MAIN, FW_UI_CONFIRM_REVERT, FW_UI_MESSAGE } fw_ui_state_t;
+typedef enum { FW_OP_CHECK_MAIN = 0, FW_OP_CHECK_CTRL, FW_OP_CHECK_REVERT, FW_OP_CHECK_TYPE, FW_OP_INSTALL_MAIN, FW_OP_DO_REVERT } fw_task_op_t;
+
+static const char *const s_fw_menu[] = { "MAIN F/W", "CTRL F/W", "REVERT F/W", "CHANGE TYPE" };
+
+/* One card carries a file per station type, and each unit takes its own. Another type's file is
+ * only ever offered from CHANGE TYPE, so a shared card can't lead to an accidental change. */
+static const char *fw_file_for(uint32_t profile)
+{
+    switch (profile) {
+    case KSNDMC_TRG: return FW_FILE_KSNDMC_TRG;
+    case BIHAR_TRG:  return FW_FILE_BIHAR_TRG;
+    default:         return FW_FILE_KSNDMC_TWS;
+    }
+}
+#define FW_MENU_ITEMS (sizeof(s_fw_menu) / sizeof(s_fw_menu[0]))
+
+static volatile fw_ui_state_t s_fw_ui = FW_UI_MENU;
+static volatile bool s_fw_running = false;
+static fw_task_op_t s_fw_op = FW_OP_CHECK_MAIN;
+static size_t s_fw_pos = 0;
+static char s_fw_line1[17] = "";
+static char s_fw_line2[17] = "";
+static fw_file_info_t s_fw_info;
+static const char *s_fw_file = NULL;
+static int s_fw_type_tries = 0;
+
+static const char *fw_type_name(uint32_t profile)
+{
+    switch (profile) {
+    case KSNDMC_TRG: return "KSNDMC TRG";
+    case BIHAR_TRG:  return "BIHAR TRG";
+    case KSNDMC_TWS: return "KSNDMC TWS";
+    default:         return "UNKNOWN";
+    }
+}
+
+static void fw_show(fw_ui_state_t state, const char *line1, const char *line2)
+{
+    snprintf(s_fw_line1, sizeof(s_fw_line1), "%s", line1);
+    snprintf(s_fw_line2, sizeof(s_fw_line2), "%s", line2);
+    s_fw_ui = state;
+}
+
+static void fw_progress(const char *stage, unsigned percent)
+{
+    char text[20];
+    snprintf(text, sizeof(text), "%s %u%%", stage, percent);
+    strncpy(s_status_sms_substep, text, sizeof(s_status_sms_substep) - 1);
+    s_status_sms_substep[sizeof(s_status_sms_substep) - 1] = '\0';
+    hal_power_heartbeat(); /* Keeps the LPC845's hang timer quiet through a long copy */
+}
+
+static void fw_restart_for_install(const char *what)
+{
+    fw_show(FW_UI_BUSY, "INSTALLING...", "DO NOT POWER OFF");
+    strncpy(s_status_sms_substep, "DO NOT POWER OFF", sizeof(s_status_sms_substep) - 1);
+    storage_log_debug("FW", what);
+    storage_log_flush();
+    /* The LCD keeps showing this while the bootloader, which has no LCD code, does its work */
+    vTaskDelay(1500 / portTICK_RATE_MS);
+    NVIC_SystemReset();
+}
+
+static void vFwUpdate_Task(void *pvParameters)
+{
+    (void)pvParameters;
+    char line[17];
+    uint32_t size;
+
+    switch (s_fw_op) {
+    case FW_OP_CHECK_MAIN: {
+        s_fw_file = fw_file_for(UNIT_CFG);
+        fw_result_t r = fw_update_check(s_fw_file, UNIT_CFG, &s_fw_info, fw_progress);
+        if (r == FW_OK && s_fw_info.crc32 == fw_app_running_crc()) {
+            /* The usual case for a card that has already updated this station. Reflashing is
+             * allowed, but the operator should know that's what it is. */
+            snprintf(line, sizeof(line), "SAME F/W %.7s", s_fw_info.version);
+            fw_show(FW_UI_CONFIRM_MAIN, line, "EN=REDO BACK=NO");
+        } else if (r == FW_OK) {
+            snprintf(line, sizeof(line), "FW %.7s FOUND", s_fw_info.version);
+            fw_show(FW_UI_CONFIRM_MAIN, line, "EN=YES  BACK=NO");
+        } else if (r == FW_E_NOT_FOUND) {
+            fw_show(FW_UI_MESSAGE, s_fw_file, "NOT FOUND");
+        } else {
+            storage_log_debug("ERROR", fw_update_error_text(r));
+            fw_show(FW_UI_MESSAGE, "UPDATE REFUSED", fw_update_error_text(r));
+        }
+        break;
+    }
+    case FW_OP_CHECK_TYPE: {
+        /* The other two types' files, in turn: BACK at the prompt moves on to the next */
+        bool offered = false;
+        while (s_fw_type_tries < 2 && !offered) {
+            uint32_t profile = (uint32_t)((UNIT_CFG + 1 + s_fw_type_tries) % 3);
+            s_fw_type_tries++;
+            s_fw_file = fw_file_for(profile);
+            fw_result_t r = fw_update_check(s_fw_file, profile, &s_fw_info, fw_progress);
+            if (r == FW_OK) {
+                snprintf(line, sizeof(line), "TO %.12s?", fw_type_name(profile));
+                fw_show(FW_UI_CONFIRM_TYPE, line, "ERASES ALL DATA");
+                offered = true;
+            } else if (r != FW_E_NOT_FOUND) {
+                storage_log_debug("ERROR", fw_update_error_text(r));
+                fw_show(FW_UI_MESSAGE, "UPDATE REFUSED", fw_update_error_text(r));
+                offered = true;
+            }
+        }
+        if (!offered) {
+            fw_show(FW_UI_MESSAGE, "NO OTHER TYPE", "FILE ON CARD");
+        }
+        break;
+    }
+    case FW_OP_CHECK_CTRL:
+        /* Sending it to the LPC845 needs that chip's bootloader, which is the next stage */
+        if (fw_file_open(FW_CTRL_FILENAME, &size)) {
+            fw_file_close();
+            fw_show(FW_UI_MESSAGE, "SENSOR.HEX FOUND", "NOT READY YET");
+        } else {
+            fw_show(FW_UI_MESSAGE, "SENSOR.HEX", "NOT FOUND");
+        }
+        break;
+    case FW_OP_CHECK_REVERT:
+        if (fw_update_slot_b_info(&s_fw_info)) {
+            snprintf(line, sizeof(line), "BACK TO %.7s", s_fw_info.version);
+            fw_show(FW_UI_CONFIRM_REVERT, line, "EN=YES BACK=NO");
+        } else {
+            fw_show(FW_UI_MESSAGE, "NO PREVIOUS F/W", "CAN'T REVERT");
+        }
+        break;
+    case FW_OP_INSTALL_MAIN: {
+        fw_result_t r = fw_update_stage(s_fw_file, &s_fw_info, fw_progress);
+        if (r == FW_OK) {
+            fw_restart_for_install("New firmware staged and checked, restarting to install");
+        }
+        storage_log_debug("ERROR", fw_update_error_text(r));
+        fw_show(FW_UI_MESSAGE, "UPDATE STOPPED", fw_update_error_text(r));
+        break;
+    }
+    case FW_OP_DO_REVERT:
+        if (fw_journal_append(FW_J_REVERT_REQ, FW_OP_NONE, 0)) {
+            fw_restart_for_install("Going back to the previous firmware, restarting");
+        }
+        fw_show(FW_UI_MESSAGE, "REVERT STOPPED", "FLASH ERROR");
+        break;
+    default:
+        break;
+    }
+
+    s_fw_running = false;
+    s_sms_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void fw_start_task(fw_task_op_t op, const char *first_step)
+{
+    s_fw_op = op;
+    s_fw_running = true;
+    s_fw_ui = FW_UI_BUSY;
+    snprintf(s_fw_line1, sizeof(s_fw_line1), "FIRMWARE UPDATE");
+    strncpy(s_status_sms_substep, first_step, sizeof(s_status_sms_substep) - 1);
+    s_status_sms_substep[sizeof(s_status_sms_substep) - 1] = '\0';
+    if (xTaskCreate(vFwUpdate_Task, (const signed char *)"FwTask", 768, NULL, 1, &s_sms_task_handle) != pdPASS) {
+        s_sms_task_handle = NULL;
+        s_fw_running = false;
+        storage_log_debug("ERROR", "Not enough memory to start the firmware update task");
+        fw_show(FW_UI_MESSAGE, "UPDATE STOPPED", "NO MEMORY");
+    }
+}
+
+/* An update must not run into a slot, or on a weak battery */
+static bool fw_safe_to_install(const telemetry_data_t *telemetry)
+{
+    const char *t = telemetry->present_time;
+    if (s_slot_busy || s_sms_task_handle != NULL) {
+        fw_show(FW_UI_MESSAGE, "UNIT BUSY", "TRY AGAIN SOON");
+        return false;
+    }
+    if (strlen(t) >= 14) {
+        int minute = (t[10] - '0') * 10 + (t[11] - '0');
+        int second = (t[12] - '0') * 10 + (t[13] - '0');
+        int to_slot = (15 - (minute % 15)) * 60 - second;
+        if (to_slot < FW_MIN_SECONDS_TO_SLOT || slot_scheduler_is_due()) {
+            fw_show(FW_UI_MESSAGE, "SLOT DUE SOON", "TRY AFTER SLOT");
+            return false;
+        }
+    }
+    if (telemetry->bat1_volt < GPS_MIN_BATTERY_V) {
+        fw_show(FW_UI_MESSAGE, "BATTERY LOW", "NOT UPDATING");
+        return false;
+    }
+    return true;
+}
+
+static void fw_open(void)
+{
+    s_fw_pos = 0;
+    const char *last = fw_app_last_result();
+    if (last) {
+        fw_show(FW_UI_MESSAGE, "LAST UPDATE:", last);
+    } else {
+        s_fw_ui = FW_UI_MENU;
+    }
+    s_ui_mode = UI_MODE_FW_UPDATE;
+}
+
+static void fw_key(key_code_t key, const telemetry_data_t *telemetry)
+{
+    if (s_fw_running || s_fw_ui == FW_UI_BUSY) {
+        return; /* Locked until it finishes */
+    }
+    switch (s_fw_ui) {
+    case FW_UI_MENU:
+        if (key == KEY_UP || key == KEY_LEFT) {
+            s_fw_pos = (s_fw_pos + FW_MENU_ITEMS - 1) % FW_MENU_ITEMS;
+        } else if (key == KEY_DOWN || key == KEY_RIGHT) {
+            s_fw_pos = (s_fw_pos + 1) % FW_MENU_ITEMS;
+        } else if (key == KEY_BACK || key == KEY_MENU) {
+            s_ui_mode = UI_MODE_BROWSE;
+        } else if (key == KEY_EN) {
+            if (s_sms_task_handle != NULL) {
+                fw_show(FW_UI_MESSAGE, "UNIT BUSY", "TRY AGAIN SOON");
+            } else if (s_fw_pos == 0) {
+                fw_start_task(FW_OP_CHECK_MAIN, "CHECKING 0%");
+            } else if (s_fw_pos == 1) {
+                fw_start_task(FW_OP_CHECK_CTRL, "SEARCHING...");
+            } else if (s_fw_pos == 2) {
+                fw_start_task(FW_OP_CHECK_REVERT, "CHECKING...");
+            } else {
+                s_fw_type_tries = 0;
+                fw_start_task(FW_OP_CHECK_TYPE, "SEARCHING...");
+            }
+        }
+        break;
+    case FW_UI_CONFIRM_TYPE:
+        if (key == KEY_EN) {
+            /* Second step: this is the same prompt as any update */
+            char line[17];
+            char msg[48];
+            snprintf(line, sizeof(line), "FW %.7s FOUND", s_fw_info.version);
+            fw_show(FW_UI_CONFIRM_MAIN, line, "EN=YES  BACK=NO");
+            snprintf(msg, sizeof(msg), "Operator accepted station type %s", fw_type_name(s_fw_info.profile));
+            storage_log_debug("FW", msg);
+        } else if (key == KEY_BACK) {
+            fw_start_task(FW_OP_CHECK_TYPE, "SEARCHING...");
+        }
+        break;
+    case FW_UI_CONFIRM_MAIN:
+    case FW_UI_CONFIRM_REVERT:
+        if (key == KEY_EN) {
+            if (fw_safe_to_install(telemetry)) {
+                bool main_fw = (s_fw_ui == FW_UI_CONFIRM_MAIN);
+                fw_start_task(main_fw ? FW_OP_INSTALL_MAIN : FW_OP_DO_REVERT, main_fw ? "ERASING 0%" : "RESTARTING...");
+            }
+        } else if (key == KEY_BACK) {
+            s_fw_ui = FW_UI_MENU;
+        }
+        break;
+    default:
+        if (key == KEY_EN || key == KEY_BACK) {
+            s_fw_ui = FW_UI_MENU;
+        }
+        break;
     }
 }
 
@@ -1049,7 +1325,7 @@ void ui_enter_sleep(void)
     }
 
     /* Never power down over a 15-minute slot, or with GPS searching */
-    if (s_slot_busy || s_gps_running || slot_scheduler_is_due()) {
+    if (s_slot_busy || s_gps_running || s_fw_running || slot_scheduler_is_due()) {
         storage_log_debug("PWR", "Sleep refused: 15-minute slot is due or running");
         s_inactivity_ticks = 0;
         return;
@@ -1175,6 +1451,17 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
             snprintf(line2, sizeof(line2), "SET %-4s EN=SEND", field_names[s_test_field]);
         }
 #endif
+    } else if (s_ui_mode == UI_MODE_FW_UPDATE) {
+        if (s_fw_ui == FW_UI_MENU) {
+            snprintf(line1, sizeof(line1), "FIRMWARE UPDATE ");
+            snprintf(line2, sizeof(line2), ">%-15.15s", s_fw_menu[s_fw_pos]);
+        } else if (s_fw_ui == FW_UI_BUSY) {
+            snprintf(line1, sizeof(line1), "%-16.16s", s_fw_line1);
+            snprintf(line2, sizeof(line2), "%-16.16s", s_status_sms_substep);
+        } else {
+            snprintf(line1, sizeof(line1), "%-16.16s", s_fw_line1);
+            snprintf(line2, sizeof(line2), "%-16.16s", s_fw_line2);
+        }
     } else if (s_ui_mode == UI_MODE_SLEEP_CONFIRM) {
         snprintf(line1, sizeof(line1), "POWER SAVE MODE?");
         snprintf(line2, sizeof(line2), "EN=YES  OTHER=NO");
@@ -1604,7 +1891,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
     if (key != KEY_NONE) {
         s_operator_touched_key = true;
         s_inactivity_ticks = 0;
-    } else if (s_status_sms_state != STATUS_UI_SENDING && !s_slot_busy && !s_gps_running
+    } else if (s_status_sms_state != STATUS_UI_SENDING && !s_slot_busy && !s_gps_running && !s_fw_running
 #if ENABLE_TEST_SEND
                && !s_test_running
 #endif
@@ -1656,6 +1943,11 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             return;
         }
         #endif
+
+        if (s_ui_mode == UI_MODE_FW_UPDATE) {
+            fw_key(key, telemetry);
+            return;
+        }
 
         #if (UNIT_CFG == KSNDMC_TWS)
         /* CALIB is for TRG only: TWS has no rain gauge, so the key has no function */
@@ -1802,6 +2094,8 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                     s_key_test_last = KEY_NONE;
                     s_mode_timeout_ticks = KEY_TEST_TIMEOUT_TICKS;
                     s_ui_mode = UI_MODE_KEY_TEST;
+                } else if (item->action == MENU_FW_UPDATE) {
+                    fw_open();
                 #if ENABLE_TEST_SEND
                 } else if (item->action == MENU_TEST_SEND) {
                     test_send_open(telemetry);

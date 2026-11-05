@@ -17,14 +17,17 @@ typedef enum {
     FW_J_CONFIRMED,     /* Application: the new image proved itself */
     FW_J_ROLLED_BACK,   /* Failed its trial, old image back in slot A */
     FW_J_RECOVERED,     /* Slot A was damaged, slot B's image now in slot A */
-    FW_J_REVERT_REQ     /* Application: operator asked for the previous firmware */
+    FW_J_REVERT_REQ,    /* Application: operator asked for the previous firmware */
+    FW_J_REVERTED,      /* Bootloader: the previous firmware is back, as asked */
+    FW_J_REPORTED       /* Application: the outcome has been logged, nothing in progress */
 } fw_j_type_t;
 
 typedef enum {
     FW_OP_NONE = 0,
     FW_OP_INSTALL,
     FW_OP_ROLLBACK,
-    FW_OP_RECOVER
+    FW_OP_RECOVER,
+    FW_OP_REVERT
 } fw_op_t;
 
 typedef struct {

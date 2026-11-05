@@ -173,6 +173,26 @@ bool flash_nvram_get_location(int32_t *lat_udeg, int32_t *lon_udeg)
     return true;
 }
 
+/* The tag tells a real value from old bytes in this sector */
+#define FW_PROFILE_TAG 0x54505200UL /* 'TPR' */
+
+int flash_nvram_get_profile(void)
+{
+    const station_nvram_params_t *p = (const station_nvram_params_t *)PARAM_SECTOR_ADDR;
+    uint32_t tag;
+    memcpy(&tag, &p->profile_tag, sizeof(tag));
+    return ((tag & 0xFFFFFF00UL) == FW_PROFILE_TAG) ? (int)(tag & 0xFFUL) : -1;
+}
+
+bool flash_nvram_set_profile(int profile)
+{
+    uint8_t sector_buf[256] __attribute__((aligned(4)));
+    uint32_t tag = FW_PROFILE_TAG | ((uint32_t)profile & 0xFFUL);
+    memcpy(sector_buf, (const void *)PARAM_SECTOR_ADDR, 256);
+    memcpy(sector_buf + offsetof(station_nvram_params_t, profile_tag), &tag, sizeof(tag));
+    return iap_write_sector1(sector_buf, 256);
+}
+
 const char *flash_nvram_get_location_date(void)
 {
     const char *stored = (const char *)(PARAM_SECTOR_ADDR + offsetof(station_nvram_params_t, gps_date));

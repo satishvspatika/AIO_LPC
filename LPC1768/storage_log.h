@@ -21,6 +21,9 @@ void storage_log_http(const char *entry);
 
 /* One CSV line per 15-minute slot in SLOTS.CSV, for auditing gaps */
 void storage_log_slot(const char *csv_line);
+int storage_erase_station_data(void);
+/* Adds one timestamped line to a file on the card */
+void storage_append_stamped(const char *name, const char *text);
 
 /* Small state files. Saves overwrite in place, so keep each file's text a fixed length. */
 bool storage_state_load(const char *filename, char *out, size_t size);

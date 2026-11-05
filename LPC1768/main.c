@@ -804,8 +804,8 @@ static void vMain_Task(void *pvParameters)
             char wake = '?';
             int reset_status = -1;
             intermcu_get_845_wake(&wake, &reset_status);
-            snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 link: %lu bytes, %lu frames, %lu good, woke=%c 845reset=%d. Last: %s",
-                     (unsigned long)bytes, (unsigned long)frames, (unsigned long)good, wake, reset_status, last);
+            snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 link: %lu bytes, %lu frames, %lu good, %lu damaged, woke=%c 845reset=%d. Last: %s",
+                     (unsigned long)bytes, (unsigned long)frames, (unsigned long)good, (unsigned long)intermcu_get_bad_frames(), wake, reset_status, last);
             storage_log_debug(good ? "LINK" : "ERROR", s_slot_line);
         }
         link_log_sec++;

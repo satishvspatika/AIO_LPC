@@ -2219,6 +2219,17 @@ int main(void)
 					(int)rf_val,	//Tips so far in this slot, for the LCD
 					(int)rain_total_restored);
 
+			//XOR of everything between '$' and ';', sent as a last field: the LPC1768 drops a frame
+			//that doesn't match, as a lost byte could otherwise move digits between fields
+			{
+				int frame_len = (int)strlen(gc_xmit_buf);
+				uint8_t frame_xor = 0;
+				for(int k = 1; k < frame_len - 1; k++){
+					frame_xor ^= (uint8_t)gc_xmit_buf[k];
+				}
+				sprintf(&gc_xmit_buf[frame_len - 1], ",%02X;", frame_xor);
+			}
+
 			xmit_ptr = gc_xmit_buf;
 			LPC845_UART0->INTENSET = kUSART_TxReady;
 			pAck_xmit = 1;

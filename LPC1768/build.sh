@@ -61,6 +61,7 @@ ${CC} ${CFLAGS} "${LPC_DIR}/storage_log.c" -o "${OUT_DIR}/storage_log.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/flash_nvram.c" -o "${OUT_DIR}/flash_nvram.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/flash_log.c" -o "${OUT_DIR}/flash_log.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_app.c" -o "${OUT_DIR}/fw_app.o"
+${CC} ${CFLAGS} "${LPC_DIR}/fw_update.c" -o "${OUT_DIR}/fw_update.o"
 mkdir -p "${OUT_DIR}/boot"
 ${CC} ${CFLAGS} "${LPC_DIR}/boot/fw_journal.c" -o "${OUT_DIR}/boot/fw_journal.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/cr_startup_lpc17.c" -o "${OUT_DIR}/cr_startup_lpc17.o"
@@ -114,6 +115,7 @@ ${CC} \
   "${OUT_DIR}/storage_log.o" \
   "${OUT_DIR}/flash_log.o" \
   "${OUT_DIR}/fw_app.o" \
+  "${OUT_DIR}/fw_update.o" \
   "${OUT_DIR}/boot/fw_journal.o" \
   "${OUT_DIR}/flash_nvram.o" \
   "${OUT_DIR}/fat_sd/diskio.o" \
@@ -168,7 +170,12 @@ grep -vE "${HEX_STRIP}" "${OUT_DIR}/journal_blank.hex" >> "${OUT_DIR}/LPC1768_AI
 grep -vE "${HEX_STRIP}" "${OUT_DIR}/LPC1768_AIO_APP.hex" >> "${OUT_DIR}/LPC1768_AIO_FULL.hex"
 echo ":00000001FF" >> "${OUT_DIR}/LPC1768_AIO_FULL.hex"
 python3 "${SCRIPTS_DIR}/fw_check_hex.py" "${OUT_DIR}/LPC1768_AIO_FULL.hex"
+# The file for MENU > FIRMWARE UPDATE: copy this one to the SD card. One per station type.
+SD_FILE="$(cat "${OUT_DIR}/LPC1768_AIO.bin.sdname")"
+rm -f "${OUT_DIR}/fw.hex"
+cp "${OUT_DIR}/LPC1768_AIO_APP.hex" "${OUT_DIR}/${SD_FILE}"
 
 ${SIZE} "${OUT_DIR}/LPC1768_AIO.axf"
 echo "=== LPC1768 Build Completed Successfully! ==="
 echo "Full Flashing HEX: ${OUT_DIR}/LPC1768_AIO_FULL.hex"
+echo "SD card update file: ${OUT_DIR}/${SD_FILE}"

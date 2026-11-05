@@ -35,6 +35,7 @@ void intermcu_protocol_init(void);
 void intermcu_process_byte(uint8_t byte);
 bool intermcu_get_telemetry(telemetry_data_t *out_data);
 uint32_t intermcu_get_fat_time(void);
+uint32_t intermcu_get_bad_frames(void);
 bool intermcu_845_wants_rain_total(void);
 void intermcu_update_time(const char *timestamp14);
 void intermcu_tick_second(void);

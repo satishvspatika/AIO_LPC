@@ -20,7 +20,8 @@ typedef struct __attribute__((packed)) {
     int32_t gps_lat_udeg;    /* Last GPS position, millionths of a degree (south negative) */
     int32_t gps_lon_udeg;    /* West negative */
     char gps_date[12];       /* e.g. "2026-11-05" */
-    char reserved[178];      /* Pad to 256 bytes for IAP write alignment */
+    uint32_t profile_tag;    /* FW_PROFILE_TAG | UNIT_CFG of the firmware that last ran */
+    char reserved[174];      /* Pad to 256 bytes for IAP write alignment */
 } station_nvram_params_t;
 
 void flash_nvram_init(void);
@@ -37,6 +38,9 @@ bool flash_nvram_set_calib_result(const char *result);
 bool flash_nvram_get_location(int32_t *lat_udeg, int32_t *lon_udeg);
 const char *flash_nvram_get_location_date(void);
 bool flash_nvram_set_location(int32_t lat_udeg, int32_t lon_udeg, const char *date);
+/* The station type that last ran here, or -1 if none is recorded */
+int flash_nvram_get_profile(void);
+bool flash_nvram_set_profile(int profile);
 bool flash_nvram_read(station_nvram_params_t *out_params);
 bool flash_nvram_write(const station_nvram_params_t *in_params);
 

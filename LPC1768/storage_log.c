@@ -3,6 +3,7 @@
 #include "ui_display.h"
 #include "intermcu_protocol.h"
 #include "ff.h"
+#include "fw_update.h"
 #include "diskio.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -11,6 +12,8 @@
 #include <string.h>
 
 #define RING_BUFFER_SIZE 2048
+
+#define BACKLOG_FILENAME "BACKLOG.DAT"
 
 static FATFS s_fatfs;
 static bool s_fs_mounted = false;
@@ -480,7 +483,6 @@ typedef struct __attribute__((packed)) {
     char payload[384];    /* HTTP payload string */
 } storage_backlog_entry_t;
 
-#define BACKLOG_FILENAME "BACKLOG.DAT"
 
 void storage_backlog_init(void)
 {
@@ -652,6 +654,108 @@ void storage_backlog_cleanup_if_all_sent(void)
         fs_unlock();
         storage_log_debug("BACKLOG", "All backlogs sent, reclaimed BACKLOG.DAT");
     }
+}
+
+/* Firmware files. The card is shared, so the lock is taken per read, and the backlog's file object
+ * is free because an update can't start near a slot. */
+bool fw_file_open(const char *name, uint32_t *out_size)
+{
+    fs_lock();
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    bool ok = (f_open(&s_backlog_file, name, FA_OPEN_EXISTING | FA_READ) == FR_OK);
+    if (ok && out_size) {
+        *out_size = (uint32_t)s_backlog_file.fsize;
+    }
+    fs_unlock();
+    return ok;
+}
+
+int fw_file_read(void *buf, uint32_t len)
+{
+    UINT got = 0;
+    fs_lock();
+    FRESULT r = f_read(&s_backlog_file, buf, len, &got);
+    fs_unlock();
+    return (r == FR_OK) ? (int)got : -1;
+}
+
+void fw_file_close(void)
+{
+    fs_lock();
+    f_close(&s_backlog_file);
+    fs_unlock();
+}
+
+/* A new station type starts fresh: its records, and what the old type had queued or remembered.
+ * Debug logs, SLOTS.CSV and UPDATE.TXT stay, as they say what happened. Returns files removed. */
+int storage_erase_station_data(void)
+{
+    static const char *const state_files[] = { LAST_SLOT_FILENAME, FLASH_SYNC_FILENAME, LAST_LOGGED_FILENAME, BACKLOG_FILENAME };
+    int removed = 0;
+    DIR dir;
+    FILINFO info;
+    char path[24];
+
+    fs_lock();
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    for (size_t i = 0; i < sizeof(state_files) / sizeof(state_files[0]); i++) {
+        if (f_unlink(state_files[i]) == FR_OK) {
+            removed++;
+        }
+    }
+    if (f_opendir(&dir, "DATA") == FR_OK) {
+        /* Reading on from the same place after a delete is safe in FatFs, but restarting is simpler */
+        for (int guard = 0; guard < 2000; guard++) {
+            if (f_opendir(&dir, "DATA") != FR_OK || f_readdir(&dir, &info) != FR_OK) {
+                break;
+            }
+            while (info.fname[0] == '.' ) {
+                if (f_readdir(&dir, &info) != FR_OK) {
+                    info.fname[0] = '\0';
+                }
+            }
+            if (info.fname[0] == '\0') {
+                break;
+            }
+            snprintf(path, sizeof(path), "DATA/%s", info.fname);
+            if (f_unlink(path) != FR_OK) {
+                break;
+            }
+            removed++;
+        }
+    }
+    fs_unlock();
+    return removed;
+}
+
+void storage_append_stamped(const char *name, const char *text)
+{
+    char ts_str[36];
+    format_log_time(ts_str, sizeof(ts_str));
+    fs_lock();
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    if (f_open(&s_http_file, name, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
+        UINT bw;
+        char stamp[44];
+        int n = snprintf(stamp, sizeof(stamp), "[%s] ", ts_str);
+        f_lseek(&s_http_file, s_http_file.fsize);
+        if (n > 0) {
+            f_write(&s_http_file, stamp, (UINT)n, &bw);
+        }
+        f_write(&s_http_file, text, strlen(text), &bw);
+        f_write(&s_http_file, "\r\n", 2, &bw);
+        f_close(&s_http_file);
+    }
+    fs_unlock();
 }
 
 void storage_backlog_clear_all(void)

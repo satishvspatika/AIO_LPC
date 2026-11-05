@@ -2,6 +2,9 @@
 #include "boot/fw_layout.h"
 #include "boot/fw_journal.h"
 #include "storage_log.h"
+#include "flash_nvram.h"
+#include "flash_log.h"
+#include "intermcu_protocol.h"
 #include "user_config.h"
 #include "LPC17xx.h"
 #include "FreeRTOS.h"
@@ -30,6 +33,11 @@ static unsigned long s_cmd[5];
 static unsigned long s_res[5];
 static bool s_on_trial = false;
 static volatile bool s_confirmed = false;
+static const char *s_last_result = NULL;
+static uint8_t s_outcome_pending = FW_J_NONE;
+static bool s_outcome_done = false;
+#define OUTCOME_MIN_FRAMES  3
+#define OUTCOME_LATEST_SEC  15
 
 const uint8_t *fw_hal_ptr(uint32_t addr)
 {
@@ -93,34 +101,99 @@ bool fw_hal_program(uint32_t addr, const void *src, uint32_t len)
     return false;
 }
 
+uint32_t fw_app_running_crc(void)
+{
+    /* Read from flash: the build stamps this after compiling, so the compiler's copy is wrong */
+    return *(const volatile uint32_t *)&g_fw_image_info.crc32;
+}
+
+const char *fw_app_last_result(void)
+{
+    return s_last_result;
+}
+
+/* Once for each update: writes down how it ended. A power cut before REPORTED just repeats this.
+ * The file stays on the card, as one card serves many stations: only the menu can install it. */
+static void report_outcome(uint8_t type)
+{
+    const char *what;
+    bool failed = true;
+    switch (type) {
+    case FW_J_CONFIRMED:    what = "UPDATE OK"; failed = false; break;
+    case FW_J_ROLLED_BACK:  what = "FAILED: OLD F/W"; break;
+    case FW_J_RECOVERED:    what = "F/W RESTORED"; break;
+    case FW_J_REJECTED:     what = "REJECTED"; break;
+    case FW_J_REVERTED:     what = "REVERTED"; failed = false; break;
+    default:                return;
+    }
+    s_last_result = what;
+
+    char line[64];
+    snprintf(line, sizeof(line), "%s, now running %s", what, g_fw_image_info.version);
+    storage_log_debug(failed ? "ERROR" : "FW", line);
+    /* One card serves many stations */
+    char history[80];
+    snprintf(history, sizeof(history), "Station %s: %s", flash_nvram_get_station_id(), line);
+    storage_append_stamped(FW_HISTORY_FILENAME, history);
+    fw_journal_append(FW_J_REPORTED, FW_OP_NONE, 0);
+}
+
+/* A new station type starts fresh, as the operator was warned: queued records are in the old
+ * server's format, and the old totals mean nothing to the new type. Done once the new firmware has
+ * confirmed itself, so a failed update costs no data, and from every boot's check, so a power cut
+ * can't skip it and an MCU-Link flash counts too. */
+static void check_station_type_change(void)
+{
+    int last = flash_nvram_get_profile();
+    if (last == UNIT_CFG) {
+        return;
+    }
+    if (last >= 0) {
+        char line[80];
+        int removed = storage_erase_station_data();
+        storage_backlog_clear_all();
+        flash_log_erase_all();
+        intermcu_reset_cumulative_rain();
+        snprintf(line, sizeof(line), "Station %s type %d to %d: all data erased, %d SD files",
+                 flash_nvram_get_station_id(), last, UNIT_CFG, removed);
+        storage_log_debug("FW", line);
+        storage_append_stamped(FW_HISTORY_FILENAME, line);
+    }
+    /* Last: until this is written, the erase runs again after a power cut */
+    flash_nvram_set_profile(UNIT_CFG);
+}
+
 void fw_app_init(void)
 {
     fw_record_t rec;
     fw_journal_read(&rec);
     s_on_trial = (rec.type == FW_J_TRIAL_BOOT);
 
-    char line[64];
-    const char *what;
-    switch (rec.type) {
-    case FW_J_TRIAL_BOOT:   what = "new firmware on trial"; break;
-    case FW_J_CONFIRMED:    what = "last update confirmed"; break;
-    case FW_J_ROLLED_BACK:  what = "UPDATE FAILED, previous firmware restored"; break;
-    case FW_J_RECOVERED:    what = "FIRMWARE WAS DAMAGED, restored from the other copy"; break;
-    case FW_J_REJECTED:     what = "UPDATE REJECTED, staged image was invalid"; break;
-    default:                what = "no update history"; break;
-    }
-    snprintf(line, sizeof(line), "%s: %s", g_fw_image_info.version, what);
-    storage_log_debug((rec.type == FW_J_ROLLED_BACK || rec.type == FW_J_RECOVERED || rec.type == FW_J_REJECTED) ? "ERROR" : "FW", line);
+    s_outcome_pending = rec.type;
+
+    char line[48];
+    snprintf(line, sizeof(line), "Running %s%s", g_fw_image_info.version, s_on_trial ? ", new firmware on trial" : "");
+    storage_log_debug("FW", line);
 }
 
 void fw_app_step(uint32_t uptime_sec, uint32_t good_frames)
 {
+    /* A few seconds in, so the clock has arrived and the history gets a real time */
+    if (!s_outcome_done && (good_frames >= OUTCOME_MIN_FRAMES || uptime_sec >= OUTCOME_LATEST_SEC)) {
+        s_outcome_done = true;
+        if (!s_on_trial) {
+            check_station_type_change();
+        }
+        report_outcome(s_outcome_pending);
+    }
     if (!s_on_trial || s_confirmed || uptime_sec < CONFIRM_AFTER_SEC || good_frames < CONFIRM_MIN_FRAMES) {
         return;
     }
     if (fw_journal_append(FW_J_CONFIRMED, FW_OP_NONE, 0)) {
         s_confirmed = true;
         storage_log_debug("FW", "New firmware confirmed healthy");
+        check_station_type_change();
+        report_outcome(FW_J_CONFIRMED);
     } else {
         storage_log_debug("ERROR", "Could not record firmware confirmation, will retry");
     }

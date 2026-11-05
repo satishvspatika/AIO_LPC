@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.7.0"
+#define FIRMWARE_VERSION    "v6.8.3"
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
 #define ENABLE_TEST_SEND    1
@@ -53,6 +53,11 @@
 #define LAST_SLOT_FILENAME      "LASTSLOT.DAT"
 #define FLASH_SYNC_FILENAME     "FLASHSYN.DAT"
 #define SD_CHECK_FILENAME       "SDCHECK.DAT"
+#define FW_FILE_KSNDMC_TRG      "fw_ksn_trg.hex"
+#define FW_FILE_BIHAR_TRG       "fw_bihar.hex"
+#define FW_FILE_KSNDMC_TWS      "fw_ksn_tws.hex"
+#define FW_CTRL_FILENAME        "sensor.hex"
+#define FW_HISTORY_FILENAME     "UPDATE.TXT"
 #define DEBUG_TRIGGER_FILENAME  "DEBUG.TXT"
 
 /* Timing & Safety Watchdog Limits (in milliseconds) */

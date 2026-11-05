@@ -144,6 +144,8 @@ static bool finish_swap(fw_op_t op, uint32_t first_step)
         return fw_journal_append(FW_J_SWAPPED, FW_OP_NONE, 0);
     case FW_OP_ROLLBACK:
         return fw_journal_append(FW_J_ROLLED_BACK, FW_OP_NONE, 0);
+    case FW_OP_REVERT:
+        return fw_journal_append(FW_J_REVERTED, FW_OP_NONE, 0);
     default:
         return fw_journal_append(FW_J_RECOVERED, FW_OP_NONE, 0);
     }
@@ -198,7 +200,7 @@ fw_boot_result_t fw_boot_decide(void)
             }
             break;
         }
-        return start_swap(FW_OP_ROLLBACK) ? FW_BOOT_RUN : FW_BOOT_RETRY;
+        return start_swap(FW_OP_REVERT) ? FW_BOOT_RUN : FW_BOOT_RETRY;
 
     case FW_J_SWAP_START:
     case FW_J_SWAP_STEP: {

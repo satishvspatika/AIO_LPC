@@ -270,6 +270,8 @@ int main(void)
     assert(fw_journal_append(FW_J_REVERT_REQ, FW_OP_NONE, 0));
     assert(fw_boot_decide() == FW_BOOT_RUN);
     assert(slot_is(FW_SLOT_A_BASE, s_old) && slot_is(FW_SLOT_B_BASE, s_new));
+    fw_journal_read(&rec);
+    assert(rec.type == FW_J_REVERTED);
     tests++;
 
     /* 8. Update after update, enough to wrap the journal ring many times */

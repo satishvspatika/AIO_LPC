@@ -30,6 +30,11 @@ def main(path):
         f.write(data)
     version = bytes(data[off + 20:off + 36]).split(b"\0")[0].decode("ascii", "replace")
     print(f"Image {version}: {len(data)} bytes of {SLOT_SIZE}, CRC32 0x{crc:08X}")
+    # What the SD card file for this image is called
+    profile = struct.unpack_from("<I", data, off + 16)[0]
+    names = {0: "fw_ksn_trg.hex", 1: "fw_bihar.hex", 2: "fw_ksn_tws.hex"}
+    with open(path + ".sdname", "w") as f:
+        f.write(names[profile])
 
 
 if __name__ == "__main__":

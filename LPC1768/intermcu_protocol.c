@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#define FRAME_MAX_LEN 160
+#define FRAME_MAX_LEN 176
 
 static char s_rx_buffer[FRAME_MAX_LEN];
 static uint16_t s_rx_idx = 0;
@@ -84,6 +84,19 @@ void intermcu_get_845_wake(char *out_reason, int *out_reset_status)
 static volatile uint32_t s_link_bytes = 0;
 static volatile uint32_t s_link_frames = 0;
 static volatile uint32_t s_link_good = 0;
+static volatile uint32_t s_link_bad = 0;
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+uint32_t intermcu_get_bad_frames(void)
+{
+    return s_link_bad;
+}
 static char s_link_last_frame[72];
 
 void intermcu_get_link_stats(uint32_t *out_bytes, uint32_t *out_frames, uint32_t *out_good, char *out_last, size_t size)
@@ -376,12 +389,56 @@ static void parse_c_packet(const char *frame)
     }
 }
 
+/* CHECKSUM_BEGIN */
+/* The last field is the XOR of everything between '$' and its comma. Firmware that sends it always
+ * sends it, so once seen, a frame without a good one is damaged: a lost comma could otherwise pass
+ * as a frame from older firmware. */
+static bool frame_checksum_ok(const char *frame)
+{
+    static bool s_has_checksum = false;
+    int commas = 0;
+    const char *last_comma = NULL;
+    const char *p;
+    for (p = frame; *p && *p != ';'; p++) {
+        if (*p == ',') {
+            commas++;
+            last_comma = p;
+        }
+    }
+    if (commas < 27) {
+        return !s_has_checksum;
+    }
+    if (commas > 27 || !last_comma || (p - last_comma) != 3) {
+        return false;
+    }
+    int hi = hex_value(last_comma[1]);
+    int lo = hex_value(last_comma[2]);
+    if (hi < 0 || lo < 0) {
+        return false;
+    }
+    uint8_t x = 0;
+    for (const char *q = frame + 1; q < last_comma; q++) {
+        x ^= (uint8_t)*q;
+    }
+    if (x != (uint8_t)((hi << 4) | lo)) {
+        return false;
+    }
+    s_has_checksum = true;
+    return true;
+}
+/* CHECKSUM_END */
+
 static void parse_d_packet(const char *frame)
 {
     /* Format:
      * $D<time>,<slot>,<rf>,<bat1>,<ltemp>,<lhum>,<lws>,<lwd>,<iws>,<lws_sec>,<ptemp>,<phum>,<pws>,<pwd>,<pws_sec>,<gprs>,<usb>,<ver>,<sc_bat1>,<sc_bat2>,<solar>,<rain_day_tips>,<system>;
      */
     if (frame[0] != '$' || frame[1] != 'D') return;
+
+    if (!frame_checksum_ok(frame)) {
+        s_link_bad++;
+        return;
+    }
 
     char copy[FRAME_MAX_LEN];
     strncpy(copy, frame + 2, sizeof(copy) - 1);

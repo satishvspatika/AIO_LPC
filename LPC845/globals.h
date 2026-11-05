@@ -51,7 +51,7 @@
 //#define LPC845_UARTHNDLR USART0_IRQHandler
 
 #define RBUF_SIZE     	120
-#define TBUF_SIZE       160
+#define TBUF_SIZE       176
 
 #define MAX_DAY_BLOCKS_RF 	 	   3
 #define LOG_INTERVAL_1MIN_RF 	   1440
