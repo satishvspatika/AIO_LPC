@@ -3,8 +3,8 @@
 
 #define PAGE_SIZE       256
 #define SECTOR_SIZE     0x8000UL
-#define FIRST_SECTOR    24
-#define SECTOR_COUNT    6
+#define FIRST_SECTOR    25
+#define SECTOR_COUNT    5
 #define TOTAL_PAGES     ((SECTOR_COUNT * SECTOR_SIZE) / PAGE_SIZE)
 #define PAGES_PER_SECTOR (SECTOR_SIZE / PAGE_SIZE)
 
@@ -50,7 +50,7 @@ static bool iap_write_page(uint32_t page, const void *src)
 
 /* LPC1768 flash map: sector 16 starts at 0x10000, then 32 KB per sector up to sector 29 */
 #define LOG_BASE        (0x00010000UL + (FIRST_SECTOR - 16) * SECTOR_SIZE)
-_Static_assert((0x00010000UL + (FIRST_SECTOR - 16) * SECTOR_SIZE) == 0x00050000UL, "sector 24 is at 0x50000");
+_Static_assert((0x00010000UL + (FIRST_SECTOR - 16) * SECTOR_SIZE) == 0x00058000UL, "sector 24 is at 0x50000");
 _Static_assert((0x00010000UL + (FIRST_SECTOR - 16 + SECTOR_COUNT) * SECTOR_SIZE) == 0x00080000UL, "log must end at the top of flash");
 #define IAP_LOCATION    0x1FFF1FF1UL
 

@@ -60,6 +60,9 @@ ${CC} ${CFLAGS} "${LPC_DIR}/ui_display.c" -o "${OUT_DIR}/ui_display.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/storage_log.c" -o "${OUT_DIR}/storage_log.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/flash_nvram.c" -o "${OUT_DIR}/flash_nvram.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/flash_log.c" -o "${OUT_DIR}/flash_log.o"
+${CC} ${CFLAGS} "${LPC_DIR}/fw_app.c" -o "${OUT_DIR}/fw_app.o"
+mkdir -p "${OUT_DIR}/boot"
+${CC} ${CFLAGS} "${LPC_DIR}/boot/fw_journal.c" -o "${OUT_DIR}/boot/fw_journal.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/cr_startup_lpc17.c" -o "${OUT_DIR}/cr_startup_lpc17.o"
 
 # Compile FatFs drivers
@@ -110,6 +113,8 @@ ${CC} \
   "${OUT_DIR}/ui_display.o" \
   "${OUT_DIR}/storage_log.o" \
   "${OUT_DIR}/flash_log.o" \
+  "${OUT_DIR}/fw_app.o" \
+  "${OUT_DIR}/boot/fw_journal.o" \
   "${OUT_DIR}/flash_nvram.o" \
   "${OUT_DIR}/fat_sd/diskio.o" \
   "${OUT_DIR}/fat_sd/spi_sd_lpc17xx.o" \
@@ -139,11 +144,30 @@ ${OBJCOPY} -O binary "${OUT_DIR}/boot_stub.elf" "${OUT_DIR}/boot_stub.bin"
 python3 "${SCRIPTS_DIR}/lpc_checksum.py" "${OUT_DIR}/boot_stub.bin"
 ${OBJCOPY} -I binary -O ihex --change-addresses 0x00000000 "${OUT_DIR}/boot_stub.bin" "${OUT_DIR}/boot_stub.hex"
 
-echo "=== 4. Merging Boot Stub (0x0) + Application (0x18000) ==="
+echo "=== 4. Building Bootloader (0x2000) ==="
+BOOT_FLAGS="-mcpu=cortex-m3 -mthumb -Os -g -ffreestanding -fno-builtin -ffunction-sections -fdata-sections -Wall \
+  -D__USE_CMSIS=CMSISv1p30_LPC17xx -I${LPC_DIR}/boot -I${PROJECT_ROOT}/CMSISv1p30_LPC17xx/inc"
+${CC} ${BOOT_FLAGS} -nostartfiles -nostdlib -Wl,--gc-sections -T "${LPC_DIR}/boot/boot.ld" \
+  "${LPC_DIR}/boot/boot_main.c" "${LPC_DIR}/boot/boot_core.c" "${LPC_DIR}/boot/fw_journal.c" \
+  -lgcc -o "${OUT_DIR}/bootloader.elf"
+${OBJCOPY} -O ihex "${OUT_DIR}/bootloader.elf" "${OUT_DIR}/bootloader.hex"
+${SIZE} "${OUT_DIR}/bootloader.elf"
+
+echo "=== 5. Merging Boot Stub + Bootloader + Blank Journal + Application (0x18000) ==="
 ${OBJCOPY} -O binary "${OUT_DIR}/LPC1768_AIO.axf" "${OUT_DIR}/LPC1768_AIO.bin"
+python3 "${SCRIPTS_DIR}/fw_image.py" "${OUT_DIR}/LPC1768_AIO.bin"
 ${OBJCOPY} -I binary -O ihex --change-addresses 0x00018000 "${OUT_DIR}/LPC1768_AIO.bin" "${OUT_DIR}/LPC1768_AIO_APP.hex"
-cat "${OUT_DIR}/boot_stub.hex" | grep -v '^:00000001FF' > "${OUT_DIR}/LPC1768_AIO_FULL.hex"
-cat "${OUT_DIR}/LPC1768_AIO_APP.hex" >> "${OUT_DIR}/LPC1768_AIO_FULL.hex"
+# Data records only: start addresses (record types 03 and 05) and end records come off each part
+HEX_STRIP='^:00000001FF|^:04000005|^:04000003'
+grep -vE "${HEX_STRIP}" "${OUT_DIR}/boot_stub.hex" > "${OUT_DIR}/LPC1768_AIO_FULL.hex"
+grep -vE "${HEX_STRIP}" "${OUT_DIR}/bootloader.hex" >> "${OUT_DIR}/LPC1768_AIO_FULL.hex"
+# Flashing with the probe starts the update journal afresh
+python3 -c "import sys; sys.stdout.buffer.write(b'\xff' * 0x4000)" > "${OUT_DIR}/journal_blank.bin"
+${OBJCOPY} -I binary -O ihex --change-addresses 0x0000C000 "${OUT_DIR}/journal_blank.bin" "${OUT_DIR}/journal_blank.hex"
+grep -vE "${HEX_STRIP}" "${OUT_DIR}/journal_blank.hex" >> "${OUT_DIR}/LPC1768_AIO_FULL.hex"
+grep -vE "${HEX_STRIP}" "${OUT_DIR}/LPC1768_AIO_APP.hex" >> "${OUT_DIR}/LPC1768_AIO_FULL.hex"
+echo ":00000001FF" >> "${OUT_DIR}/LPC1768_AIO_FULL.hex"
+python3 "${SCRIPTS_DIR}/fw_check_hex.py" "${OUT_DIR}/LPC1768_AIO_FULL.hex"
 
 ${SIZE} "${OUT_DIR}/LPC1768_AIO.axf"
 echo "=== LPC1768 Build Completed Successfully! ==="

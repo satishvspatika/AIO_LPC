@@ -6,6 +6,7 @@
 #include "sim7600_driver.h"
 #include "ui_display.h"
 #include "storage_log.h"
+#include "fw_app.h"
 #include "flash_nvram.h"
 #include "flash_log.h"
 #include "user_config.h"
@@ -64,9 +65,15 @@ static void vDisk_Task(void *pvParameters)
     (void)pvParameters;
     portTickType xLastWakeTime = xTaskGetTickCount();
 
+    uint32_t tick = 0;
+
     for (;;) {
         storage_log_timer_step_10ms();
         storage_log_drain_step();
+        if (++tick >= 100) {
+            tick = 0;
+            fw_app_watchdog_step();
+        }
         vTaskDelayUntil(&xLastWakeTime, 10 / portTICK_RATE_MS);
     }
 }
@@ -783,6 +790,7 @@ static void vMain_Task(void *pvParameters)
     (void)pvParameters;
 
     log_boot_header();
+    fw_app_init();
 
     uint32_t heartbeat_sec = 0;
     uint32_t link_log_sec = 0;
@@ -801,6 +809,12 @@ static void vMain_Task(void *pvParameters)
             storage_log_debug(good ? "LINK" : "ERROR", s_slot_line);
         }
         link_log_sec++;
+
+        {
+            uint32_t bytes, frames, good;
+            intermcu_get_link_stats(&bytes, &frames, &good, NULL, 0);
+            fw_app_step(xTaskGetTickCount() / configTICK_RATE_HZ, good);
+        }
 
         /* Sent from this loop so it proves slot scheduling is alive, not just the UI */
         if (++heartbeat_sec >= 60) {

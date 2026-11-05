@@ -14,10 +14,10 @@
     .global Reset_Stub
 Reset_Stub:
     ldr r0, =0xE000ED08    /* SCB->VTOR */
-    ldr r1, =0x00018000    /* App base */
+    ldr r1, =0x00002000    /* Bootloader base */
     str r1, [r0]
-    ldr r0, [r1]           /* App initial SP */
+    ldr r0, [r1]           /* Bootloader initial SP */
     msr msp, r0
-    ldr r0, [r1, #4]       /* App ResetISR */
+    ldr r0, [r1, #4]       /* Bootloader reset */
     bx  r0
 

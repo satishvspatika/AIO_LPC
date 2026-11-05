@@ -5,8 +5,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Circular log of 15-minute records in the LPC1768's own flash (sectors 24-29, 192 KB, about
- * 8 days), so records survive a missing or failed SD card. Each page is written once and the
+/* Circular log of 15-minute records in the LPC1768's own flash (sectors 25-29, 160 KB: 640
+ * records, at least 512 after a sector is erased), so records survive a missing or failed SD card. Each page is written once and the
  * oldest sector is erased only when the log wraps, about every 8 days per sector. */
 
 #define FLASH_LOG_RECORD_SIZE   72

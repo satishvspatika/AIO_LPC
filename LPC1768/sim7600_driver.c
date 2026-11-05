@@ -3,6 +3,7 @@
 #include "storage_log.h"
 #include "user_config.h"
 #include "flash_nvram.h"
+#include "flash_log.h"
 #include "intermcu_protocol.h"
 #include "telemetry_formatter.h"
 #include "lpc17xx_uart.h"
@@ -2164,6 +2165,15 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
         snprintf(slot_iso, sizeof(slot_iso), "%.4s-%.2s-%.2sT%.2s:%.2s",
                  telem->slot_time, telem->slot_time + 4, telem->slot_time + 6,
                  telem->slot_time + 8, telem->slot_time + 10);
+    }
+
+    /* Just after an LPC845 restart it has no last slot (year 2000): use the newest stored record,
+     * "NN,YYYY-MM-DD,HH:MM,..." */
+    if (strncmp(slot_iso, "20", 2) != 0 || slot_iso[2] == '0') {
+        const flash_log_page_t *rec = flash_log_newest_record();
+        if (rec && strlen(rec->record) >= 19 && rec->record[2] == ',' && rec->record[13] == ',') {
+            snprintf(slot_iso, sizeof(slot_iso), "%.10sT%.5s", rec->record + 3, rec->record + 14);
+        }
     }
 
     char calib_date[12] = "0000-00-00";

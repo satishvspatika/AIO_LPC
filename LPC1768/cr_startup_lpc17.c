@@ -114,6 +114,7 @@ extern WEAK void main(void);
 //
 //*****************************************************************************
 extern void _vStackTop;
+extern const char g_fw_image_info[]; /* fw_app.c: what this image is */
 
 //*****************************************************************************
 //
@@ -133,7 +134,7 @@ void (* const g_pfnVectors[])(void) =
 	BusFault_Handler,						// The bus fault handler
 	UsageFault_Handler,						// The usage fault handler
 	0,										// Reserved
-	0,										// Reserved
+	(void (*)(void))g_fw_image_info,		// Reserved: vector 8 points to the image info
 	0,										// Reserved
 	0,										// Reserved
 	vPortSVCHandler,                        // SVCall handler

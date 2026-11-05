@@ -91,8 +91,10 @@ void intermcu_get_link_stats(uint32_t *out_bytes, uint32_t *out_frames, uint32_t
     *out_bytes = s_link_bytes;
     *out_frames = s_link_frames;
     *out_good = s_link_good;
-    strncpy(out_last, s_link_last_frame, size - 1);
-    out_last[size - 1] = '\0';
+    if (out_last && size > 0) {
+        strncpy(out_last, s_link_last_frame, size - 1);
+        out_last[size - 1] = '\0';
+    }
 }
 
 static bool ts14_valid(const char *ts)
