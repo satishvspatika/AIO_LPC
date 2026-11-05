@@ -515,7 +515,7 @@ static int Kbd_Scan(void)
     /* 3. Scan rows 0..2 */
     for (int iRow_No = 0; iRow_No < 3; iRow_No++) {
         Output_Row(iRow_No);
-        vTaskDelay(1 / portTICK_RATE_MS); /* 1ms settling delay */
+        delay_us(100); /* 100us settling delay (fast & avoids FreeRTOS task yield) */
         uint32_t port0 = LPC_GPIO0->FIOPIN;
 
         /* Restore rows to HIGH immediately after reading columns */
@@ -542,19 +542,13 @@ static int Kbd_Scan(void)
     return iKey_Value;
 }
 
-enum {
-    KBD_STATE_IDLE = 0,
-    KBD_STATE_DEBOUNCE,
-    KBD_STATE_WAIT_RELEASE
-};
-
 static void vKbd_Task(void *pvParameters)
 {
     (void)pvParameters;
-    int kbd_state = KBD_STATE_IDLE;
-    int candidate_key = 0;
-    int debounce_count = 0;
-    int hold_timer = 0;
+    int iOld_Key = 0;
+    int iNew_Key = 0;
+    int iDebounce_Count = 0;
+    int iKey_Pressed = 0;
     bool pins_released = false;
 
     keypad_init_hw();
@@ -567,63 +561,39 @@ static void vKbd_Task(void *pvParameters)
             if (!pins_released) {
                 kbd_release_pins_for_sleep();
                 pins_released = true;
-                kbd_state = KBD_STATE_IDLE;
+                iOld_Key = 0;
+                iDebounce_Count = 0;
             }
             vTaskDelay(200 / portTICK_RATE_MS);
             continue;
         } else if (pins_released) {
             keypad_init_hw();
             pins_released = false;
-            kbd_state = KBD_STATE_IDLE;
+            iOld_Key = 0;
+            iDebounce_Count = 0;
             vTaskDelay(50 / portTICK_RATE_MS);
         }
 
-        int scanned_key = Kbd_Scan();
-
-        switch (kbd_state) {
-        case KBD_STATE_IDLE:
-            if (scanned_key != 0) {
-                candidate_key = scanned_key;
-                debounce_count = 1;
-                kbd_state = KBD_STATE_DEBOUNCE;
-            }
-            break;
-
-        case KBD_STATE_DEBOUNCE:
-            if (scanned_key == candidate_key) {
-                debounce_count++;
-                if (debounce_count >= 2) {
-                    /* Confirmed stable keypress event (20ms hold): enqueue to FIFO */
-                    g_dbg_last_key = (uint32_t)candidate_key;
-                    kbd_fifo_put((key_code_t)candidate_key);
-                    hold_timer = 0;
-                    kbd_state = KBD_STATE_WAIT_RELEASE;
+        /* Scan matrix with golden TWS5 counter-based debouncer */
+        iNew_Key = Kbd_Scan();
+        if (iNew_Key) {
+            if (iNew_Key != iOld_Key) {
+                iOld_Key = iNew_Key;
+                iDebounce_Count = 2; /* 20ms debounce (2 samples of 10ms) */
+            } else if (iDebounce_Count > 0) {
+                iDebounce_Count--;
+                if (iDebounce_Count == 0) {
+                    iKey_Pressed = iNew_Key;
                 }
-            } else {
-                /* Noise / flutter: discard */
-                kbd_state = KBD_STATE_IDLE;
             }
-            break;
 
-        case KBD_STATE_WAIT_RELEASE:
-            hold_timer++;
-            if (scanned_key == 0) {
-                /* Clean physical release confirmed */
-                kbd_state = KBD_STATE_IDLE;
-            } else if (scanned_key != candidate_key) {
-                /* New key pressed before previous was released */
-                candidate_key = scanned_key;
-                debounce_count = 1;
-                kbd_state = KBD_STATE_DEBOUNCE;
-            } else if (hold_timer >= 40) {
-                /* Stuck key recovery after 400ms hold */
-                kbd_state = KBD_STATE_IDLE;
+            if (iKey_Pressed) {
+                g_dbg_last_key = (uint32_t)iKey_Pressed;
+                kbd_fifo_put((key_code_t)iKey_Pressed);
+                iKey_Pressed = 0;
             }
-            break;
-
-        default:
-            kbd_state = KBD_STATE_IDLE;
-            break;
+        } else {
+            iOld_Key = 0;
         }
     }
 }
@@ -777,7 +747,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 #elif (UNIT_CFG == BIHAR_TRG)
                 snprintf(line1, sizeof(line1), "BIHAR - TRG");
                 #else
-                snprintf(line1, sizeof(line1), "KSNDMC - TWS");
+                snprintf(line1, sizeof(line1), "KSNDMC-TWS  K:%-2u", (unsigned int)g_dbg_last_key);
                 #endif
                 snprintf(line2, sizeof(line2), "ID:%-6s %s", flash_nvram_get_station_id(), FIRMWARE_VERSION);
                 break;
@@ -998,13 +968,23 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
     }
 
     if (key != KEY_NONE) {
+        char kmsg[32];
+        snprintf(kmsg, sizeof(kmsg), "Key Evt: %d", (int)key);
+        storage_log_debug("UI", kmsg);
+
         ui_reset_activity_timer();
         s_force_redraw = true;
 
         #if (UNIT_CFG == KSNDMC_TWS)
         if (key == KEY_CALIB) {
             /* TWS Total Weather Station has no rain gauge.
-             * Completely ignore CALIB key, matching golden TWS5 code line 80. */
+             * Show momentary feedback banner matching golden TWS6 ui.c line 1016 */
+            lcd_command(0x80);
+            lcd_print("  VARSHA - TWS  ");
+            lcd_command(0xC0);
+            lcd_print(" NO RAIN GAUGE  ");
+            vTaskDelay(1200 / portTICK_RATE_MS);
+            s_force_redraw = true;
             return;
         }
         #else
@@ -1148,23 +1128,21 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         }
 
         /* --- Mode: Browse Mode Navigation --- */
-        if (key == KEY_DOWN) {
+        if (key == KEY_DOWN || key == KEY_RIGHT) {
             s_current_screen_idx = (s_current_screen_idx + 1) % NUM_SCREENS;
-        } else if (key == KEY_UP) {
+        } else if (key == KEY_UP || key == KEY_LEFT) {
             s_current_screen_idx = (s_current_screen_idx + NUM_SCREENS - 1) % NUM_SCREENS;
-        } else if (key == KEY_RIGHT || key == KEY_LEFT) {
-            /* Left and Right keys are dedicated to cursor navigation in Edit mode; strictly NO-OP in browse */
         } else if (key == KEY_MENU) {
-            /* Quick jump between Station ID (0) and Send Status */
-            if (s_current_screen_idx == 0) {
-                for (size_t i = 0; i < NUM_SCREENS; i++) {
-                    if (s_screens[i] == SCR_SEND_STATUS) {
-                        s_current_screen_idx = i;
-                        break;
-                    }
-                }
+            /* Quick jump between sections matching golden TWS6 ui.c line 997:
+             * Station/Sensors (0..3) -> Battery (4) -> Signal (6) -> Send Status (9) -> Station (0) */
+            if (s_current_screen_idx < 4) {
+                s_current_screen_idx = 4; /* Battery */
+            } else if (s_current_screen_idx < 6) {
+                s_current_screen_idx = 6; /* Signal */
+            } else if (s_current_screen_idx < 9) {
+                s_current_screen_idx = 9; /* Send Status */
             } else {
-                s_current_screen_idx = 0;
+                s_current_screen_idx = 0; /* Station ID */
             }
         } else if (key == KEY_BACK) {
             if (s_status_sms_state == STATUS_UI_SENDING) {
