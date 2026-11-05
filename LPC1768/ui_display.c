@@ -32,11 +32,11 @@
 #define MASK_LCD_D7     (1UL << PIN_LCD_D7)
 #define MASK_LCD_BL     (1UL << PIN_LCD_BL)
 
-/* --- 3x3 Keypad Matrix Hardware Interface (Matching Golden TWS6 kbd.c / kbd.h) ---
+/* --- 3x3 Keypad Matrix Hardware Interface (Exact Hardware Pinout) ---
  * Rows (GPIO Outputs, driven LOW one at a time):
- *   Row 0: Port 3, Pin 25 (Top Row:    MENU,  UP,    CALIB)
- *   Row 1: Port 3, Pin 26 (Middle Row: LEFT,  EN,    RIGHT)
- *   Row 2: Port 1, Pin 21 (Bottom Row: BACK,  DOWN,  DSP)
+ *   output_row(0): Clears P3.26 LOW -> reads P0.22 (MENU),  P0.21 (UP),   P0.20 (CALIB)
+ *   output_row(1): Clears P3.25 LOW -> reads P0.22 (LEFT),  P0.21 (EN),   P0.20 (RIGHT)
+ *   output_row(2): Clears P1.21 LOW -> reads P0.22 (BACK),  P0.21 (DOWN), P0.20 (DSP)
  *
  * Columns (GPIO Inputs with internal pull-ups on Port 0):
  *   Col 0: Port 0, Pin 22 (Left Column:   MENU,  LEFT,  BACK)
@@ -44,12 +44,12 @@
  *   Col 2: Port 0, Pin 20 (Right Column:  CALIB, RIGHT, DSP)
  */
 #define KBD_ROW0_PORT   3
-#define KBD_ROW0_PIN    25
-#define KBD_ROW0_MASK   (1UL << 25)
+#define KBD_ROW0_PIN    26
+#define KBD_ROW0_MASK   (1UL << 26)
 
 #define KBD_ROW1_PORT   3
-#define KBD_ROW1_PIN    26
-#define KBD_ROW1_MASK   (1UL << 26)
+#define KBD_ROW1_PIN    25
+#define KBD_ROW1_MASK   (1UL << 25)
 
 #define KBD_ROW2_PORT   1
 #define KBD_ROW2_PIN    21
@@ -488,11 +488,11 @@ static void Output_Row(int iRow)
 
     /* Assert selected row LOW */
     if (iRow == 0) {
-        LPC_GPIO3->FIOCLR = KBD_ROW0_MASK; /* Row 0: P3.25 */
+        LPC_GPIO3->FIOCLR = KBD_ROW0_MASK; /* output_row(0): Clears P3.26 LOW */
     } else if (iRow == 1) {
-        LPC_GPIO3->FIOCLR = KBD_ROW1_MASK; /* Row 1: P3.26 */
+        LPC_GPIO3->FIOCLR = KBD_ROW1_MASK; /* output_row(1): Clears P3.25 LOW */
     } else if (iRow == 2) {
-        LPC_GPIO1->FIOCLR = KBD_ROW2_MASK; /* Row 2: P1.21 */
+        LPC_GPIO1->FIOCLR = KBD_ROW2_MASK; /* output_row(2): Clears P1.21 LOW */
     }
 }
 
@@ -508,13 +508,7 @@ static int Kbd_Scan(void)
      * If all 3 column lines read 0, the front-panel 5V rail is off or unpowered.
      * Discard immediately to prevent phantom keys on power-down transitions. */
     uint32_t baseline_port0 = LPC_GPIO0->FIOPIN;
-    uint32_t stuck_cols = 0;
-
-    if ((baseline_port0 & KBD_COL0_MASK) == 0) stuck_cols |= KBD_COL0_MASK;
-    if ((baseline_port0 & KBD_COL1_MASK) == 0) stuck_cols |= KBD_COL1_MASK;
-    if ((baseline_port0 & KBD_COL2_MASK) == 0) stuck_cols |= KBD_COL2_MASK;
-
-    if (stuck_cols == (KBD_COL0_MASK | KBD_COL1_MASK | KBD_COL2_MASK)) {
+    if ((baseline_port0 & (KBD_COL0_MASK | KBD_COL1_MASK | KBD_COL2_MASK)) == 0) {
         return 0; /* Whole bus low: unpowered display or floating rail */
     }
 
@@ -528,14 +522,14 @@ static int Kbd_Scan(void)
         LPC_GPIO3->FIOSET = (KBD_ROW0_MASK | KBD_ROW1_MASK);
         LPC_GPIO1->FIOSET = KBD_ROW2_MASK;
 
-        /* A valid key requires column to be LOW during row assert AND NOT stuck LOW at baseline */
-        if ((port0 & KBD_COL0_MASK) == 0 && !(stuck_cols & KBD_COL0_MASK)) {
+        /* Check columns: Col 0 = P0.22, Col 1 = P0.21, Col 2 = P0.20 */
+        if ((port0 & KBD_COL0_MASK) == 0) {
             iKey_Value = iRow_No * 3 + 1;
             break;
-        } else if ((port0 & KBD_COL1_MASK) == 0 && !(stuck_cols & KBD_COL1_MASK)) {
+        } else if ((port0 & KBD_COL1_MASK) == 0) {
             iKey_Value = iRow_No * 3 + 2;
             break;
-        } else if ((port0 & KBD_COL2_MASK) == 0 && !(stuck_cols & KBD_COL2_MASK)) {
+        } else if ((port0 & KBD_COL2_MASK) == 0) {
             iKey_Value = iRow_No * 3 + 3;
             break;
         }

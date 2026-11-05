@@ -255,13 +255,6 @@ bool intermcu_is_rails_active(void)
         return true;
     }
 
-    /* Also check physical DSP key sense line (P0.20):
-     * During sentry sleep ($f7;), LPC845 drives Row 2 (P1.21) LOW and monitors Col 2 (P0.20).
-     * Pressing the DSP key bridges P0.20 to P1.21, pulling P0.20 to ground. */
-    if ((LPC_GPIO0->FIOPIN & (1UL << 20)) == 0) {
-        return true;
-    }
-
     return false;
 }
 
