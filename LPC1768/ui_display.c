@@ -165,8 +165,12 @@ static xTaskHandle s_sms_task_handle = NULL;
 static char s_status_sms_substep[20] = "PRESS EN TO SEND";
 static uint32_t s_anim_counter = 0;
 
-/* Non-blocking popup timer for "VARSHA - TWS / No Rain Gauge" (50ms ticks) */
-static uint32_t s_no_rf_popup_timer = 0;
+/* LCD Differential Render Cache & Redraw Flag */
+static char s_cached_line1[17] = "";
+static char s_cached_line2[17] = "";
+static ui_mode_t s_cached_mode = (ui_mode_t)-1;
+static int s_cached_edit_pos = -1;
+static bool s_force_redraw = true;
 
 /* HTTP Backlog Tracking */
 static uint32_t s_backlog_count = 0;
@@ -254,11 +258,11 @@ static void delay_us(uint32_t us)
 
 static void lcd_pulse_en(void)
 {
-    delay_us(1);
-    LPC_GPIO2->FIOSET = MASK_LCD_EN;
     delay_us(2);
+    LPC_GPIO2->FIOSET = MASK_LCD_EN;
+    delay_us(5);
     LPC_GPIO2->FIOCLR = MASK_LCD_EN;
-    delay_us(50);
+    delay_us(80);
 }
 
 static void lcd_write_nibble(uint8_t nibble, bool is_data)
@@ -297,7 +301,7 @@ static void lcd_command(uint8_t cmd)
 static void lcd_data(uint8_t data)
 {
     lcd_write_byte(data, true);
-    delay_us(50);
+    delay_us(80);
 }
 
 static void lcd_init_hw(void)
@@ -341,6 +345,11 @@ static void lcd_init_hw(void)
 
     s_lcd_initialized = true;
     s_display_active = true;
+    s_force_redraw = true;
+    s_cached_line1[0] = '\0';
+    s_cached_line2[0] = '\0';
+    s_cached_mode = (ui_mode_t)-1;
+    s_cached_edit_pos = -1;
 }
 
 static void lcd_set_cursor(uint8_t row, uint8_t col)
@@ -356,7 +365,46 @@ static void lcd_print(const char *str)
     }
 }
 
-/* --- 3x3 Keypad Matrix Hardware Interface --- */
+/* --- 3x3 Keypad Matrix Hardware Interface (Matching Golden TWS5 kbd.c / kbd.h) ---
+ * Rows (GPIO Outputs, driven LOW one at a time):
+ *   Row 0: Port 3, Pin 26 (Top Row:    MENU,  UP,    CALIB)
+ *   Row 1: Port 3, Pin 25 (Middle Row: LEFT,  EN,    RIGHT)
+ *   Row 2: Port 1, Pin 21 (Bottom Row: BACK,  DOWN,  DSP)
+ *
+ * Columns (GPIO Inputs with internal pull-ups on Port 0):
+ *   Col 0: Port 0, Pin 22 (Left Column:   MENU,  LEFT,  BACK)
+ *   Col 1: Port 0, Pin 21 (Center Column: UP,    EN,    DOWN)
+ *   Col 2: Port 0, Pin 20 (Right Column:  CALIB, RIGHT, DSP)
+ */
+#define KBD_FIFO_SIZE 8
+static volatile key_code_t s_kbd_fifo[KBD_FIFO_SIZE];
+static volatile uint8_t s_kbd_head = 0;
+static volatile uint8_t s_kbd_tail = 0;
+
+static void kbd_fifo_put(key_code_t k)
+{
+    uint8_t next = (s_kbd_head + 1) % KBD_FIFO_SIZE;
+    if (next != s_kbd_tail) {
+        s_kbd_fifo[s_kbd_head] = k;
+        s_kbd_head = next;
+    }
+}
+
+key_code_t ui_keypad_get_key(void)
+{
+    if (s_kbd_head == s_kbd_tail) {
+        return KEY_NONE;
+    }
+    key_code_t k = s_kbd_fifo[s_kbd_tail];
+    s_kbd_tail = (s_kbd_tail + 1) % KBD_FIFO_SIZE;
+    return k;
+}
+
+key_code_t ui_keypad_scan(void)
+{
+    return ui_keypad_get_key();
+}
+
 static void keypad_init_hw(void)
 {
     PINSEL_CFG_Type pin_cfg;
@@ -365,16 +413,16 @@ static void keypad_init_hw(void)
     pin_cfg.OpenDrain = PINSEL_PINMODE_NORMAL;
 
     /* Rows as GPIO Outputs */
-    pin_cfg.Portnum = 3; pin_cfg.Pinnum = 25; PINSEL_ConfigPin(&pin_cfg);
     pin_cfg.Portnum = 3; pin_cfg.Pinnum = 26; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = 3; pin_cfg.Pinnum = 25; PINSEL_ConfigPin(&pin_cfg);
     pin_cfg.Portnum = 1; pin_cfg.Pinnum = 21; PINSEL_ConfigPin(&pin_cfg);
 
     /* Columns as GPIO Inputs */
-    pin_cfg.Portnum = 0; pin_cfg.Pinnum = 20; PINSEL_ConfigPin(&pin_cfg);
-    pin_cfg.Portnum = 0; pin_cfg.Pinnum = 21; PINSEL_ConfigPin(&pin_cfg);
     pin_cfg.Portnum = 0; pin_cfg.Pinnum = 22; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = 0; pin_cfg.Pinnum = 21; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = 0; pin_cfg.Pinnum = 20; PINSEL_ConfigPin(&pin_cfg);
 
-    /* Direct register writes for maximum hardware reliability */
+    /* Direct register configuration for maximum hardware reliability */
     LPC_PINCON->PINSEL7 &= ~((0x03UL << 18) | (0x03UL << 20)); /* P3.25, P3.26 */
     LPC_PINCON->PINMODE7 &= ~((0x03UL << 18) | (0x03UL << 20)); /* Pull-Up */
     LPC_PINCON->PINMODE_OD3 &= ~((1UL << 25) | (1UL << 26));    /* Push-Pull */
@@ -396,120 +444,95 @@ static void keypad_init_hw(void)
     LPC_GPIO0->FIOMASK &= ~((1UL << 20) | (1UL << 21) | (1UL << 22));          /* Explicitly unmasked */
 }
 
-static void output_row(int row)
+static void Output_Row(int iRow)
 {
-    /* All row strobe lines idle HIGH first */
+    /* Set all row pins logic HIGH first */
     LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26));
     LPC_GPIO1->FIOSET = (1UL << 21);
 
-    /* Assert selected row strobe LOW:
-     * Row 0 (P3.26): Top row    [MENU, UP, CALIB]
-     * Row 1 (P3.25): Middle row [LEFT, EN, RIGHT]
-     * Row 2 (P1.21): Bottom row [BACK, DOWN, DSP]
-     */
-    if (row == 0) {
+    /* Assert selected row LOW */
+    if (iRow == 0) {
         LPC_GPIO3->FIOCLR = (1UL << 26); /* Row 0 (P3.26) */
-    } else if (row == 1) {
+    } else if (iRow == 1) {
         LPC_GPIO3->FIOCLR = (1UL << 25); /* Row 1 (P3.25) */
-    } else if (row == 2) {
+    } else if (iRow == 2) {
         LPC_GPIO1->FIOCLR = (1UL << 21); /* Row 2 (P1.21) */
     }
 }
 
-/* Keypad Scanning Engine:
- * Matrix Wiring verified against hardware & recovered TWS codebase (kbd.c / kbd.h):
- *
- *                 Col 0 (P0.22)   Col 1 (P0.21)   Col 2 (P0.20)
- *                 (bit 2, 0x04)   (bit 1, 0x02)   (bit 0, 0x01)
- *  Row 0 (P3.26):  MENU            UP              CALIB
- *  Row 1 (P3.25):  LEFT            EN              RIGHT
- *  Row 2 (P1.21):  BACK            DOWN            DSP
- */
-key_code_t ui_keypad_scan(void)
+static int Read_Col_Pressed(void)
 {
-    static key_code_t s_last_raw = KEY_NONE;
-    static key_code_t s_latched_key = KEY_NONE;
-    static uint32_t s_debounce_count = 0;
-    static uint32_t s_hold_timer = 0;
+    int iCol_Number = 0;
+    uint32_t pin0 = LPC_GPIO0->FIOPIN;
 
-    key_code_t raw = KEY_NONE;
-
-    /* 1. Scan Row 0 (P3.26 LOW) -> [MENU, UP, CALIB] */
-    output_row(0);
-    delay_us(500);
-    uint32_t cols_r0 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
-    output_row(-1);
-    delay_us(100);
-
-    /* 2. Scan Row 1 (P3.25 LOW) -> [LEFT, EN, RIGHT] */
-    output_row(1);
-    delay_us(500);
-    uint32_t cols_r1 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
-    output_row(-1);
-    delay_us(100);
-
-    /* 3. Scan Row 2 (P1.21 LOW) -> [BACK, DOWN, DSP] */
-    output_row(2);
-    delay_us(500);
-    uint32_t cols_r2 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
-    output_row(-1);
-
-    g_dbg_cols_r0 = cols_r0;
-    g_dbg_cols_r1 = cols_r1;
-    g_dbg_cols_r2 = cols_r2;
-
-    /* Decode Key:
-     * P0.22 (bit 2, mask 0x04) = Col 0 (Left Column:   MENU,  LEFT,  BACK)
-     * P0.21 (bit 1, mask 0x02) = Col 1 (Center Column: UP,    EN,    DOWN)
-     * P0.20 (bit 0, mask 0x01) = Col 2 (Right Column:  CALIB, RIGHT, DSP)
+    /* Check columns on Port 0 (matching golden kbd.c lines 149-163):
+     * Col 2: P0.20 -> iCol_Number = 3
+     * Col 1: P0.21 -> iCol_Number = 2
+     * Col 0: P0.22 -> iCol_Number = 1
      */
+    if ((pin0 & (1UL << 20)) == 0) {
+        iCol_Number = 3; /* Col 2 (P0.20) */
+    } else if ((pin0 & (1UL << 21)) == 0) {
+        iCol_Number = 2; /* Col 1 (P0.21) */
+    } else if ((pin0 & (1UL << 22)) == 0) {
+        iCol_Number = 1; /* Col 0 (P0.22) */
+    }
 
-    /* Row 0 (P3.26 LOW): Top Row */
-    if (!(cols_r0 & 0x04))      raw = KEY_MENU;   /* Col 0 (P0.22) */
-    else if (!(cols_r0 & 0x02)) raw = KEY_UP;     /* Col 1 (P0.21) */
-    else if (!(cols_r0 & 0x01)) raw = KEY_CALIB;  /* Col 2 (P0.20) */
+    /* Set all rows back to logic HIGH immediately */
+    LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26));
+    LPC_GPIO1->FIOSET = (1UL << 21);
 
-    /* Row 1 (P3.25 LOW): Middle Row */
-    else if (!(cols_r1 & 0x04)) raw = KEY_LEFT;   /* Col 0 (P0.22) */
-    else if (!(cols_r1 & 0x02)) raw = KEY_EN;     /* Col 1 (P0.21) */
-    else if (!(cols_r1 & 0x01)) raw = KEY_RIGHT;  /* Col 2 (P0.20) */
+    return iCol_Number;
+}
 
-    /* Row 2 (P1.21 LOW): Bottom Row */
-    else if (!(cols_r2 & 0x04)) raw = KEY_BACK;   /* Col 0 (P0.22) */
-    else if (!(cols_r2 & 0x02)) raw = KEY_DOWN;   /* Col 1 (P0.21) */
-    else if (!(cols_r2 & 0x01)) raw = KEY_DSP;    /* Col 2 (P0.20) */
+static int Kbd_Scan(void)
+{
+    int iKey_Value = 0;
 
-    /* 4. 2-Stage Debounce & Release Filter (50ms scan interval) */
-    if (raw != KEY_NONE) {
-        g_dbg_last_key = (uint32_t)raw;
-        if (raw == s_last_raw) {
-            s_debounce_count++;
-            if (s_debounce_count == 2) {
-                /* First valid trigger after 2 consecutive matching scans (~100ms) */
-                s_latched_key = raw;
-                s_hold_timer = 0;
-                return raw;
-            } else if (s_debounce_count > 2 && s_latched_key == raw) {
-                s_hold_timer++;
-                /* Auto-repeat after 10 ticks (500ms) every 3 ticks (150ms) */
-                if (s_hold_timer >= 10 && (s_hold_timer % 3 == 0)) {
-                    return raw;
+    for (int iRow_No = 0; iRow_No < 3; iRow_No++) {
+        Output_Row(iRow_No);
+        vTaskDelay(1 / portTICK_RATE_MS); /* 1ms settling delay for display/capacitance: golden kbd.c line 87 */
+        int iCol_No = Read_Col_Pressed();
+
+        if (iCol_No != 0) {
+            iKey_Value = iRow_No * 3 + iCol_No;
+            break;
+        }
+    }
+
+    return iKey_Value;
+}
+
+static void vKbd_Task(void *pvParameters)
+{
+    (void)pvParameters;
+    portTickType xLastWakeTime = xTaskGetTickCount();
+    int iOld_Key = 0;
+    int iDebounce_Count = 0;
+
+    for (;;) {
+        vTaskDelayUntil(&xLastWakeTime, 10 / portTICK_RATE_MS);
+
+        int iNew_Key = Kbd_Scan();
+
+        if (iNew_Key) {
+            if (iNew_Key != iOld_Key) {
+                iOld_Key = iNew_Key;
+                iDebounce_Count = 4; /* 4 consecutive matching 10ms scans (~40ms debounce) */
+            } else if (iDebounce_Count) {
+                iDebounce_Count--;
+                if (0 == iDebounce_Count) {
+                    /* Confirmed single keypress event: enqueue to FIFO */
+                    g_dbg_last_key = (uint32_t)iNew_Key;
+                    kbd_fifo_put((key_code_t)iNew_Key);
                 }
             }
         } else {
-            /* Raw key changed: begin debounce of new candidate key */
-            s_last_raw = raw;
-            s_debounce_count = 1;
+            /* Key physically released: reset engine */
+            iOld_Key = 0;
+            iDebounce_Count = 0;
         }
-    } else {
-        /* Physical release */
-        s_last_raw = KEY_NONE;
-        s_debounce_count = 0;
-        s_latched_key = KEY_NONE;
-        s_hold_timer = 0;
     }
-
-    return KEY_NONE;
 }
 
 void ui_reset_activity_timer(void)
@@ -548,7 +571,16 @@ void ui_display_init(void)
     s_calib_tips = 0;
     s_display_active = true;
     s_operator_touched_key = false;
+    s_force_redraw = true;
+    s_cached_line1[0] = '\0';
+    s_cached_line2[0] = '\0';
     ui_reset_activity_timer();
+
+    /* Spawn dedicated Keypad Task (Priority 3, 160 words stack) */
+    static xTaskHandle s_kbd_task_handle = NULL;
+    if (s_kbd_task_handle == NULL) {
+        xTaskCreate(vKbd_Task, (const signed char *)"KbdTask", 160, NULL, 3, &s_kbd_task_handle);
+    }
 
     telemetry_data_t telem;
     memset(&telem, 0, sizeof(telem));
@@ -566,7 +598,9 @@ void ui_enter_sleep(void)
     s_display_active = false;
     s_operator_touched_key = false;
     s_inactivity_ticks = 0;
-    s_no_rf_popup_timer = 0;
+    s_force_redraw = true;
+    s_cached_line1[0] = '\0';
+    s_cached_line2[0] = '\0';
 
     /* 2. Turn off cursor if in edit mode */
     if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
@@ -744,13 +778,32 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
         }
     }
 
+    /* Pad lines to 16 characters */
+    for (int i = strlen(line1); i < 16; i++) line1[i] = ' ';
+    line1[16] = '\0';
+    for (int i = strlen(line2); i < 16; i++) line2[i] = ' ';
+    line2[16] = '\0';
+
+    /* Differential rendering: skip physical LCD writes if content and cursor are unchanged */
+    if (!s_force_redraw &&
+        s_cached_mode == s_ui_mode &&
+        s_cached_edit_pos == s_edit_pos &&
+        strncmp(s_cached_line1, line1, 16) == 0 &&
+        strncmp(s_cached_line2, line2, 16) == 0) {
+        return;
+    }
+
+    s_force_redraw = false;
+    s_cached_mode = s_ui_mode;
+    s_cached_edit_pos = s_edit_pos;
+    strncpy(s_cached_line1, line1, sizeof(s_cached_line1));
+    strncpy(s_cached_line2, line2, sizeof(s_cached_line2));
+
     lcd_command(0x80);
     lcd_print(line1);
-    for (int i = strlen(line1); i < 16; i++) lcd_data(' ');
 
     lcd_command(0xC0);
     lcd_print(line2);
-    for (int i = strlen(line2); i < 16; i++) lcd_data(' ');
 
     if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
         /* Line 2 format: "ID: 001922      " -> digits start at col 4 */
@@ -781,21 +834,6 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
 
     key_code_t key = ui_keypad_scan();
 
-    /* Non-blocking popup timer for "VARSHA - TWS / No Rain Gauge" */
-    if (s_no_rf_popup_timer > 0) {
-        if (key != KEY_NONE && key != KEY_CALIB) {
-            /* Any valid operator navigation key dismisses popup immediately */
-            s_no_rf_popup_timer = 0;
-        } else {
-            s_no_rf_popup_timer--;
-            lcd_command(0x80);
-            lcd_print("  VARSHA - TWS  ");
-            lcd_command(0xC0);
-            lcd_print(" No Rain Gauge  ");
-            return;
-        }
-    }
-
     /* If display is asleep, any keypress wakes it back up */
     if (!s_display_active) {
         if (key != KEY_NONE) {
@@ -806,6 +844,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             s_display_active = true;
             s_operator_touched_key = true;
             s_inactivity_ticks = 0;
+            s_force_redraw = true;
             storage_log_debug("UI", "Keypress detected: Display woke up from sleep");
         }
         return;
@@ -833,24 +872,23 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
 
     if (key != KEY_NONE) {
         ui_reset_activity_timer();
+        s_force_redraw = true;
 
-        /* Global CALIB key handler */
+        #if (UNIT_CFG == KSNDMC_TWS)
+        if (key == KEY_CALIB) {
+            /* TWS Total Weather Station has no rain gauge.
+             * Completely ignore CALIB key, matching golden TWS5 code line 80. */
+            return;
+        }
+        #else
+        /* Global CALIB key handler for TRG mode */
         if (key == KEY_CALIB && s_ui_mode == UI_MODE_BROWSE) {
-            #if (UNIT_CFG == KSNDMC_TWS)
-            /* TWS has no rain gauge: start non-blocking 1.5s popup notification */
-            s_no_rf_popup_timer = 30; /* 30 ticks * 50ms = 1.5 seconds */
-            lcd_command(0x80);
-            lcd_print("  VARSHA - TWS  ");
-            lcd_command(0xC0);
-            lcd_print(" No Rain Gauge  ");
-            #else
-            /* TRG enters Field Calibration directly */
             s_ui_mode = UI_MODE_CALIB;
             s_calib_tips = 0;
             s_calib_last_raw_tips = telemetry->rf_tips_15m;
-            #endif
             return;
         }
+        #endif
 
         /* --- Mode: Field Calibration --- */
         if (s_ui_mode == UI_MODE_CALIB) {
