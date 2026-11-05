@@ -17,7 +17,10 @@ typedef struct __attribute__((packed)) {
     uint8_t sd_debug_dump;   /* 1 = enabled, 0 = disabled */
     char last_logged[20];    /* e.g. "04-11-2026 18:45" */
     char calib_result[20];   /* e.g. "2026-11-05 PASS" */
-    char reserved[198];      /* Pad to 256 bytes for IAP write alignment */
+    int32_t gps_lat_udeg;    /* Last GPS position, millionths of a degree (south negative) */
+    int32_t gps_lon_udeg;    /* West negative */
+    char gps_date[12];       /* e.g. "2026-11-05" */
+    char reserved[178];      /* Pad to 256 bytes for IAP write alignment */
 } station_nvram_params_t;
 
 void flash_nvram_init(void);
@@ -30,6 +33,10 @@ void flash_nvram_note_last_logged(const char *last_logged_str);
 /* Last field calibration result, or "" if never calibrated */
 const char *flash_nvram_get_calib_result(void);
 bool flash_nvram_set_calib_result(const char *result);
+/* Saved GPS position. False if there is none yet. */
+bool flash_nvram_get_location(int32_t *lat_udeg, int32_t *lon_udeg);
+const char *flash_nvram_get_location_date(void);
+bool flash_nvram_set_location(int32_t lat_udeg, int32_t lon_udeg, const char *date);
 bool flash_nvram_read(station_nvram_params_t *out_params);
 bool flash_nvram_write(const station_nvram_params_t *in_params);
 

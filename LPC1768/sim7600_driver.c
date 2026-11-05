@@ -1617,6 +1617,258 @@ bool sim7600_net_diagnostics(const http_endpoint_t *endpoint, const char *payloa
 }
 #endif /* ENABLE_TEST_SEND */
 
+/* GPS_PARSE_BEGIN */
+/* One ddmm.mmmmmm or dddmm.mmmmmm coordinate to millionths of a degree, with no floats */
+static bool gps_parse_coord(const char *p, char dir_pos, char dir_neg, int32_t *out)
+{
+    uint32_t whole = 0;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9' && digits < 6) {
+        whole = whole * 10 + (uint32_t)(*p++ - '0');
+        digits++;
+    }
+    if (digits < 3 || *p != '.') {
+        return false;
+    }
+    p++;
+
+    uint32_t minute_micro = 0;
+    for (int i = 0; i < 6; i++) {
+        minute_micro *= 10;
+        if (*p >= '0' && *p <= '9') {
+            minute_micro += (uint32_t)(*p++ - '0');
+        }
+    }
+    while (*p >= '0' && *p <= '9') {
+        p++;
+    }
+    if (*p != ',') {
+        return false;
+    }
+    p++;
+    if (*p != dir_pos && *p != dir_neg) {
+        return false;
+    }
+
+    uint32_t minutes = whole % 100;
+    if (minutes >= 60) {
+        return false;
+    }
+    int32_t value = (int32_t)((whole / 100) * 1000000UL + (minutes * 1000000UL + minute_micro) / 60UL);
+    *out = (*p == dir_neg) ? -value : value;
+    return true;
+}
+
+/* "+CGPSINFO: 1259.432487,N,07732.253059,E,270820,075955.0,965.2,0.0,267.7".
+ * While searching it is "+CGPSINFO: ,,,,,,,,". */
+static bool gps_parse_info(const char *reply, int32_t *lat, int32_t *lon)
+{
+    const char *p = strstr(reply, "+CGPSINFO:");
+    if (!p) {
+        return false;
+    }
+    p += 10;
+    while (*p == ' ') {
+        p++;
+    }
+    if (!gps_parse_coord(p, 'N', 'S', lat)) {
+        return false;
+    }
+    for (int commas = 0; commas < 2; commas++) {
+        p = strchr(p, ',');
+        if (!p) {
+            return false;
+        }
+        p++;
+    }
+    if (!gps_parse_coord(p, 'E', 'W', lon)) {
+        return false;
+    }
+    return !(*lat == 0 && *lon == 0) && *lat >= -90000000 && *lat <= 90000000 && *lon >= -180000000 && *lon <= 180000000;
+}
+
+/* Metres between two positions. Short-range flat-earth form, plenty for a 50 m check. */
+static uint32_t gps_distance_m(int32_t lat1, int32_t lon1, int32_t lat2, int32_t lon2)
+{
+    float x = ((float)lat1 + (float)lat2) * 0.5f * 1.745329e-8f; /* Mean latitude, radians */
+    float cos_lat = 1.0f - x * x / 2.0f + x * x * x * x / 24.0f;
+    float north = (float)(lat2 - lat1) * 0.1111949f;
+    float east = (float)(lon2 - lon1) * 0.1111949f * cos_lat;
+    float square = north * north + east * east;
+    if (square >= 1.0e12f) {
+        return 1000000UL; /* Far enough: no need for the root */
+    }
+    float root = (square > 1.0f) ? square : 1.0f;
+    for (int i = 0; i < 24; i++) {
+        root = (root + square / root) * 0.5f;
+    }
+    return (uint32_t)(root + 0.5f);
+}
+/* GPS_PARSE_END */
+
+/* GPS_TIME_BEGIN */
+/* The UTC date and time in a +CGPSINFO reply, written as an HTTP Date line so it goes through the
+ * same GMT to IST conversion as the server's. ...,E,270820,075955.0,... */
+static bool gps_time_as_date_line(const char *reply, char *out, size_t size)
+{
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    const char *p = strstr(reply, "+CGPSINFO:");
+    if (!p) {
+        return false;
+    }
+    for (int commas = 0; commas < 4; commas++) {
+        p = strchr(p, ',');
+        if (!p) {
+            return false;
+        }
+        p++;
+    }
+    /* ddmmyy,hhmmss */
+    for (int i = 0; i < 13; i++) {
+        bool ok = (i == 6) ? (p[i] == ',') : (p[i] >= '0' && p[i] <= '9');
+        if (!ok) {
+            return false;
+        }
+    }
+    int month = (p[2] - '0') * 10 + (p[3] - '0');
+    if (month < 1 || month > 12) {
+        return false;
+    }
+    snprintf(out, size, "Date: %.2s %.3s 20%.2s %.2s:%.2s:%.2s GMT", p, &months[(month - 1) * 3], p + 4, p + 7, p + 9, p + 11);
+    return true;
+}
+/* GPS_TIME_END */
+
+/* Same rule as the server's: only a real drift moves the clock, or a clock that isn't valid */
+static void __attribute__((noinline)) correct_clock_from_gps(const char *reply)
+{
+    char date_line[40];
+    char gps_ts[16];
+    char msg[72];
+    telemetry_data_t t;
+
+    if (!gps_time_as_date_line(reply, date_line, sizeof(date_line)) ||
+        !intermcu_parse_server_time(date_line, gps_ts, sizeof(gps_ts))) {
+        storage_log_debug("RTC", "No usable time in the GPS reply");
+        return;
+    }
+
+    bool have_clock = intermcu_get_telemetry(&t);
+    long drift = have_clock ? intermcu_clock_drift_sec(t.present_time, gps_ts) : -1;
+    if (drift >= 0 && drift < CLOCK_DRIFT_LIMIT_SEC) {
+        snprintf(msg, sizeof(msg), "Clock agrees with GPS, drift %lds", drift);
+        storage_log_debug("RTC", msg);
+        return;
+    }
+
+    snprintf(msg, sizeof(msg), "RTC corrected from GPS: %.14s -> %s (drift %lds)",
+             have_clock ? t.present_time : "none", gps_ts, drift);
+    storage_log_debug("RTC", msg);
+    hal_power_sync_rtc(gps_ts);
+    intermcu_update_time(gps_ts);
+}
+
+static void gps_turn_off(void)
+{
+    clear_rx();
+    send_raw("AT+CGPS=0\r\n");
+    wait_response("+CGPS: 0", 3000, NULL, 0);
+    clear_rx();
+    send_raw("AT+CVAUXS=0\r\n"); /* Antenna supply off */
+    wait_response("OK", 1000, NULL, 0);
+}
+
+gps_result_t sim7600_gps_update(const char *today)
+{
+    char cap[128];
+    char line[96];
+    int32_t lat = 0, lon = 0;
+
+    storage_log_debug("GPS", "Search starting");
+    report_progress("GPS STARTING... ");
+
+    /* Older firmware set CGPSAUTO=1, which starts GPS at every modem power-up */
+    clear_rx();
+    send_raw("AT+CGPSAUTO=0\r\n");
+    wait_response("OK", 1000, NULL, 0);
+    /* Supply for an active antenna, as in the TWS firmware */
+    clear_rx();
+    send_raw("AT+CVAUXV=3050\r\n");
+    wait_response("OK", 1000, NULL, 0);
+    clear_rx();
+    send_raw("AT+CVAUXS=1\r\n");
+    wait_response("OK", 1000, NULL, 0);
+
+    cap[0] = '\0';
+    clear_rx();
+    send_raw("AT+CGPS?\r\n");
+    wait_response("OK", 2000, cap, sizeof(cap));
+    if (!strstr(cap, "+CGPS: 1")) {
+        clear_rx();
+        send_raw("AT+CGPS=1\r\n");
+        if (!wait_response("OK", 3000, NULL, 0)) {
+            clear_rx();
+            send_raw("AT+CGPS=1,1\r\n");
+            if (!wait_response("OK", 3000, NULL, 0)) {
+                storage_log_debug("GPS", "Modem refused AT+CGPS");
+                gps_turn_off();
+                return GPS_NOT_AVAILABLE;
+            }
+        }
+    }
+
+    /* Two readings in a row that agree: the very first fix after a cold start can be well off */
+    bool have_first = false, have_fix = false;
+    int32_t first_lat = 0, first_lon = 0;
+    uint32_t waited = 0;
+    report_progress("GPS SEARCHING...");
+    while (waited < GPS_FIX_TIMEOUT_SEC && !have_fix) {
+        delay_ms(5000);
+        waited += 5;
+        cap[0] = '\0';
+        clear_rx();
+        send_raw("AT+CGPSINFO\r\n");
+        if (wait_response("OK", 2000, cap, sizeof(cap)) && gps_parse_info(cap, &lat, &lon)) {
+            if (have_first && gps_distance_m(first_lat, first_lon, lat, lon) <= GPS_MOVE_LIMIT_M) {
+                have_fix = true;
+            }
+            first_lat = lat;
+            first_lon = lon;
+            have_first = true;
+        } else {
+            have_first = false;
+        }
+    }
+    gps_turn_off();
+
+    if (have_fix) {
+        correct_clock_from_gps(cap); /* cap still holds the agreed reading */
+    }
+
+    if (!have_fix) {
+        snprintf(line, sizeof(line), "No fix after %lus: GPS off", (unsigned long)waited);
+        storage_log_debug("GPS", line);
+        return GPS_NO_FIX;
+    }
+
+    int32_t old_lat = 0, old_lon = 0;
+    bool have_old = flash_nvram_get_location(&old_lat, &old_lon);
+    uint32_t moved = have_old ? gps_distance_m(old_lat, old_lon, lat, lon) : 0;
+
+    snprintf(line, sizeof(line), "Fix after %lus: %ld,%ld (millionths of a degree), moved %lum", (unsigned long)waited,
+             (long)lat, (long)lon, (unsigned long)moved);
+    storage_log_debug("GPS", line);
+
+    if (have_old && moved <= GPS_MOVE_LIMIT_M) {
+        return GPS_SAME_POSITION; /* Nothing to write */
+    }
+    if (!flash_nvram_set_location(lat, lon, today)) {
+        storage_log_debug("ERROR", "Could not save the GPS position");
+    }
+    storage_log_debug("GPS", have_old ? "Station moved beyond the limit: position updated" : "First position saved");
+    return have_old ? GPS_MOVED : GPS_NEW_POSITION;
+}
+
 void sim7600_get_status(modem_status_t *out_status)
 {
     if (out_status) {
@@ -1668,13 +1920,9 @@ void sanitize_phone_number(char *dest, const char *src, size_t dest_size)
     }
 }
 
-bool sim7600_send_sms(const char *dest_phone, const char *message)
+/* The ESP32's sequence: AT+CMGF, AT+CSCA?, AT+CMGS, the text, 100 ms, then Ctrl+Z */
+static bool __attribute__((noinline)) send_sms_to_number(const char *number, const char *message)
 {
-    if (!dest_phone || !message) return false;
-
-    char sanitized[24];
-    sanitize_phone_number(sanitized, dest_phone, sizeof(sanitized));
-
     char cap[128] = "";
 
     clear_rx();
@@ -1689,11 +1937,6 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
         return false;
     }
 
-    /* 2. Character set */
-    clear_rx();
-    send_raw("AT+CSCS=\"GSM\"\r\n");
-    wait_response("OK", 1000, NULL, 0);
-
     /* 3. Query SMS Service Center Address (SMSC) for diagnostics (do not overwrite SIM native SMSC) */
     clear_rx();
     send_raw("AT+CSCA?\r\n");
@@ -1705,7 +1948,7 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
 
     /* 4. Initiate AT+CMGS */
     char sms_cmd[64];
-    snprintf(sms_cmd, sizeof(sms_cmd), "AT+CMGS=\"%s\"\r", sanitized);
+    snprintf(sms_cmd, sizeof(sms_cmd), "AT+CMGS=\"%s\"\r", number);
     clear_rx();
     send_raw(sms_cmd);
     if (!wait_response(">", 5000, cap, sizeof(cap))) {
@@ -1730,7 +1973,7 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
     /* Wait 50ms before sending payload after '>' prompt */
     delay_ms(50);
 
-    /* 5. Build clean message payload terminated by single Ctrl+Z (0x1A) */
+    /* 5. Clean message text; Ctrl+Z (0x1A) follows separately */
     char send_buf[300];
     size_t slen = 0;
     while (*message && slen < sizeof(send_buf) - 2) {
@@ -1739,14 +1982,21 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
         }
         message++;
     }
-    send_buf[slen++] = 0x1A; /* Ctrl+Z */
+    /* A CR makes the SIM7600 open a new input line (the second ">" in the log), so end on text */
+    while (slen > 0 && (send_buf[slen - 1] == '\r' || send_buf[slen - 1] == '\n')) {
+        slen--;
+    }
     send_buf[slen] = '\0';
 
     clear_rx();
     UART_Send(UART_MODEM, (uint8_t *)send_buf, slen, BLOCKING);
+    delay_ms(100); /* Breather before the transmit surge */
+    uint8_t ctrl_z = 0x1A;
+    UART_Send(UART_MODEM, &ctrl_z, 1, BLOCKING);
 
     /* 6. Wait for cellular network SMS acknowledgement */
-    if (wait_response("+CMGS:", 20000, cap, sizeof(cap))) {
+    /* The ESP32 waits 20s, but the SIM7600 answers nothing else until this ends, so give it longer */
+    if (wait_response("+CMGS:", 60000, cap, sizeof(cap))) {
         report_progress("STATUS SENT OK  ");
         char ok_log[80];
         snprintf(ok_log, sizeof(ok_log), "SMS Sent OK: %s", cap);
@@ -1764,10 +2014,88 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
         } else if (strstr(cap, "ERROR")) {
             report_progress("CMD ERROR       ");
         } else {
-            report_progress("NET TIMEOUT 20S ");
+            report_progress("NET TIMEOUT 60S ");
         }
         return false;
     }
+}
+
+/* After a send with no confirmation: does the modem still answer? ESC leaves text input. */
+static bool __attribute__((noinline)) sms_modem_answers(void)
+{
+    const char esc[] = {0x1B, '\0'};
+    clear_rx();
+    send_raw(esc);
+    wait_response("OK", 3000, NULL, 0);
+    delay_ms(500);
+    clear_rx();
+    send_raw("AT\r\n");
+    return wait_response("OK", 3000, NULL, 0);
+}
+
+static void sms_log_query(const char *cmd)
+{
+    clear_rx();
+    send_raw(cmd);
+    wait_response("OK", 2000, NULL, 0);
+}
+
+bool sim7600_send_sms(const char *dest_phone, const char *message)
+{
+    if (!dest_phone || !message) return false;
+
+    char sanitized[24];
+    sanitize_phone_number(sanitized, dest_phone, sizeof(sanitized));
+
+    /* The ESP32 dials the plain 10-digit number. The +91 form is what last worked on this modem. */
+    const char *plain = (strncmp(sanitized, "+91", 3) == 0 && strlen(sanitized) == 13) ? (sanitized + 3) : sanitized;
+
+    /* SMS needs more than a data connection: show what the network has granted */
+    sms_log_query("AT+CREG?\r\n");
+    sms_log_query("AT+CPSI?\r\n");
+    sms_log_query("AT+CGSMS?\r\n");
+
+    char line[64];
+    snprintf(line, sizeof(line), "Sending to %s", plain);
+    storage_log_debug("SMS", line);
+    if (send_sms_to_number(plain, message)) {
+        return true;
+    }
+    if (sim7600_is_cancel_requested()) {
+        return false;
+    }
+
+    /* Second try on automatic network mode: on 4G only, SMS relies on the network carrying it */
+    bool answers = sms_modem_answers();
+    storage_log_debug("SMS", answers ? "Modem still answers after the failed send" : "Modem silent after the failed send: restarting it");
+    report_progress("TRYING AUTO NET ");
+    if (!answers) {
+        sim7600_power_off();
+        if (!sim7600_power_on()) {
+            report_progress("MODEM FAIL      ");
+            return false;
+        }
+    }
+
+    clear_rx();
+    send_raw("AT+CNMP=2\r\n");
+    wait_response("OK", 2000, NULL, 0);
+
+    char reg[48];
+    for (int i = 0; i < 15; i++) {
+        delay_ms(2000);
+        reg[0] = '\0';
+        clear_rx();
+        send_raw("AT+CREG?\r\n");
+        if (wait_response("+CREG:", 1500, reg, sizeof(reg)) && (strstr(reg, ",1") || strstr(reg, ",5"))) {
+            break;
+        }
+    }
+    sms_log_query("AT+CPSI?\r\n");
+
+    snprintf(line, sizeof(line), "Retrying as %s on automatic network mode", sanitized);
+    storage_log_debug("SMS", line);
+    return send_sms_to_number(sanitized, message);
 }
 
 bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)

@@ -225,7 +225,13 @@ bool intermcu_parse_server_time(const char *http_response, char *out_ts14, size_
  * keeps the rainfall and the day's total, and sends the total in every status frame. */
 #define RAIN_CLOSE_SLOT 34  /* Slot of the day for 08:30 */
 
+static volatile int s_845_total_restored = -1; /* 0: LPC845 restarted and wants its rain total back */
 static volatile int s_845_system = -1; /* -1 until a frame from current LPC845 firmware */
+
+bool intermcu_845_wants_rain_total(void)
+{
+    return s_845_total_restored == 0;
+}
 
 int intermcu_get_845_system(void)
 {
@@ -398,6 +404,7 @@ static void parse_d_packet(const char *frame)
     int rain_day_tips = 0;
     int lpc845_system = -1;
     int live_tips = -1;
+    int total_restored = -1;
 
     while (token != NULL) {
         switch (field_idx) {
@@ -427,6 +434,7 @@ static void parse_d_packet(const char *frame)
             case 23: wake_reason = token[0]; break;
             case 24: reset_status = atoi(token); break;
             case 25: live_tips = atoi(token); break;
+            case 26: total_restored = atoi(token); break;
             default: break;
         }
         field_idx++;
@@ -457,6 +465,7 @@ static void parse_d_packet(const char *frame)
 
         if (field_idx >= 23) {
             s_845_system = lpc845_system;
+            s_845_total_restored = total_restored;
             s_845_wake = wake_reason;
             s_845_reset_status = reset_status;
             s_latest_telemetry.rf_cum_mm = rain_day_tips * RF_BUCKET_RESOLUTION;

@@ -162,6 +162,7 @@ uint16_t sc_bat1, sc_bat2;
 char solar_status;
 uint16_t last_rf;
 uint32_t rain_day_tips;		//rainfall so far in this rain day
+volatile uint8_t rain_total_restored;	//0 after a restart, until the LPC1768 has returned the stored total
 volatile int wake_key_low_cnt;
 volatile int wake_key_pressed;
 int sleep_holdoff_100ms;

@@ -115,10 +115,13 @@ void store_data()
 		Next_Date(&close_dd, &close_mm, &close_yy);
 	}
 
-	if ((Day_Samples[gi_cur_blk].dd != close_dd) ||
+	//A wrong clock (year 00 after the RTC lost power) must not look like a new rain day
+	static uint8_t day_started = 0;
+	if ((Present_Date_Time.year >= 24) &&
+			((Day_Samples[gi_cur_blk].dd != close_dd) ||
 			(Day_Samples[gi_cur_blk].mm != close_mm) ||
 			(Day_Samples[gi_cur_blk].yy != close_yy) ||
-			(Day_Samples[gi_cur_blk].cc != Present_Date_Time.century)){
+			(Day_Samples[gi_cur_blk].cc != Present_Date_Time.century))){
 
 		gi_cur_blk++;
 		gi_cur_blk %= MAX_DAY_BLOCKS_RF;
@@ -126,7 +129,13 @@ void store_data()
 		Day_Samples[gi_cur_blk].mm = close_mm;
 		Day_Samples[gi_cur_blk].yy = close_yy;
 		Day_Samples[gi_cur_blk].cc = Present_Date_Time.century;
-		rain_day_tips = 0;
+		//CUM_RF only restarts on a real change of rain day (08:45), not on the first slot after
+		//a restart: that total may already hold what the LPC1768 returned
+		if(day_started){
+			rain_day_tips = 0;
+			rain_total_restored = 1;	//A new day has nothing to restore
+		}
+		day_started = 1;
 
 		/*	for(i=0; i<LOG_INTERVAL_1MIN_RF; i++){
 			Day_Samples[gi_cur_blk].rf_1min[i] = 0xFF;
@@ -350,6 +359,18 @@ void decode_command(void)
 
 		case 'R':									//Erase Data: restart the rain-day total
 			rain_day_tips = 0;
+			rain_total_restored = 1;
+			break;
+
+		case 'T':									//$T<tips>; total stored before this restart. Adds once only
+			if(!rain_total_restored){
+				uint32_t stored_tips = 0;
+				for(int k = 2; k < 12 && gc_recv_buf[k] >= '0' && gc_recv_buf[k] <= '9'; k++){
+					stored_tips = stored_tips*10 + (gc_recv_buf[k]-'0');
+				}
+				rain_day_tips += stored_tips;
+				rain_total_restored = 1;
+			}
 			break;
 
 		case 'H':									//LPC1768 heartbeat: still making progress
@@ -969,21 +990,35 @@ void read_th_val(void)
 
 void init_ext_rtc(void){
 	int i, j;
-	i2c_clkval[0]= 0;		// start address is 0
-	i2c_clkval[1]= 0;		// always set the seconds to zero
 
-	//deviceAddress
+	//Only start the RTC if it is stopped (bit 7 of register 0). Writing the seconds on every
+	//restart lost up to 59 seconds of real time each time.
+	i2c_clkval[0]= 0;		// start address is 0
+	i2c_clkval[1]= 0;
 	XITC_I2C_IDT.slaveAddress = IDT_DEV_ADDR;
 	XITC_I2C_IDT.flags = 0;
 	XITC_I2C_IDT.data = &i2c_clkval[0];
-	XITC_I2C_IDT.dataSize = 2;		// start address and data for register 0
+	XITC_I2C_IDT.dataSize = 1;
 	XITC_I2C_IDT.direction = kI2C_Write;
-	//	XITC_I2C_IDT.subaddress = deviceAddress;
-	//	XITC_I2C_IDT.subaddressSize = 1;
-
-	//kI2C_Write = 0U, /*!< Master transmit. */
-	//  kI2C_Read = 1U   /*!< Master receive. */
 	I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT);
+
+	XITC_I2C_IDT.slaveAddress = IDT_DEV_ADDR;
+	XITC_I2C_IDT.flags = 0;
+	XITC_I2C_IDT.data = &i2c_clkval[1];
+	XITC_I2C_IDT.dataSize = 1;
+	XITC_I2C_IDT.direction = kI2C_Read;
+	I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT);
+
+	if(i2c_clkval[1] & 0x80){
+		i2c_clkval[0]= 0;
+		i2c_clkval[1] &= 0x7F;
+		XITC_I2C_IDT.slaveAddress = IDT_DEV_ADDR;
+		XITC_I2C_IDT.flags = 0;
+		XITC_I2C_IDT.data = &i2c_clkval[0];
+		XITC_I2C_IDT.dataSize = 2;
+		XITC_I2C_IDT.direction = kI2C_Write;
+		I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT);
+	}
 
 	for(i=0;i<100;i++)
 		for(j=0;j<100;j++);
@@ -1910,6 +1945,7 @@ int main(void)
 	ws_sec_cnt = 0;
 	last_rf = 0;
 	rain_day_tips = 0;
+	rain_total_restored = 0;
 	wake_key_low_cnt = 0;
 	wake_key_pressed = 0;
 	sleep_holdoff_100ms = 0;
@@ -2142,7 +2178,7 @@ int main(void)
 
 			//sprintf(gc_xmit_buf, "$D%04d;", rf_val);
 			wait_tx_idle();
-			sprintf(gc_xmit_buf, "$D%02d%02d%02d%02d%02d%02d%02d,%02d%02d%02d%02d%02d%02d%02d,%04d,%04d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%c,%c,%c,%04d,%04d,%c,%d,%d,%c,%d,%d;",
+			sprintf(gc_xmit_buf, "$D%02d%02d%02d%02d%02d%02d%02d,%02d%02d%02d%02d%02d%02d%02d,%04d,%04d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%c,%c,%c,%04d,%04d,%c,%d,%d,%c,%d,%d,%d;",
 					Present_Date_Time.century,
 					Present_Date_Time.year,
 					Present_Date_Time.month,
@@ -2180,7 +2216,8 @@ int main(void)
 					LPC845_FW_TYPE,
 					wake_reason,
 					(int)reset_status,
-					(int)rf_val);	//Tips so far in this slot, for the LCD
+					(int)rf_val,	//Tips so far in this slot, for the LCD
+					(int)rain_total_restored);
 
 			xmit_ptr = gc_xmit_buf;
 			LPC845_UART0->INTENSET = kUSART_TxReady;

@@ -32,6 +32,17 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
 bool sim7600_net_diagnostics(const http_endpoint_t *endpoint, const char *payload); /* TEMPORARY: TEST SEND only */
 
 /* Query live modem status */
+typedef enum {
+    GPS_NO_FIX = 0,     /* Searched for the full time: no sky view or no antenna */
+    GPS_NOT_AVAILABLE,  /* The modem refused the GPS commands */
+    GPS_NEW_POSITION,   /* First position, saved */
+    GPS_MOVED,          /* Moved beyond the limit, saved */
+    GPS_SAME_POSITION   /* Within the limit, nothing written */
+} gps_result_t;
+
+/* One GPS try: the modem must be on and held by the caller. Always turns GPS off again. */
+gps_result_t sim7600_gps_update(const char *today);
+
 void sim7600_get_status(modem_status_t *out_status);
 
 /* Sub-step progress hook & cancellation for UI responsiveness */

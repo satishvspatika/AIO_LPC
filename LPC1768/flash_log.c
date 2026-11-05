@@ -243,6 +243,18 @@ const flash_log_page_t *flash_log_next_record(uint32_t after_seq)
     return best;
 }
 
+const flash_log_page_t *flash_log_newest_record(void)
+{
+    const flash_log_page_t *best = NULL;
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (page_valid(p) && p->type == TYPE_RECORD && (!best || p->seq > best->seq)) {
+            best = p;
+        }
+    }
+    return best;
+}
+
 uint32_t flash_log_newest_seq(void)
 {
     return s_next_seq - 1;

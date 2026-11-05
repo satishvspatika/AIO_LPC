@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.5.2"
+#define FIRMWARE_VERSION    "v6.6.4"
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
 #define ENABLE_TEST_SEND    1
@@ -35,7 +35,8 @@
 
 /* Status SMS Destination & Network Identifiers */
 #if (UNIT_CFG == BIHAR_TRG)
-#define STATUS_SMS_DEST_NUMBER    "9741391102"
+/* TEMPORARY for the SMS test: the ESP32's Bihar number is 9741391102. This one last worked from this SIM. */
+#define STATUS_SMS_DEST_NUMBER    "9980945474"
 #define STATUS_SMS_NETWORK_NAME   "DES-BIH"
 #else
 #define STATUS_SMS_DEST_NUMBER    "9980945474"
@@ -59,6 +60,12 @@
 #define WDT_ACTIVITY_LIMIT_MS   (5 * 60 * 1000)   /* 5-min inactivity hold */
 #define UI_INACTIVITY_SLEEP_MS  (60 * 1000)       /* 60s screen blanking */
 #define SLOT_HOLD_GUARD_SEC     62                /* 62s minimum slot boundary guard */
+
+/* GPS position (SIM7600 AT+CGPS). It only runs while the modem is already on for a slot, after
+ * the record has gone out. */
+#define GPS_MOVE_LIMIT_M        50      /* Save a new position only if it moved further than this */
+#define GPS_FIX_TIMEOUT_SEC     90      /* Longest try: with no antenna, this is all it costs */
+#define GPS_MIN_BATTERY_V       11.8f   /* Scheduled tries are skipped below this */
 
 /* Rainfall Parameters */
 #define RF_BUCKET_RESOLUTION   0.50f   /* mm per bucket tip */

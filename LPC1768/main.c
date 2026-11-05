@@ -290,6 +290,25 @@ static slot_result_t save_slot_for_retry(const telemetry_data_t *telem, const ch
     return result;
 }
 
+/* Power: GPS only runs in a slot's own modem time, and at set slots, so nothing needs storing to
+ * count tries. No position: 01:00, 07:00, 13:00 and 19:00. Position saved: one check at 13:00. */
+static void __attribute__((noinline)) gps_auto_step(const telemetry_data_t *telem)
+{
+    int slot_of_day = (int)(s_archive_slot_id % 96);
+    bool have_fix = flash_nvram_get_location(NULL, NULL);
+    if (have_fix ? (slot_of_day != 52) : ((slot_of_day % 24) != 4)) {
+        return;
+    }
+    if (telem->bat1_volt < GPS_MIN_BATTERY_V) {
+        storage_log_debug("GPS", "Battery low: scheduled search skipped");
+        return;
+    }
+    char today[12];
+    snprintf(today, sizeof(today), "%.4s-%.2s-%.2s", telem->present_time, telem->present_time + 4, telem->present_time + 6);
+    hal_power_heartbeat();
+    sim7600_gps_update(today);
+}
+
 static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out_attempts, int *out_csq, const char **out_reason)
 {
     char payload[512] = "";
@@ -444,6 +463,9 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
             result = save_slot_for_retry(telem, payload);
         }
 
+        /* The record has gone out, so this can't delay it */
+        gps_auto_step(telem);
+
         /* Check and process incoming operator SMS */
         sim7600_check_incoming_sms(telem);
     } else {
@@ -491,11 +513,16 @@ static void save_last_slot(int32_t slot_id)
 
 static int32_t load_last_slot(void)
 {
+    /* The newer of the two: with the card out, slots still reach flash but not this file */
+    int32_t last = flash_log_newest_slot();
     char line[16];
     if (storage_state_load(LAST_SLOT_FILENAME, line, sizeof(line)) && strlen(line) >= 10) {
-        return atol(line);
+        int32_t on_card = atol(line);
+        if (on_card > last) {
+            last = on_card;
+        }
     }
-    return flash_log_newest_slot(); /* No SD card: the newest record in flash */
+    return last;
 }
 
 static telemetry_data_t s_gap_record; /* Used by vMain_Task only */
@@ -569,6 +596,81 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
         snprintf(s_slot_line, sizeof(s_slot_line), "%.14s,,LOST,NOT_IN_LPC845,0,0,0,,,%d", telem->present_time, not_held);
         storage_log_slot(s_slot_line);
     }
+}
+
+/* RAIN_PARSE_BEGIN */
+/* Tips held in a TRG record ("NN,YYYY-MM-DD,HH:MM,rf15,cum,csq,bat"), with its time as
+ * YYYYMMDDHHMM00. False if the record isn't in that form. */
+static bool parse_record_total(const char *record, char *ts, size_t ts_size, unsigned long *out_tips)
+{
+    const char *p = record;
+    const char *field[5];
+    for (int i = 0; i < 5; i++) {
+        field[i] = p;
+        p = strchr(p, ',');
+        if (!p) {
+            return false;
+        }
+        p++;
+    }
+    /* field[1] is the date, [2] the time, [4] the total in mm, as 12.50 */
+    if (field[2] - field[1] != 11 || field[3] - field[2] != 6) {
+        return false;
+    }
+    snprintf(ts, ts_size, "%.4s%.2s%.2s%.2s%.2s00", field[1], field[1] + 5, field[1] + 8, field[2], field[2] + 3);
+
+    unsigned long whole = 0, hundredths = 0;
+    const char *q = field[4];
+    while (*q >= '0' && *q <= '9') {
+        whole = whole * 10 + (unsigned long)(*q++ - '0');
+    }
+    if (*q != '.' || q[1] < '0' || q[1] > '9' || q[2] < '0' || q[2] > '9') {
+        return false;
+    }
+    hundredths = whole * 100 + (unsigned long)(q[1] - '0') * 10 + (unsigned long)(q[2] - '0');
+
+    unsigned long bucket = (unsigned long)(RF_BUCKET_RESOLUTION * 100.0f + 0.5f);
+    *out_tips = (hundredths + bucket / 2) / bucket;
+    return true;
+}
+/* RAIN_PARSE_END */
+
+/* CUM_RF must never dip. The LPC845 keeps the total in RAM, so after a restart it asks for it back:
+ * this returns the total from the newest stored record, if that is from the same rain day. The
+ * LPC845 adds it once, on top of any tips since the restart. Only the rain that fell while it had
+ * no power is missing. */
+static void rain_total_restore_step(const telemetry_data_t *telem)
+{
+    if (!intermcu_845_wants_rain_total()) {
+        return;
+    }
+
+    static portTickType s_next_try = 0;
+    portTickType now = xTaskGetTickCount();
+    if ((long)(now - s_next_try) < 0) {
+        return;
+    }
+    s_next_try = now + (3000 / portTICK_RATE_MS); /* Until a frame says the LPC845 has it */
+
+    unsigned long tips = 0;
+#if (UNIT_CFG != KSNDMC_TWS)
+    const flash_log_page_t *rec = flash_log_newest_record();
+    char ts[16], stored_close[12], current_close[12];
+    if (rec && parse_record_total(rec->record, ts, sizeof(ts), &tips) &&
+        intermcu_rain_close_date(ts, stored_close, sizeof(stored_close)) &&
+        intermcu_rain_close_date(telem->present_time, current_close, sizeof(current_close)) &&
+        strcmp(stored_close, current_close) == 0) {
+        snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 restarted: returning CUM_RF of %lu tips from record %.12s", tips, ts);
+    } else {
+        tips = 0;
+        snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 restarted: no stored total for this rain day");
+    }
+#else
+    (void)telem;
+    snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 restarted: this profile has no rain total");
+#endif
+    storage_log_debug("RAIN", s_slot_line);
+    hal_power_rain_restore(tips);
 }
 
 /* Runs one slot from start to finish. The UI cannot power down while this is running. */
@@ -718,6 +820,8 @@ static void vMain_Task(void *pvParameters)
             if (clock_ok) {
                 s_waiting_for_clock = false;
 
+                rain_total_restore_step(&telem);
+
                 if (!s_slot_armed) {
                     /* Due now if we booted inside a slot minute, or on a scheduled wake that
                      * came up late. The minute before a boundary just waits for the boundary. */
@@ -789,7 +893,7 @@ int main(void)
     /* UiTask at Priority 3 guarantees instant keypad scan and screen responsiveness */
     xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     512, NULL, 3, NULL);
     xTaskCreate(vModem_Task,  (const signed char *)"ModemTask",  768, NULL, 2, NULL);
-    xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   896, NULL, 1, NULL);
+    xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   960, NULL, 1, NULL);
     xTaskCreate(vDisk_Task,   (const signed char *)"DiskTask",   512, NULL, 1, NULL);
 
     /* Start the scheduler */

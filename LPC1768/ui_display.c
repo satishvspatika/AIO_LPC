@@ -79,6 +79,7 @@ typedef enum {
     SCR_BATTERY,
     SCR_SOLAR,
     SCR_SIGNAL,
+    SCR_LOCATION,
     SCR_LAST_LOGGED,
     SCR_BACKLOG,
     SCR_FIELD_CALIB,
@@ -101,6 +102,7 @@ static const screen_type_t s_screens[] = {
     SCR_BATTERY,
     SCR_SOLAR,
     SCR_SIGNAL,
+    SCR_LOCATION,
     SCR_LAST_LOGGED,
     SCR_BACKLOG,
     SCR_SEND_STATUS,
@@ -114,6 +116,7 @@ static const screen_type_t s_screens[] = {
     SCR_RAINFALL,       /* Shows ONLY Cumulative Rainfall */
     SCR_BATTERY,
     SCR_SIGNAL,
+    SCR_LOCATION,
     SCR_LAST_LOGGED,
     SCR_BACKLOG,
     SCR_FIELD_CALIB,
@@ -128,6 +131,7 @@ static const screen_type_t s_screens[] = {
     SCR_RAINFALL,       /* Shows BOTH 15M and Cumulative Rainfall */
     SCR_BATTERY,
     SCR_SIGNAL,
+    SCR_LOCATION,
     SCR_LAST_LOGGED,
     SCR_BACKLOG,
     SCR_FIELD_CALIB,
@@ -177,6 +181,7 @@ static const menu_item_t s_menu_items[] = {
     #endif
     { "POWER STATUS",    MENU_GOTO_SCREEN, SCR_BATTERY },
     { "NETWORK SIGNAL",  MENU_GOTO_SCREEN, SCR_SIGNAL },
+    { "LOCATION",        MENU_GOTO_SCREEN, SCR_LOCATION },
     { "DATA LOGGING",    MENU_GOTO_SCREEN, SCR_LAST_LOGGED },
     { "SEND STATUS SMS", MENU_GOTO_SCREEN, SCR_SEND_STATUS },
     #if (UNIT_CFG != KSNDMC_TWS)
@@ -547,6 +552,63 @@ static void test_send_key(key_code_t key)
     }
 }
 #endif /* ENABLE_TEST_SEND */
+
+/* LOCATION screen: EN searches now. Shares the SMS task slot, as both use the modem. */
+static volatile bool s_gps_running = false;
+static const char *volatile s_gps_status = NULL;
+static char s_gps_today[12] = "";
+
+static void vGps_Task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    if (!sim7600_acquire(3000)) {
+        s_gps_status = "MODEM BUSY";
+    } else {
+        sim7600_clear_cancel();
+        if (!sim7600_power_on()) {
+            s_gps_status = "MODEM FAIL";
+        } else {
+            switch (sim7600_gps_update(s_gps_today)) {
+            case GPS_NEW_POSITION:  s_gps_status = "POSITION SAVED"; break;
+            case GPS_MOVED:         s_gps_status = "MOVED: UPDATED"; break;
+            case GPS_SAME_POSITION: s_gps_status = "SAME POSITION"; break;
+            case GPS_NOT_AVAILABLE: s_gps_status = "GPS NOT AVAIL"; break;
+            default:                s_gps_status = "NO FIX: EN=RETRY"; break;
+            }
+        }
+        sim7600_release();
+    }
+    s_gps_running = false;
+    s_sms_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void gps_fetch_start(const telemetry_data_t *telemetry)
+{
+    if (s_gps_running) {
+        return;
+    }
+    if (s_slot_busy || slot_scheduler_is_due()) {
+        s_gps_status = "SLOT DUE, WAIT";
+        return;
+    }
+    if (s_sms_task_handle != NULL) {
+        s_gps_status = "MODEM BUSY";
+        return;
+    }
+    const char *t = telemetry->present_time;
+    snprintf(s_gps_today, sizeof(s_gps_today), "%.4s-%.2s-%.2s", t, t + 4, t + 6);
+    s_gps_status = NULL;
+    s_gps_running = true;
+    strncpy(s_status_sms_substep, "GPS STARTING... ", sizeof(s_status_sms_substep) - 1);
+    if (xTaskCreate(vGps_Task, (const signed char *)"GpsTask", 768, NULL, 1, &s_sms_task_handle) != pdPASS) {
+        s_sms_task_handle = NULL;
+        s_gps_running = false;
+        s_gps_status = "NO MEMORY";
+        storage_log_debug("ERROR", "Not enough memory to start the GPS task");
+    }
+}
 
 volatile uint32_t g_dbg_last_key = 0;
 volatile uint32_t g_dbg_cols_r0 = 7;
@@ -986,8 +1048,8 @@ void ui_enter_sleep(void)
         return;
     }
 
-    /* Never power down over a 15-minute slot */
-    if (s_slot_busy || slot_scheduler_is_due()) {
+    /* Never power down over a 15-minute slot, or with GPS searching */
+    if (s_slot_busy || s_gps_running || slot_scheduler_is_due()) {
         storage_log_debug("PWR", "Sleep refused: 15-minute slot is due or running");
         s_inactivity_ticks = 0;
         return;
@@ -1214,6 +1276,28 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 const char *last_log = flash_nvram_get_last_logged();
                 snprintf(line2, sizeof(line2), "%-16.16s", (last_log && last_log[0]) ? last_log : "NO DATA YET");
                 break;
+
+            case SCR_LOCATION: {
+                int32_t lat = 0, lon = 0;
+                if (s_gps_running) {
+                    snprintf(line1, sizeof(line1), "LOCATION        ");
+                    snprintf(line2, sizeof(line2), "%-16.16s", s_status_sms_substep);
+                } else if (flash_nvram_get_location(&lat, &lon)) {
+                    /* Five decimals is about 1 m. A result shows on line 2 until the next key. */
+                    int32_t a = (lat < 0) ? -lat : lat;
+                    int32_t o = (lon < 0) ? -lon : lon;
+                    snprintf(line1, sizeof(line1), "LAT:%3ld.%05ld %c", (long)(a / 1000000), (long)((a % 1000000) / 10), (lat < 0) ? 'S' : 'N');
+                    if (s_gps_status) {
+                        snprintf(line2, sizeof(line2), "%-16.16s", s_gps_status);
+                    } else {
+                        snprintf(line2, sizeof(line2), "LON:%3ld.%05ld %c", (long)(o / 1000000), (long)((o % 1000000) / 10), (lon < 0) ? 'W' : 'E');
+                    }
+                } else {
+                    snprintf(line1, sizeof(line1), "NO LOCATION YET ");
+                    snprintf(line2, sizeof(line2), "%-16.16s", s_gps_status ? s_gps_status : "PRESS EN TO FIND");
+                }
+                break;
+            }
 
             case SCR_BACKLOG: {
                 uint32_t bl = ui_get_backlog_count();
@@ -1520,7 +1604,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
     if (key != KEY_NONE) {
         s_operator_touched_key = true;
         s_inactivity_ticks = 0;
-    } else if (s_status_sms_state != STATUS_UI_SENDING && !s_slot_busy
+    } else if (s_status_sms_state != STATUS_UI_SENDING && !s_slot_busy && !s_gps_running
 #if ENABLE_TEST_SEND
                && !s_test_running
 #endif
@@ -1773,6 +1857,8 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             } else if (active_scr == SCR_ERASE_DATA) {
                 /* Prompt Erase Confirmation */
                 s_ui_mode = UI_MODE_ERASE_CONFIRM;
+            } else if (active_scr == SCR_LOCATION) {
+                gps_fetch_start(telemetry);
             } else if (active_scr == SCR_SEND_STATUS) {
                 /* Transmit Status SMS Asynchronously in FreeRTOS Task (keeps UI responsive) */
                 if (s_status_sms_state != STATUS_UI_SENDING && s_sms_task_handle == NULL) {

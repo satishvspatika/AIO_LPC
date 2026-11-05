@@ -139,6 +139,63 @@ const char *flash_nvram_get_last_logged(void)
     return s_active_last_logged;
 }
 
+/* LOC_CHECK_BEGIN */
+/* A position counts only with the date saved beside it. This sector was first written by older
+ * firmware with a different layout, so these bytes can hold old values that look like a position. */
+static bool location_date_valid(const char *d)
+{
+    for (int i = 0; i < 10; i++) {
+        bool ok = (i == 4 || i == 7) ? (d[i] == '-') : (d[i] >= '0' && d[i] <= '9');
+        if (!ok) {
+            return false;
+        }
+    }
+    return d[0] == '2' && d[1] == '0' && d[10] == '\0';
+}
+
+static bool location_values_valid(int32_t lat, int32_t lon)
+{
+    return lat != 0 && lon != 0 && lat >= -90000000 && lat <= 90000000 && lon >= -180000000 && lon <= 180000000;
+}
+/* LOC_CHECK_END */
+
+bool flash_nvram_get_location(int32_t *lat_udeg, int32_t *lon_udeg)
+{
+    const station_nvram_params_t *p = (const station_nvram_params_t *)PARAM_SECTOR_ADDR;
+    int32_t lat, lon;
+    memcpy(&lat, &p->gps_lat_udeg, sizeof(lat));
+    memcpy(&lon, &p->gps_lon_udeg, sizeof(lon));
+    if (!location_date_valid(p->gps_date) || !location_values_valid(lat, lon)) {
+        return false;
+    }
+    if (lat_udeg) *lat_udeg = lat;
+    if (lon_udeg) *lon_udeg = lon;
+    return true;
+}
+
+const char *flash_nvram_get_location_date(void)
+{
+    const char *stored = (const char *)(PARAM_SECTOR_ADDR + offsetof(station_nvram_params_t, gps_date));
+    return location_date_valid(stored) ? stored : "";
+}
+
+bool flash_nvram_set_location(int32_t lat_udeg, int32_t lon_udeg, const char *date)
+{
+    /* On the stack: this runs rarely, and permanent RAM is short */
+    uint8_t sector_buf[256] __attribute__((aligned(4)));
+    memcpy(sector_buf, (const void *)PARAM_SECTOR_ADDR, 256);
+
+    memcpy(sector_buf + offsetof(station_nvram_params_t, gps_lat_udeg), &lat_udeg, sizeof(lat_udeg));
+    memcpy(sector_buf + offsetof(station_nvram_params_t, gps_lon_udeg), &lon_udeg, sizeof(lon_udeg));
+    size_t offset = offsetof(station_nvram_params_t, gps_date);
+    size_t size = sizeof(((station_nvram_params_t *)0)->gps_date);
+    memset(sector_buf + offset, 0, size);
+    if (date) {
+        strncpy((char *)(sector_buf + offset), date, size - 1);
+    }
+    return iap_write_sector1(sector_buf, 256);
+}
+
 const char *flash_nvram_get_calib_result(void)
 {
     const char *stored = (const char *)(PARAM_SECTOR_ADDR + offsetof(station_nvram_params_t, calib_result));

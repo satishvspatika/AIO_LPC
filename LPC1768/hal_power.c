@@ -96,6 +96,13 @@ void hal_power_rain_reset(void)
     send_intermcu_cmd("$R;\012");
 }
 
+void hal_power_rain_restore(unsigned long tips)
+{
+    char cmd[20];
+    snprintf(cmd, sizeof(cmd), "$T%lu;\012", tips);
+    send_intermcu_cmd(cmd);
+}
+
 void hal_power_heartbeat(void)
 {
     send_intermcu_cmd("$H;\012");

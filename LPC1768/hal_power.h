@@ -16,6 +16,7 @@ void hal_power_sleep_system(void);
 
 /* Tells the LPC845 this chip is still making progress (it cuts power after 11 min without) */
 void hal_power_heartbeat(void);
+void hal_power_rain_restore(unsigned long tips);
 
 /* Erase Data: restart the LPC845's rain-day total */
 void hal_power_rain_reset(void);
