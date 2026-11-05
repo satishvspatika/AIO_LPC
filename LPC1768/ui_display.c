@@ -432,33 +432,25 @@ key_code_t ui_keypad_scan(void)
     static uint32_t s_debounce_count = 0;
     static uint32_t s_hold_timer = 0;
 
-    /* 1. Baseline qualification: all row strobes idle HIGH */
-    output_row(-1);
-    delay_us(500);
-
-    /* Baseline stuck column check:
-     * When all row outputs are HIGH, column inputs (P0.20, P0.21, P0.22) MUST read HIGH (pulled up).
-     * If any pin reads 0 when all rows are 1, that line has external leakage or short. */
-    uint32_t baseline = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
-    uint32_t stuck_cols = (~baseline) & 0x07;
-
     key_code_t raw = KEY_NONE;
 
-    /* 2. Scan Row 0 (P3.26 LOW) -> [MENU, UP, CALIB] */
+    /* 1. Scan Row 0 (P3.26 LOW) -> [MENU, UP, CALIB] */
     output_row(0);
-    delay_us(1000);
+    delay_us(500);
     uint32_t cols_r0 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     output_row(-1);
+    delay_us(100);
 
-    /* 3. Scan Row 1 (P3.25 LOW) -> [LEFT, EN, RIGHT] */
+    /* 2. Scan Row 1 (P3.25 LOW) -> [LEFT, EN, RIGHT] */
     output_row(1);
-    delay_us(1000);
+    delay_us(500);
     uint32_t cols_r1 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     output_row(-1);
+    delay_us(100);
 
-    /* 4. Scan Row 2 (P1.21 LOW) -> [BACK, DOWN, DSP] */
+    /* 3. Scan Row 2 (P1.21 LOW) -> [BACK, DOWN, DSP] */
     output_row(2);
-    delay_us(1000);
+    delay_us(500);
     uint32_t cols_r2 = (LPC_GPIO0->FIOPIN >> 20) & 0x07;
     output_row(-1);
 
@@ -473,21 +465,21 @@ key_code_t ui_keypad_scan(void)
      */
 
     /* Row 0 (P3.26 LOW): Top Row */
-    if (!(cols_r0 & 0x04) && !(stuck_cols & 0x04))      raw = KEY_MENU;   /* Col 0 (P0.22) */
-    else if (!(cols_r0 & 0x02) && !(stuck_cols & 0x02)) raw = KEY_UP;     /* Col 1 (P0.21) */
-    else if (!(cols_r0 & 0x01) && !(stuck_cols & 0x01)) raw = KEY_CALIB;  /* Col 2 (P0.20) */
+    if (!(cols_r0 & 0x04))      raw = KEY_MENU;   /* Col 0 (P0.22) */
+    else if (!(cols_r0 & 0x02)) raw = KEY_UP;     /* Col 1 (P0.21) */
+    else if (!(cols_r0 & 0x01)) raw = KEY_CALIB;  /* Col 2 (P0.20) */
 
     /* Row 1 (P3.25 LOW): Middle Row */
-    else if (!(cols_r1 & 0x04) && !(stuck_cols & 0x04)) raw = KEY_LEFT;   /* Col 0 (P0.22) */
-    else if (!(cols_r1 & 0x02) && !(stuck_cols & 0x02)) raw = KEY_EN;     /* Col 1 (P0.21) */
-    else if (!(cols_r1 & 0x01) && !(stuck_cols & 0x01)) raw = KEY_RIGHT;  /* Col 2 (P0.20) */
+    else if (!(cols_r1 & 0x04)) raw = KEY_LEFT;   /* Col 0 (P0.22) */
+    else if (!(cols_r1 & 0x02)) raw = KEY_EN;     /* Col 1 (P0.21) */
+    else if (!(cols_r1 & 0x01)) raw = KEY_RIGHT;  /* Col 2 (P0.20) */
 
     /* Row 2 (P1.21 LOW): Bottom Row */
-    else if (!(cols_r2 & 0x04) && !(stuck_cols & 0x04)) raw = KEY_BACK;   /* Col 0 (P0.22) */
-    else if (!(cols_r2 & 0x02) && !(stuck_cols & 0x02)) raw = KEY_DOWN;   /* Col 1 (P0.21) */
-    else if (!(cols_r2 & 0x01) && !(stuck_cols & 0x01)) raw = KEY_DSP;    /* Col 2 (P0.20) */
+    else if (!(cols_r2 & 0x04)) raw = KEY_BACK;   /* Col 0 (P0.22) */
+    else if (!(cols_r2 & 0x02)) raw = KEY_DOWN;   /* Col 1 (P0.21) */
+    else if (!(cols_r2 & 0x01)) raw = KEY_DSP;    /* Col 2 (P0.20) */
 
-    /* 5. 2-Stage Debounce & Release Filter (50ms scan interval) */
+    /* 4. 2-Stage Debounce & Release Filter (50ms scan interval) */
     if (raw != KEY_NONE) {
         g_dbg_last_key = (uint32_t)raw;
         if (raw == s_last_raw) {
@@ -564,6 +556,40 @@ void ui_display_init(void)
     memset(&mstat, 0, sizeof(mstat));
     mstat.csq_dbm = -113;
     render_screen(s_screens[0], &telem, &mstat);
+}
+
+void ui_enter_sleep(void)
+{
+    storage_log_debug("PWR", "Entering sleep: shutting down UI, modem, and sending $f1;");
+
+    /* 1. Mark display inactive IMMEDIATELY so vModem_Task will not attempt to restart modem */
+    s_display_active = false;
+    s_operator_touched_key = false;
+    s_inactivity_ticks = 0;
+    s_no_rf_popup_timer = 0;
+
+    /* 2. Turn off cursor if in edit mode */
+    if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+        lcd_command(0x0C);
+    }
+    s_ui_mode = UI_MODE_BROWSE;
+
+    /* 3. Turn off LCD display and backlight */
+    lcd_command(0x08); /* Display OFF */
+    LPC_GPIO2->FIOCLR = MASK_LCD_BL; /* Backlight OFF */
+
+    /* 4. Power off SIM7600 cellular modem completely */
+    sim7600_power_off();
+
+    /* 5. Flush any pending logs to SD card */
+    storage_log_flush();
+
+    /* 6. Cut LCD 5V rail */
+    hal_power_lcd_off();
+
+    /* 7. Send sentry sleep command to LPC845 coprocessor ($f1;) */
+    vTaskDelay(100 / portTICK_RATE_MS);
+    hal_power_sleep_system();
 }
 
 /* Screen Rendering Engine */
@@ -793,18 +819,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         s_inactivity_ticks++;
         if (s_inactivity_ticks >= (120 * 20)) {
             storage_log_debug("UI", "2-minute inactivity timeout reached -> entering auto-sleep");
-            if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
-                lcd_command(0x0C);
-            }
-            s_ui_mode = UI_MODE_BROWSE;
-            lcd_command(0x08); /* Display OFF */
-            LPC_GPIO2->FIOCLR = MASK_LCD_BL; /* Backlight OFF */
-            hal_power_lcd_off(); /* Cut 5V LCD rail */
-            sim7600_power_off(); /* Power off modem to turn off NETLIGHT */
-            hal_power_sleep_system(); /* Sentry sleep command ($f1;) */
-            s_display_active = false;
-            s_operator_touched_key = false;
-            s_inactivity_ticks = 0;
+            ui_enter_sleep();
             return;
         }
     }
@@ -812,19 +827,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
     /* Global DSP key handler: Sleep display on demand */
     if (key == KEY_DSP) {
         storage_log_debug("UI", "Operator pressed DSP key -> entering sleep");
-        s_no_rf_popup_timer = 0;
-        if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
-            lcd_command(0x0C);
-        }
-        s_ui_mode = UI_MODE_BROWSE;
-        lcd_command(0x08);
-        LPC_GPIO2->FIOCLR = MASK_LCD_BL;
-        hal_power_lcd_off();
-        sim7600_power_off();
-        hal_power_sleep_system();
-        s_display_active = false;
-        s_operator_touched_key = false;
-        s_inactivity_ticks = 0;
+        ui_enter_sleep();
         return;
     }
 
@@ -1048,14 +1051,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 lcd_print("POWERING DOWN...");
                 vTaskDelay(1200 / portTICK_RATE_MS);
 
-                lcd_command(0x08); /* Display OFF */
-                LPC_GPIO2->FIOCLR = MASK_LCD_BL; /* Backlight OFF */
-                hal_power_lcd_off(); /* Cut LCD rail */
-                sim7600_power_off(); /* Cut modem rail */
-                hal_power_sleep_system(); /* Sentry sleep command ($f1;) */
-                s_display_active = false;
-                s_operator_touched_key = false;
-                s_inactivity_ticks = 0;
+                ui_enter_sleep();
                 return;
             }
         }

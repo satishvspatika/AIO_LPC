@@ -30,6 +30,7 @@ void ui_reset_activity_timer(void);
 bool ui_is_operator_active(void);
 bool ui_is_display_active(void);
 bool ui_is_operator_touched(void);
+void ui_enter_sleep(void);
 
 /* Backlog tracking */
 uint32_t ui_get_backlog_count(void);

@@ -927,9 +927,10 @@ static Bool rcvr_datablock (
 
 
 	Timer1 = 10;
+	uint32_t retries = 50000;
 	do {							/* Wait for data packet in timeout of 100ms */
 		token = rcvr_spi();
-	} while ((token == 0xFF) && Timer1);
+	} while ((token == 0xFF) && Timer1 && --retries);
 	if(token != 0xFE) return FALSE;	/* If not valid data token, return with error */
 
 #if ( SPI_SD_ACCESS_MODE == SPI_SD_USE_DMA )

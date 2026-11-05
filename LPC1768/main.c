@@ -202,48 +202,58 @@ static void vMain_Task(void *pvParameters)
     storage_log_debug("BOOT", bk_info);
 
     int last_transmitted_min = -1;
+    bool boot_initialized = false;
 
     for (;;) {
         telemetry_data_t telem;
         bool telem_ready = intermcu_get_telemetry(&telem);
 
         if (telem_ready && strlen(telem.present_time) >= 14 && strncmp(telem.present_time, "20", 2) == 0) {
+            int yr = (telem.present_time[0]-'0')*1000 + (telem.present_time[1]-'0')*100 + (telem.present_time[2]-'0')*10 + (telem.present_time[3]-'0');
             int min = (telem.present_time[10] - '0') * 10 + (telem.present_time[11] - '0');
             int sec = (telem.present_time[12] - '0') * 10 + (telem.present_time[13] - '0');
 
-            bool is_slot_boundary = (min % 15 == 0);
-
-            if (is_slot_boundary && (last_transmitted_min != min)) {
-                /* Slot boundary guard: ensure 62s have passed so sensors are settled */
-                if (sec < SLOT_HOLD_GUARD_SEC) {
-                    int wait_sec = SLOT_HOLD_GUARD_SEC - sec;
-                    char sched_msg[64];
-                    snprintf(sched_msg, sizeof(sched_msg), "Slot boundary %02d:00 reached, holding %ds", min, wait_sec);
-                    storage_log_debug("SCHED", sched_msg);
-                    for (int w = 0; w < wait_sec; w++) {
-                        vTaskDelay(1000 / portTICK_RATE_MS);
+            if (yr >= 2024) {
+                if (!boot_initialized) {
+                    boot_initialized = true;
+                    if (ui_is_display_active() || telem.usb_power_flag == 'U') {
+                        last_transmitted_min = min;
+                        storage_log_debug("SCHED", "Interactive boot detected: disarmed immediate boot slot transmission");
                     }
-                    /* Re-read fresh telemetry */
-                    intermcu_get_telemetry(&telem);
                 }
 
-                last_transmitted_min = min;
+                bool is_slot_boundary = (min % 15 == 0);
 
-                char trigger_msg[64];
-                snprintf(trigger_msg, sizeof(trigger_msg), "15-Minute Trigger fired for slot %02d (Time: %.14s)", min, telem.present_time);
-                storage_log_debug("SCHED", trigger_msg);
+                if (is_slot_boundary && (last_transmitted_min != min)) {
+                    /* Slot boundary guard: ensure 62s have passed so sensors are settled */
+                    if (sec < SLOT_HOLD_GUARD_SEC) {
+                        int wait_sec = SLOT_HOLD_GUARD_SEC - sec;
+                        char sched_msg[64];
+                        snprintf(sched_msg, sizeof(sched_msg), "Slot boundary %02d:00 reached, holding %ds", min, wait_sec);
+                        storage_log_debug("SCHED", sched_msg);
+                        for (int w = 0; w < wait_sec; w++) {
+                            vTaskDelay(1000 / portTICK_RATE_MS);
+                        }
+                        /* Re-read fresh telemetry */
+                        intermcu_get_telemetry(&telem);
+                    }
 
-                execute_slot_transmission(&telem);
+                    last_transmitted_min = min;
 
-                /* If operator has not touched keypad (unattended slot wakeup), sleep system */
-                if (!ui_is_operator_touched()) {
-                    storage_log_debug("PWR", "Slot transmission complete and no operator keypress -> sleeping ($f1;)");
-                    sim7600_power_off();
-                    storage_log_flush();
-                    vTaskDelay(200 / portTICK_RATE_MS);
-                    hal_power_sleep_system();
-                } else {
-                    storage_log_debug("PWR", "Operator active on keypad/LCD, remaining awake");
+                    char trigger_msg[64];
+                    snprintf(trigger_msg, sizeof(trigger_msg), "15-Minute Trigger fired for slot %02d (Time: %.14s)", min, telem.present_time);
+                    storage_log_debug("SCHED", trigger_msg);
+
+                    execute_slot_transmission(&telem);
+
+                    /* If station was woken in unattended sentry mode AND display is not active:
+                     * enter sleep. If operator is browsing or display is active, stay awake! */
+                    if (!ui_is_display_active() && !ui_is_operator_touched()) {
+                        storage_log_debug("PWR", "Unattended slot transmission complete -> entering sleep");
+                        ui_enter_sleep();
+                    } else {
+                        storage_log_debug("PWR", "Operator active on keypad/LCD, remaining awake");
+                    }
                 }
             }
         }

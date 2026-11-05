@@ -6,6 +6,7 @@
 #include "diskio.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -19,6 +20,26 @@ static char s_ring_buffer[RING_BUFFER_SIZE];
 static volatile uint16_t s_head = 0;
 static volatile uint16_t s_tail = 0;
 
+/* FreeRTOS Mutex for thread-safe FatFs access across tasks */
+static xSemaphoreHandle s_fs_mutex = NULL;
+
+static void fs_lock(void)
+{
+    if (!s_fs_mutex) {
+        s_fs_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_fs_mutex) {
+        xSemaphoreTake(s_fs_mutex, portMAX_DELAY);
+    }
+}
+
+static void fs_unlock(void)
+{
+    if (s_fs_mutex) {
+        xSemaphoreGive(s_fs_mutex);
+    }
+}
+
 /* Static FIL objects in .bss to avoid FreeRTOS task stack overflow (FIL is ~550 bytes) */
 static FIL s_drain_file;
 static FIL s_http_file;
@@ -27,8 +48,14 @@ static FIL s_backlog_file;
 
 void storage_log_init(void)
 {
+    if (!s_fs_mutex) {
+        s_fs_mutex = xSemaphoreCreateMutex();
+    }
+    fs_lock();
     FRESULT res = f_mount(0, &s_fatfs);
     s_fs_mounted = (res == FR_OK);
+    fs_unlock();
+
     if (s_fs_mounted) {
         storage_backlog_init();
     }
@@ -85,6 +112,7 @@ void storage_log_http(const char *entry)
 {
     if (!entry) return;
 
+    fs_lock();
     /* Ensure volume is mounted */
     if (!s_fs_mounted) {
         f_mount(0, &s_fatfs);
@@ -98,12 +126,14 @@ void storage_log_http(const char *entry)
         f_write(&s_http_file, "\r\n", 2, &bw);
         f_close(&s_http_file);
     }
+    fs_unlock();
 }
 
 void storage_log_drain_step(void)
 {
     if (s_head == s_tail) return; /* No data to flush */
 
+    fs_lock();
     /* Ensure FatFs object is registered */
     if (!s_fs_mounted) {
         f_mount(0, &s_fatfs);
@@ -139,6 +169,7 @@ void storage_log_drain_step(void)
         }
         taskEXIT_CRITICAL();
     }
+    fs_unlock();
 }
 
 void storage_log_flush(void)
@@ -153,6 +184,7 @@ bool storage_archive_slot(const char *date6, const char *record)
 {
     if (!date6 || !record) return false;
 
+    fs_lock();
     if (!s_fs_mounted) {
         f_mount(0, &s_fatfs);
         s_fs_mounted = true;
@@ -162,15 +194,17 @@ bool storage_archive_slot(const char *date6, const char *record)
     f_mkdir("DATA");
     snprintf(filepath, sizeof(filepath), "DATA/%s.TXT", date6);
 
+    bool ok = false;
     if (f_open(&s_archive_file, filepath, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
         f_lseek(&s_archive_file, s_archive_file.fsize);
         UINT bw;
         f_write(&s_archive_file, record, strlen(record), &bw);
         f_write(&s_archive_file, "\r\n", 2, &bw);
         f_close(&s_archive_file);
-        return true;
+        ok = true;
     }
-    return false;
+    fs_unlock();
+    return ok;
 }
 
 /* =========================================================================
@@ -199,11 +233,13 @@ bool storage_backlog_save(const char *slot_time, const char *payload)
 {
     if (!payload) return false;
 
+    fs_lock();
     if (!s_fs_mounted) {
         f_mount(0, &s_fatfs);
         s_fs_mounted = true;
     }
 
+    bool ok = false;
     if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
         f_lseek(&s_backlog_file, s_backlog_file.fsize);
 
@@ -218,22 +254,27 @@ bool storage_backlog_save(const char *slot_time, const char *payload)
         UINT bw;
         f_write(&s_backlog_file, &entry, sizeof(entry), &bw);
         f_close(&s_backlog_file);
+        ok = true;
+    }
+    fs_unlock();
 
+    if (ok) {
         ui_inc_backlog_count();
         storage_log_debug("BACKLOG", "Saved pending record to BACKLOG.DAT");
-        return true;
     }
-    return false;
+    return ok;
 }
 
 uint32_t storage_backlog_get_pending_count(void)
 {
+    fs_lock();
     if (!s_fs_mounted) {
         f_mount(0, &s_fatfs);
         s_fs_mounted = true;
     }
 
     if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ) != FR_OK) {
+        fs_unlock();
         return 0;
     }
 
@@ -247,6 +288,7 @@ uint32_t storage_backlog_get_pending_count(void)
         }
     }
     f_close(&s_backlog_file);
+    fs_unlock();
     return count;
 }
 
@@ -254,18 +296,21 @@ bool storage_backlog_get_next_unsent(uint32_t start_offset, uint32_t *out_offset
 {
     if (!out_offset || !out_payload || max_len == 0) return false;
 
+    fs_lock();
     if (!s_fs_mounted) {
         f_mount(0, &s_fatfs);
         s_fs_mounted = true;
     }
 
-    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ) != FR_OK) {
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ | FA_WRITE) != FR_OK) {
+        fs_unlock();
         return false;
     }
 
     if (start_offset > 0) {
         if (f_lseek(&s_backlog_file, start_offset) != FR_OK) {
             f_close(&s_backlog_file);
+            fs_unlock();
             return false;
         }
     }
@@ -282,38 +327,47 @@ bool storage_backlog_get_next_unsent(uint32_t start_offset, uint32_t *out_offset
                 strstr(entry.payload, "rainfall=&") != NULL ||
                 strstr(entry.payload, "rec_time=2026-01-01,00:00") != NULL) {
                 storage_log_debug("BACKLOG", "Discarding malformed legacy backlog record");
-                uint32_t bad_pos = current_pos;
-                f_close(&s_backlog_file);
-                storage_backlog_mark_sent(bad_pos);
-                return storage_backlog_get_next_unsent(start_offset, out_offset, out_payload, max_len);
+                f_lseek(&s_backlog_file, current_pos);
+                uint8_t sent_flag = 1;
+                UINT bw;
+                f_write(&s_backlog_file, &sent_flag, 1, &bw);
+                f_lseek(&s_backlog_file, current_pos + sizeof(entry));
+                ui_dec_backlog_count();
+                current_pos = s_backlog_file.fptr;
+                continue;
             }
 
             *out_offset = current_pos;
             strncpy(out_payload, entry.payload, max_len - 1);
             out_payload[max_len - 1] = '\0';
             f_close(&s_backlog_file);
+            fs_unlock();
             return true;
         }
         current_pos = s_backlog_file.fptr;
     }
 
     f_close(&s_backlog_file);
+    fs_unlock();
     return false;
 }
 
 bool storage_backlog_mark_sent(uint32_t entry_offset)
 {
+    fs_lock();
     if (!s_fs_mounted) {
         f_mount(0, &s_fatfs);
         s_fs_mounted = true;
     }
 
     if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_WRITE) != FR_OK) {
+        fs_unlock();
         return false;
     }
 
     if (f_lseek(&s_backlog_file, entry_offset) != FR_OK) {
         f_close(&s_backlog_file);
+        fs_unlock();
         return false;
     }
 
@@ -321,6 +375,7 @@ bool storage_backlog_mark_sent(uint32_t entry_offset)
     UINT bw;
     f_write(&s_backlog_file, &sent_flag, 1, &bw);
     f_close(&s_backlog_file);
+    fs_unlock();
 
     ui_dec_backlog_count();
     return true;
@@ -329,14 +384,18 @@ bool storage_backlog_mark_sent(uint32_t entry_offset)
 void storage_backlog_cleanup_if_all_sent(void)
 {
     if (storage_backlog_get_pending_count() == 0) {
+        fs_lock();
         f_unlink(BACKLOG_FILENAME);
+        fs_unlock();
         storage_log_debug("BACKLOG", "All backlogs sent, reclaimed BACKLOG.DAT");
     }
 }
 
 void storage_backlog_clear_all(void)
 {
+    fs_lock();
     f_unlink(BACKLOG_FILENAME);
+    fs_unlock();
     ui_set_backlog_count(0);
     storage_log_debug("BACKLOG", "Backlog file erased (Erase Data)");
 }
