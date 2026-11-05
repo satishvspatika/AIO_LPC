@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.2.8"
+#define FIRMWARE_VERSION    "v6.2.9"
 #define STATION_ID_DEFAULT  "001061"
 
 /* Status SMS Destination & Network Identifiers */
@@ -36,6 +36,12 @@
 #define SDC_DEBUG_DUMP_DEFAULT  1       /* 1 = verbose debug dump enabled by default */
 #define DEBUG_LOG_FILENAME      "DEBUG.TXT"
 #define HTTP_LOG_FILENAME       "HTTPLOG.TXT"
+#define SLOT_LOG_FILENAME       "SLOTS.CSV"
+#define LAST_LOGGED_FILENAME    "LASTLOG.DAT"
+#define RAT_MODE_FILENAME       "RATMODE.DAT"
+#define LAST_SLOT_FILENAME      "LASTSLOT.DAT"
+#define FLASH_SYNC_FILENAME     "FLASHSYN.DAT"
+#define SD_CHECK_FILENAME       "SDCHECK.DAT"
 #define DEBUG_TRIGGER_FILENAME  "DEBUG.TXT"
 
 /* Timing & Safety Watchdog Limits (in milliseconds) */
@@ -45,7 +51,13 @@
 #define SLOT_HOLD_GUARD_SEC     62                /* 62s minimum slot boundary guard */
 
 /* Rainfall Parameters */
-#define RF_BUCKET_RESOLUTION   0.25f   /* mm per bucket tip (0.25 mm standard) */
+#define RF_BUCKET_RESOLUTION   0.50f   /* mm per bucket tip */
+
+/* Sensor Scaling (same as the ESP32): the LPC845 sends raw counts */
+#define WS_CALIBRATION_FACTOR  0.45f   /* Metres per anemometer revolution */
+#define WIND_TEETH_COUNT       2.0f    /* Pulses per revolution */
+#define WIND_DIR_ADC_MIN       140
+#define WIND_DIR_ADC_MAX       3950
 
 #endif /* USER_CONFIG_H */
 

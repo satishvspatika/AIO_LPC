@@ -6,6 +6,11 @@
 #include <stddef.h>
 
 void storage_log_init(void);
+/* Touches the SD card, so call from a task: the card's timers need the scheduler running */
+void storage_log_mount(void);
+/* Really writes to the card, because the socket has no card-detect pin. Also recovers a card
+ * that was refitted. */
+bool storage_sd_is_ok(void);
 void storage_log_timer_step_10ms(void);
 void storage_log_drain_step(void);
 void storage_log_flush(void);
@@ -14,8 +19,15 @@ void storage_log_flush(void);
 void storage_log_debug(const char *tag, const char *msg);
 void storage_log_http(const char *entry);
 
+/* One CSV line per 15-minute slot in SLOTS.CSV, for auditing gaps */
+void storage_log_slot(const char *csv_line);
+
+/* Small state files. Saves overwrite in place, so keep each file's text a fixed length. */
+bool storage_state_load(const char *filename, char *out, size_t size);
+bool storage_state_save(const char *filename, const char *text);
+
 /* 15-minute raw sensor archive */
-bool storage_archive_slot(const char *date6, const char *record);
+bool storage_archive_slot(const char *day_file, const char *record);
 
 /* Backlog Management on SD Card */
 void storage_backlog_init(void);

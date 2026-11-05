@@ -139,6 +139,33 @@ const char *flash_nvram_get_last_logged(void)
     return s_active_last_logged;
 }
 
+const char *flash_nvram_get_calib_result(void)
+{
+    const char *stored = (const char *)(PARAM_SECTOR_ADDR + offsetof(station_nvram_params_t, calib_result));
+    return (stored[0] >= '0' && stored[0] <= '9') ? stored : "";
+}
+
+bool flash_nvram_set_calib_result(const char *result)
+{
+    if (!result) return false;
+
+    static uint8_t sector_buf[256] __attribute__((aligned(4)));
+    memcpy(sector_buf, (const void *)PARAM_SECTOR_ADDR, 256);
+
+    size_t offset = offsetof(station_nvram_params_t, calib_result);
+    memset(sector_buf + offset, 0, sizeof(((station_nvram_params_t *)0)->calib_result));
+    strncpy((char *)(sector_buf + offset), result, sizeof(((station_nvram_params_t *)0)->calib_result) - 1);
+
+    return iap_write_sector1(sector_buf, 256);
+}
+
+void flash_nvram_note_last_logged(const char *last_logged_str)
+{
+    if (!last_logged_str || strlen(last_logged_str) < 5) return;
+    strncpy(s_active_last_logged, last_logged_str, sizeof(s_active_last_logged) - 1);
+    s_active_last_logged[sizeof(s_active_last_logged) - 1] = '\0';
+}
+
 bool flash_nvram_set_last_logged(const char *last_logged_str)
 {
     if (!last_logged_str || strlen(last_logged_str) < 5) return false;

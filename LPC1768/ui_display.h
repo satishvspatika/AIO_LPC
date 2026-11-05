@@ -32,6 +32,16 @@ bool ui_is_display_active(void);
 bool ui_is_operator_touched(void);
 void ui_enter_sleep(void);
 
+/* Boot type, known once the LPC845's first status frame arrives (within about 3s) */
+bool ui_is_boot_mode_known(void);
+bool ui_was_scheduled_boot(void);
+
+/* While a slot is running the UI may not power the system down */
+void ui_set_slot_busy(bool busy);
+
+/* Implemented by the slot scheduler in main.c */
+bool slot_scheduler_is_due(void);
+
 /* Backlog tracking */
 uint32_t ui_get_backlog_count(void);
 void ui_set_backlog_count(uint32_t count);

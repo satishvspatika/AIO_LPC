@@ -2,6 +2,7 @@
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
 #include <string.h>
+#include <stdio.h>
 
 static volatile bool s_is_5v_on = true;
 static volatile bool s_is_modem_on = false;
@@ -40,8 +41,8 @@ void hal_power_init(void)
     NVIC_SetPriority(UART3_IRQn, 6);
     NVIC_EnableIRQ(UART3_IRQn);
 
-    /* Ensure 5V LCD power rail is active on LPC845 coprocessor */
-    hal_power_lcd_on();
+    /* Don't touch the LCD rail here: its state in the LPC845's first status frame is
+     * how the UI tells a scheduled wake (off) from an operator wake (on). */
 }
 
 static void send_intermcu_cmd(const char *cmd)
@@ -71,6 +72,33 @@ void hal_power_modem_off(void)
 {
     send_intermcu_cmd("$f2;\012");
     s_is_modem_on = false;
+}
+
+void hal_power_request_record(const char *timestamp14)
+{
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "$G%.14s;\012", timestamp14);
+    send_intermcu_cmd(cmd);
+}
+
+void hal_power_calib_start(void)
+{
+    send_intermcu_cmd("$C;\012");
+}
+
+void hal_power_calib_stop(void)
+{
+    send_intermcu_cmd("$c;\012");
+}
+
+void hal_power_rain_reset(void)
+{
+    send_intermcu_cmd("$R;\012");
+}
+
+void hal_power_heartbeat(void)
+{
+    send_intermcu_cmd("$H;\012");
 }
 
 void hal_power_sleep_system(void)

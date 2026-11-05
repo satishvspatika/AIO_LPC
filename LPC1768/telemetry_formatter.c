@@ -40,6 +40,22 @@ const http_endpoint_t* telemetry_get_endpoint(int config_id)
     return &s_endpoints[config_id];
 }
 
+void fmt_fixed(char *out, size_t size, float val, int width, int decimals)
+{
+    long scale = 1;
+    for (int i = 0; i < decimals; i++) {
+        scale *= 10;
+    }
+
+    bool negative = (val < 0.0f);
+    long scaled = (long)((negative ? -val : val) * scale + 0.5f);
+    int int_width = width - decimals - 1 - (negative ? 1 : 0);
+    if (int_width < 1) {
+        int_width = 1;
+    }
+    snprintf(out, size, "%s%0*ld.%0*ld", negative ? "-" : "", int_width, scaled / scale, decimals, scaled % scale);
+}
+
 /* Helper to format Station ID into exactly 6 zero-padded digits (e.g. "1061" -> "001061") */
 static void format_stn_id_6(char *out, size_t out_size, const char *stn_id)
 {
@@ -165,12 +181,11 @@ int format_payload_ksndmc_trg(char *dest, size_t dest_size, const char *stn_id, 
     fmt_signal_4(s_sig,  csq_dbm);
 
     return snprintf(dest, dest_size,
-        "stn_id=%s&rec_time=%s,%s&rainfall=%s&signal=%s&key=pse2420&bat_volt=%s&bat_volt1=%s",
+        "stn_id=%s&rec_time=%s,%s&rainfall=%s&signal=%s&bat_volt=%s&key=pse2420",
         clean_stn,
         date_buf, time_buf,
         s_rf,
         s_sig,
-        s_bat,
         s_bat
     );
 }
@@ -208,23 +223,57 @@ int format_payload_ksndmc_tws(char *dest, size_t dest_size, const char *stn_id, 
     char date_buf[12], time_buf[8];
     extract_slot_timestamp(data, date_buf, time_buf);
 
-    char s_temp[8], s_hum[8], s_ws[8], s_wd[8], s_bat[8], s_sig[8];
+    char s_temp[8], s_hum[8], s_ws[8], s_wd[8], s_bat[8];
     fmt_float_5_1(s_temp, data ? data->temp_c : 0.0f);
     fmt_float_5_1(s_hum,  data ? data->humidity_pct : 0.0f);
     fmt_float_4_1(s_ws,   data ? data->wind_speed_avg : 0.0f);
     fmt_uint_3(s_wd,      data ? data->wind_dir_deg : 0);
     fmt_float_5_2(s_bat,  data ? data->bat1_volt : 0.0f);
-    fmt_signal_4(s_sig,   csq_dbm);
 
+    /* TWS signal is plain %d (-73), unlike the zero-padded TRG field (-073) */
     return snprintf(dest, dest_size,
-        "stn_no=%s&rec_time=%s,%s&temp=%s&humid=%s&w_speed=%s&w_dir=%s&signal=%s&bat_volt=%s&key=climate4pTWS",
+        "stn_no=%s&rec_time=%s,%s&temp=%s&humid=%s&w_speed=%s&w_dir=%s&signal=%d&bat_volt=%s&key=climate4pTWS",
         clean_stn,
         date_buf, time_buf,
         s_temp,
         s_hum,
         s_ws,
         s_wd,
-        s_sig,
+        csq_dbm,
         s_bat
     );
+}
+
+void format_station_id(char *out, size_t size, const char *stn_id)
+{
+    format_stn_id_6(out, size, stn_id);
+}
+
+int format_sd_record(char *dest, size_t dest_size, const telemetry_data_t *data, int csq_dbm)
+{
+    char date_buf[12], time_buf[8];
+    extract_slot_timestamp(data, date_buf, time_buf);
+
+    /* Rain-day sample number: 08:45 is 00, 08:30 next day is 95 */
+    int hour = (time_buf[0] - '0') * 10 + (time_buf[1] - '0');
+    int minute = (time_buf[3] - '0') * 10 + (time_buf[4] - '0');
+    int sample_no = ((hour * 60 + minute) / 15 + 61) % 96;
+
+    char s_bat[8];
+    fmt_fixed(s_bat, sizeof(s_bat), data->bat1_volt, 5, 2);
+
+    #if (UNIT_CFG == KSNDMC_TWS)
+    char s_temp[8], s_hum[8], s_ws[8];
+    fmt_fixed(s_temp, sizeof(s_temp), data->temp_c, 5, 1);
+    fmt_fixed(s_hum, sizeof(s_hum), data->humidity_pct, 5, 1);
+    fmt_fixed(s_ws, sizeof(s_ws), data->wind_speed_avg, 4, 1);
+    return snprintf(dest, dest_size, "%02d,%s,%s,%s,%s,%s,%03d,%04d,%s",
+                    sample_no, date_buf, time_buf, s_temp, s_hum, s_ws, data->wind_dir_deg % 1000, csq_dbm, s_bat);
+    #else
+    char s_rf15[8], s_cum[8];
+    fmt_fixed(s_rf15, sizeof(s_rf15), data->rf_15m_mm, 6, 2);
+    fmt_fixed(s_cum, sizeof(s_cum), data->rf_cum_mm, 6, 2);
+    return snprintf(dest, dest_size, "%02d,%s,%s,%s,%s,%04d,%s",
+                    sample_no, date_buf, time_buf, s_rf15, s_cum, csq_dbm, s_bat);
+    #endif
 }

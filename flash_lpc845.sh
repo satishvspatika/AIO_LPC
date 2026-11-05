@@ -79,11 +79,39 @@ if [ "$FLASHER" = "LINKSERVER" ]; then
     pkill -9 -f redlinkserv 2>/dev/null || true
 
 elif [ "$FLASHER" = "PYOCD" ]; then
+    # The chip is often only reachable for a moment (for example just after power-up), so keep
+    # trying quickly: toggle board power or pulse RESET while this runs.
     echo "1. Programming LPC845 firmware via PyOCD..."
-    ${PYOCD} flash -t lpc845 --erase chip "${HEX}"
+    echo "   Retrying for up to 3 minutes. Now toggle board power OFF then ON, or pulse RESET (J2 pin 4) to GND."
+
+    FLASH_LOG="$(mktemp)"
+    FLASHED=0
+    ATTEMPT=0
+    START=$(date +%s)
+    while [ $(( $(date +%s) - START )) -lt 180 ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        if ${PYOCD} flash -t lpc845 -f 1000000 --erase chip "${HEX}" > "${FLASH_LOG}" 2>&1; then
+            FLASHED=1
+            break
+        fi
+        if [ $((ATTEMPT % 20)) -eq 0 ]; then
+            echo "   ...${ATTEMPT} attempts, $(( $(date +%s) - START ))s, still no connection"
+        fi
+    done
+
+    if [ $FLASHED -eq 0 ]; then
+        echo ""
+        echo "[ERROR] LPC845 did not answer in ${ATTEMPT} attempts. Last message:"
+        tail -1 "${FLASH_LOG}"
+        rm -f "${FLASH_LOG}"
+        exit 1
+    fi
+    echo "   Connected and programmed on attempt ${ATTEMPT}, after $(( $(date +%s) - START ))s"
+    tail -1 "${FLASH_LOG}"
+    rm -f "${FLASH_LOG}"
 
     echo "2. Issuing Hardware Reset..."
-    ${PYOCD} reset -t lpc845
+    ${PYOCD} reset -t lpc845 || true
 fi
 
 echo "=== LPC845 Flashed, Verified, and Running! ==="

@@ -4,6 +4,8 @@
 #include "flash_nvram.h"
 #include "intermcu_protocol.h"
 #include "storage_log.h"
+#include "telemetry_formatter.h"
+#include "flash_log.h"
 #include "user_config.h"
 #include "lpc17xx_gpio.h"
 #include "lpc17xx_pinsel.h"
@@ -141,8 +143,48 @@ typedef enum {
     UI_MODE_BROWSE = 0,
     UI_MODE_EDIT_STN_ID,
     UI_MODE_CALIB,
-    UI_MODE_ERASE_CONFIRM
+    UI_MODE_ERASE_CONFIRM,
+    UI_MODE_MENU,
+    UI_MODE_SLEEP_CONFIRM,
+    UI_MODE_KEY_TEST
 } ui_mode_t;
+
+/* MENU key: operator shortcuts. Screen items jump to that screen, so actions such as
+ * Send Status and Erase Data keep their own EN confirmation step. */
+typedef enum {
+    MENU_GOTO_SCREEN = 0,
+    MENU_KEY_TEST,
+    MENU_POWER_SAVE
+} menu_action_t;
+
+typedef struct {
+    const char *label; /* Max 15 characters: shown after ">" on line 2 */
+    menu_action_t action;
+    screen_type_t screen;
+} menu_item_t;
+
+static const menu_item_t s_menu_items[] = {
+    { "STATION ID",      MENU_GOTO_SCREEN, SCR_STATION_ID },
+    #if (UNIT_CFG == KSNDMC_TWS)
+    { "LIVE READINGS",   MENU_GOTO_SCREEN, SCR_TEMP_HUM },
+    #else
+    { "RAINFALL",        MENU_GOTO_SCREEN, SCR_RAINFALL },
+    #endif
+    { "POWER STATUS",    MENU_GOTO_SCREEN, SCR_BATTERY },
+    { "NETWORK SIGNAL",  MENU_GOTO_SCREEN, SCR_SIGNAL },
+    { "DATA LOGGING",    MENU_GOTO_SCREEN, SCR_LAST_LOGGED },
+    { "SEND STATUS SMS", MENU_GOTO_SCREEN, SCR_SEND_STATUS },
+    #if (UNIT_CFG != KSNDMC_TWS)
+    { "FIELD CALIB",     MENU_GOTO_SCREEN, SCR_FIELD_CALIB },
+    #endif
+    { "ERASE DATA",      MENU_GOTO_SCREEN, SCR_ERASE_DATA },
+    { "KEY TEST",        MENU_KEY_TEST,    SCR_STATION_ID },
+    { "POWER SAVE",      MENU_POWER_SAVE,  SCR_STATION_ID }
+};
+#define NUM_MENU_ITEMS (sizeof(s_menu_items) / sizeof(s_menu_items[0]))
+
+#define SLEEP_CONFIRM_TIMEOUT_TICKS (10 * 20) /* 10s of 50ms UI ticks */
+#define KEY_TEST_TIMEOUT_TICKS      (15 * 20) /* 15s of 50ms UI ticks */
 
 /* Status SMS UI State */
 typedef enum {
@@ -155,19 +197,28 @@ typedef enum {
 static bool s_lcd_initialized = false;
 static bool s_display_active = true;
 static volatile bool s_system_asleep = false;
+static volatile bool s_boot_mode_known = false;
+static volatile bool s_scheduled_boot = false;
+static volatile bool s_slot_busy = false;
+static bool s_sleep_deferred = false;
+static uint32_t s_boot_wait_ticks = 0;
+static uint32_t s_lcd_rail_off_ticks = 0;
 static bool s_operator_touched_key = false;
-static uint32_t s_inactivity_ticks = 0; /* 50ms ticks, 2 mins = 2400 */
+static uint32_t s_inactivity_ticks = 0; /* 50ms ticks */
 static size_t s_current_screen_idx = 0;
 
 static ui_mode_t s_ui_mode = UI_MODE_BROWSE;
 static char s_edit_stn_id[8] = "000000";
 static int s_edit_pos = 0;
+static size_t s_menu_pos = 0;
+static ui_mode_t s_mode_before_confirm = UI_MODE_BROWSE;
+static uint32_t s_mode_timeout_ticks = 0;
+static key_code_t s_key_test_last = KEY_NONE;
 
-/* Calibration State */
-static int s_calib_tips = 0;
-static uint16_t s_calib_last_raw_tips = 0;
-static bool s_calib_status_pass = true;
-static char s_calib_last_date[16] = "2026-01-01";
+/* Field Calibration (ESP32 flow): runs up to 5 minutes, exactly 10 tips is a pass */
+#define CALIB_TIMEOUT_TICKS (5 * 60 * 20)
+#define CALIB_PASS_TIPS     10
+static uint32_t s_calib_ticks = 0;
 
 /* Status SMS Feedback & Background Worker */
 static status_ui_state_t s_status_sms_state = STATUS_UI_IDLE;
@@ -504,18 +555,17 @@ static int Kbd_Scan(void)
     LPC_GPIO3->FIOSET = (KBD_ROW0_MASK | KBD_ROW1_MASK);
     LPC_GPIO1->FIOSET = KBD_ROW2_MASK;
 
-    /* 2. Baseline qualification: Read columns while ALL rows are driven HIGH.
-     * If all 3 column lines read 0, the front-panel 5V rail is off or unpowered.
-     * Discard immediately to prevent phantom keys on power-down transitions. */
-    uint32_t baseline_port0 = LPC_GPIO0->FIOPIN;
-    if ((baseline_port0 & (KBD_COL0_MASK | KBD_COL1_MASK | KBD_COL2_MASK)) == 0) {
-        return 0; /* Whole bus low: unpowered display or floating rail */
-    }
+    delay_us(500);
+
+    /* 2. Baseline check (as in v6.1.9): with ALL rows HIGH every column must read
+     * HIGH. A column already LOW is not a keypress on the row being scanned, for
+     * example when the LPC845 is holding ROW2 low, so ignore that column. */
+    uint32_t stuck_cols = ~LPC_GPIO0->FIOPIN;
 
     /* 3. Scan rows 0..2 */
     for (int iRow_No = 0; iRow_No < 3; iRow_No++) {
         Output_Row(iRow_No);
-        delay_us(100); /* 100us settling delay (fast & avoids FreeRTOS task yield) */
+        delay_us(1000); /* Row settling delay from v6.1.9 */
         uint32_t port0 = LPC_GPIO0->FIOPIN;
 
         /* Restore rows to HIGH immediately after reading columns */
@@ -523,13 +573,13 @@ static int Kbd_Scan(void)
         LPC_GPIO1->FIOSET = KBD_ROW2_MASK;
 
         /* Check columns: Col 0 = P0.22, Col 1 = P0.21, Col 2 = P0.20 */
-        if ((port0 & KBD_COL0_MASK) == 0) {
+        if ((port0 & KBD_COL0_MASK) == 0 && !(stuck_cols & KBD_COL0_MASK)) {
             iKey_Value = iRow_No * 3 + 1;
             break;
-        } else if ((port0 & KBD_COL1_MASK) == 0) {
+        } else if ((port0 & KBD_COL1_MASK) == 0 && !(stuck_cols & KBD_COL1_MASK)) {
             iKey_Value = iRow_No * 3 + 2;
             break;
-        } else if ((port0 & KBD_COL2_MASK) == 0) {
+        } else if ((port0 & KBD_COL2_MASK) == 0 && !(stuck_cols & KBD_COL2_MASK)) {
             iKey_Value = iRow_No * 3 + 3;
             break;
         }
@@ -545,55 +595,75 @@ static int Kbd_Scan(void)
 static void vKbd_Task(void *pvParameters)
 {
     (void)pvParameters;
-    int iOld_Key = 0;
-    int iNew_Key = 0;
-    int iDebounce_Count = 0;
-    int iKey_Pressed = 0;
+    int iLast_Raw = 0;
+    int iLatched_Key = 0;
+    uint32_t debounce_count = 0;
+    uint32_t hold_ticks = 0;
     bool pins_released = false;
+    /* DSP may still be held from waking the unit: ignore keys until all are released,
+     * otherwise that same press would open the power save prompt straight after boot. */
+    bool wait_for_release = true;
 
     keypad_init_hw();
-    vTaskDelay(300 / portTICK_RATE_MS);
+    vTaskDelay(50 / portTICK_RATE_MS);
 
     for (;;) {
-        vTaskDelay(10 / portTICK_RATE_MS);
+        vTaskDelay(50 / portTICK_RATE_MS); /* Scan interval from v6.1.9 */
 
-        if (!s_display_active || s_system_asleep) {
+        /* Keep scanning during a scheduled wake with the LCD off: any key turns the LCD on */
+        if (s_system_asleep) {
             if (!pins_released) {
                 kbd_release_pins_for_sleep();
                 pins_released = true;
-                iOld_Key = 0;
-                iDebounce_Count = 0;
+                iLast_Raw = 0;
+                iLatched_Key = 0;
+                debounce_count = 0;
+                hold_ticks = 0;
             }
             vTaskDelay(200 / portTICK_RATE_MS);
             continue;
         } else if (pins_released) {
             keypad_init_hw();
             pins_released = false;
-            iOld_Key = 0;
-            iDebounce_Count = 0;
+            wait_for_release = true;
             vTaskDelay(50 / portTICK_RATE_MS);
         }
 
-        /* Scan matrix with golden TWS5 counter-based debouncer */
-        iNew_Key = Kbd_Scan();
-        if (iNew_Key) {
-            if (iNew_Key != iOld_Key) {
-                iOld_Key = iNew_Key;
-                iDebounce_Count = 2; /* 20ms debounce (2 samples of 10ms) */
-            } else if (iDebounce_Count > 0) {
-                iDebounce_Count--;
-                if (iDebounce_Count == 0) {
-                    iKey_Pressed = iNew_Key;
-                }
+        /* v6.1.9 debounce: accept a key after 2 matching scans (~100ms) */
+        int iRaw = Kbd_Scan();
+        if (wait_for_release) {
+            if (iRaw == 0) {
+                wait_for_release = false;
             }
-
-            if (iKey_Pressed) {
-                g_dbg_last_key = (uint32_t)iKey_Pressed;
-                kbd_fifo_put((key_code_t)iKey_Pressed);
-                iKey_Pressed = 0;
+            continue;
+        }
+        if (iRaw) {
+            if (iRaw == iLast_Raw) {
+                debounce_count++;
+                if (debounce_count == 2) {
+                    iLatched_Key = iRaw;
+                    hold_ticks = 0;
+                    g_dbg_last_key = (uint32_t)iRaw;
+                    kbd_fifo_put((key_code_t)iRaw);
+                } else if (debounce_count > 2 && iLatched_Key == iRaw) {
+                    /* Auto-repeat after 500ms, every 150ms. Arrow keys only: repeating
+                     * EN could confirm an erase or a Station ID save from one long press.
+                     */
+                    hold_ticks++;
+                    if (hold_ticks >= 10 && (hold_ticks % 3) == 0 &&
+                        (iRaw == KEY_UP || iRaw == KEY_DOWN || iRaw == KEY_LEFT || iRaw == KEY_RIGHT)) {
+                        kbd_fifo_put((key_code_t)iRaw);
+                    }
+                }
+            } else {
+                iLast_Raw = iRaw;
+                debounce_count = 1;
             }
         } else {
-            iOld_Key = 0;
+            iLast_Raw = 0;
+            iLatched_Key = 0;
+            debounce_count = 0;
+            hold_ticks = 0;
         }
     }
 }
@@ -621,7 +691,6 @@ bool ui_is_operator_touched(void)
 void ui_display_init(void)
 {
     keypad_init_hw();
-    hal_power_lcd_on();
     lcd_init_hw();
     s_current_screen_idx = 0;
     s_ui_mode = UI_MODE_BROWSE;
@@ -631,7 +700,6 @@ void ui_display_init(void)
     s_anim_counter = 0;
     strncpy(s_status_sms_substep, "PRESS EN TO SEND", sizeof(s_status_sms_substep) - 1);
     sim7600_set_progress_callback(on_sms_progress);
-    s_calib_tips = 0;
     s_display_active = true;
     s_system_asleep = false;
     s_operator_touched_key = false;
@@ -654,8 +722,35 @@ void ui_display_init(void)
     render_screen(s_screens[0], &telem, &mstat);
 }
 
+bool ui_is_boot_mode_known(void)
+{
+    return s_boot_mode_known;
+}
+
+bool ui_was_scheduled_boot(void)
+{
+    return s_scheduled_boot;
+}
+
+void ui_set_slot_busy(bool busy)
+{
+    s_slot_busy = busy;
+}
+
 void ui_enter_sleep(void)
 {
+    if (s_system_asleep) {
+        return;
+    }
+
+    /* Never power down over a 15-minute slot */
+    if (s_slot_busy || slot_scheduler_is_due()) {
+        storage_log_debug("PWR", "Sleep refused: 15-minute slot is due or running");
+        s_inactivity_ticks = 0;
+        return;
+    }
+
+    bool was_display_active = s_display_active;
     storage_log_debug("PWR", "Entering sleep: shutting down UI, modem, and sending $f7;");
 
     /* 1. Mark system and display asleep */
@@ -677,12 +772,14 @@ void ui_enter_sleep(void)
     }
     s_ui_mode = UI_MODE_BROWSE;
 
-    /* 4. Display sleep banner on LCD */
-    lcd_command(0x80);
-    lcd_print("POWERING DOWN...");
-    lcd_command(0xC0);
-    lcd_print("DSP KEY TO WAKE ");
-    vTaskDelay(1200 / portTICK_RATE_MS);
+    /* 4. Display sleep banner on LCD (it has no power during a scheduled wake) */
+    if (was_display_active) {
+        lcd_command(0x80);
+        lcd_print("POWERING DOWN...");
+        lcd_command(0xC0);
+        lcd_print("DSP KEY TO WAKE ");
+        vTaskDelay(1200 / portTICK_RATE_MS);
+    }
 
     /* 5. Clear LCD and turn off display & backlight */
     lcd_command(0x01);
@@ -706,7 +803,23 @@ void ui_enter_sleep(void)
     /* 10. Cut LCD 5V rail and send full power cut command ($f7;) to LPC845 coprocessor */
     hal_power_lcd_off();
     vTaskDelay(100 / portTICK_RATE_MS);
+
+    /* Shutting down took a few seconds: if a slot came due meanwhile, $f7 would cut power
+     * until the next slot. Restart instead, and the scheduler will send this one. */
+    if (slot_scheduler_is_due()) {
+        storage_log_debug("PWR", "Slot came due during shutdown: restarting instead of sleeping");
+        storage_log_flush();
+        NVIC_SystemReset();
+    }
+
+    storage_log_debug("PWR", "Power cut command $f7 sent to LPC845");
+    storage_log_flush();
     hal_power_sleep_system(); /* Sends $f7;\012 */
+
+    /* Status frames already on their way still carry the old rail flags. Let them pass, or
+     * one would look like the LPC845 waking us straight back up. */
+    vTaskDelay(3000 / portTICK_RATE_MS);
+    intermcu_clear_power_flags();
 
     /* 11. Sentry sleep loop:
      * On battery, LPC845 cuts LPC1768 power rail and system shuts down completely.
@@ -728,17 +841,35 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
 {
     char line1[17] = "";
     char line2[17] = "";
+    char num[8];
 
     if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
         snprintf(line1, sizeof(line1), "SET STATION ID  ");
         snprintf(line2, sizeof(line2), "ID: %-6.6s      ", s_edit_stn_id);
     } else if (s_ui_mode == UI_MODE_CALIB) {
-        float rf_mm = s_calib_tips * RF_BUCKET_RESOLUTION;
-        snprintf(line1, sizeof(line1), "CALIB: TIPS   RF");
-        snprintf(line2, sizeof(line2), "Count:%-3d %3d.%02dmm", s_calib_tips, (int)rf_mm, (int)((rf_mm - (int)rf_mm) * 100));
+        int tips = intermcu_get_calib_tips();
+        fmt_fixed(num, sizeof(num), tips * RF_BUCKET_RESOLUTION, 4, 2);
+        snprintf(line1, sizeof(line1), "Count     RF(mm)");
+        snprintf(line2, sizeof(line2), "%-5d     %-6s", tips, num);
     } else if (s_ui_mode == UI_MODE_ERASE_CONFIRM) {
         snprintf(line1, sizeof(line1), "ARE YOU SURE?   ");
         snprintf(line2, sizeof(line2), "PRESS EN: CONFIRM");
+    } else if (s_ui_mode == UI_MODE_MENU) {
+        snprintf(line1, sizeof(line1), "MENU       %02u/%02u", (unsigned int)(s_menu_pos + 1), (unsigned int)NUM_MENU_ITEMS);
+        snprintf(line2, sizeof(line2), ">%-15.15s", s_menu_items[s_menu_pos].label);
+    } else if (s_ui_mode == UI_MODE_SLEEP_CONFIRM) {
+        snprintf(line1, sizeof(line1), "POWER SAVE MODE?");
+        snprintf(line2, sizeof(line2), "EN=YES  OTHER=NO");
+    } else if (s_ui_mode == UI_MODE_KEY_TEST) {
+        static const char *const key_names[] = {
+            "", "MENU", "UP", "CALIB", "LEFT", "ENTER", "RIGHT", "BACK", "DOWN", "DSP"
+        };
+        snprintf(line1, sizeof(line1), "KEY TEST BACK x2");
+        if (s_key_test_last == KEY_NONE) {
+            snprintf(line2, sizeof(line2), "PRESS ANY KEY");
+        } else {
+            snprintf(line2, sizeof(line2), "%-6s K:%d", key_names[s_key_test_last], (int)s_key_test_last);
+        }
     } else {
         switch (scr) {
             case SCR_STATION_ID:
@@ -747,7 +878,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 #elif (UNIT_CFG == BIHAR_TRG)
                 snprintf(line1, sizeof(line1), "BIHAR - TRG");
                 #else
-                snprintf(line1, sizeof(line1), "KSNDMC-TWS  K:%-2u", (unsigned int)g_dbg_last_key);
+                snprintf(line1, sizeof(line1), "KSNDMC - TWS");
                 #endif
                 snprintf(line2, sizeof(line2), "ID:%-6s %s", flash_nvram_get_station_id(), FIRMWARE_VERSION);
                 break;
@@ -767,35 +898,43 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
             case SCR_RAINFALL:
                 #if (UNIT_CFG == BIHAR_TRG)
                 /* BIHAR_TRG shows both 15M and Cumulative Rainfall */
-                snprintf(line1, sizeof(line1), "RF 15M: %04.1f mm", telemetry->rf_15m_mm);
-                snprintf(line2, sizeof(line2), "CUM RF: %04.1f mm", telemetry->rf_cum_mm);
+                fmt_fixed(num, sizeof(num), telemetry->rf_15m_mm, 4, 1);
+                snprintf(line1, sizeof(line1), "RF 15M: %s mm", num);
+                fmt_fixed(num, sizeof(num), telemetry->rf_cum_mm, 4, 1);
+                snprintf(line2, sizeof(line2), "CUM RF: %s mm", num);
                 #else
                 /* KSNDMC_TRG shows ONLY Cumulative Rainfall */
                 snprintf(line1, sizeof(line1), "CUM RAINFALL    ");
-                snprintf(line2, sizeof(line2), "    %04.1f mm    ", telemetry->rf_cum_mm);
+                fmt_fixed(num, sizeof(num), telemetry->rf_cum_mm, 4, 1);
+                snprintf(line2, sizeof(line2), "    %s mm    ", num);
                 #endif
                 break;
 
             case SCR_TEMP_HUM:
-                snprintf(line1, sizeof(line1), "TEMP: %04.1f C", telemetry->temp_c);
-                snprintf(line2, sizeof(line2), "HUM:  %04.1f %%", telemetry->humidity_pct);
+                fmt_fixed(num, sizeof(num), telemetry->live_temp_c, 4, 1);
+                snprintf(line1, sizeof(line1), "TEMP: %s C", num);
+                fmt_fixed(num, sizeof(num), telemetry->live_humidity_pct, 4, 1);
+                snprintf(line2, sizeof(line2), "HUM:  %s %%", num);
                 break;
 
             case SCR_WIND:
-                snprintf(line1, sizeof(line1), "WS: %04.1f m/s", telemetry->wind_speed_avg);
-                snprintf(line2, sizeof(line2), "WD: %03d DEG", telemetry->wind_dir_deg);
+                fmt_fixed(num, sizeof(num), telemetry->live_wind_speed, 4, 1);
+                snprintf(line1, sizeof(line1), "WS: %s m/s", num);
+                snprintf(line2, sizeof(line2), "WD: %03d DEG", telemetry->live_wind_dir_deg);
                 break;
 
             case SCR_BATTERY:
                 snprintf(line1, sizeof(line1), "BATTERY VOLTAGE ");
-                snprintf(line2, sizeof(line2), "    %04.2f V    ", telemetry->bat1_volt);
+                fmt_fixed(num, sizeof(num), telemetry->bat1_volt, 4, 2);
+                snprintf(line2, sizeof(line2), "    %s V    ", num);
                 break;
 
             case SCR_SOLAR:
                 snprintf(line1, sizeof(line1), "SOLAR VOLTAGE   ");
                 if (telemetry->solar_volt > 1.0f) {
-                    snprintf(line2, sizeof(line2), "%04.2fV %s",
-                             telemetry->solar_volt,
+                    fmt_fixed(num, sizeof(num), telemetry->solar_volt, 4, 2);
+                    snprintf(line2, sizeof(line2), "%sV %s",
+                             num,
                              (telemetry->solar_status == 'C' || telemetry->solar_status == 'Y') ? "CHARGING" : "STANDBY");
                 } else {
                     snprintf(line2, sizeof(line2), "    STANDBY     ");
@@ -832,7 +971,10 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
 
             case SCR_FIELD_CALIB:
                 snprintf(line1, sizeof(line1), "FIELD CALIB     ");
-                snprintf(line2, sizeof(line2), "PRESS EN OR CLB ");
+                {
+                    const char *calib_result = flash_nvram_get_calib_result();
+                    snprintf(line2, sizeof(line2), "%-16.16s", calib_result[0] ? calib_result : "PRESS EN");
+                }
                 break;
 
             case SCR_SEND_STATUS:
@@ -864,8 +1006,8 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 break;
 
             case SCR_SLEEP:
-                snprintf(line1, sizeof(line1), "SLEEP SYSTEM?   ");
-                snprintf(line2, sizeof(line2), "PRESS EN: SLEEP ");
+                snprintf(line1, sizeof(line1), "POWER SAVE MODE?");
+                snprintf(line2, sizeof(line2), "PRESS EN: YES   ");
                 break;
 
             default:
@@ -908,9 +1050,170 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
     }
 }
 
+/* Operator asked for power save: if a slot is running, power down once it has finished */
+static void request_power_save(void)
+{
+    if (s_slot_busy || slot_scheduler_is_due()) {
+        storage_log_debug("PWR", "Power save deferred until 15-minute slot finishes");
+        s_sleep_deferred = true;
+        lcd_command(0x80);
+        lcd_print("SENDING DATA... ");
+        lcd_command(0xC0);
+        lcd_print("SLEEP WHEN DONE ");
+        vTaskDelay(1500 / portTICK_RATE_MS);
+        s_force_redraw = true;
+    } else {
+        ui_enter_sleep();
+    }
+}
+
+static void calib_start(void)
+{
+    intermcu_calib_reset();
+    hal_power_calib_start();
+    s_calib_ticks = 0;
+    s_ui_mode = UI_MODE_CALIB;
+    s_force_redraw = true;
+    storage_log_debug("CALIB", "Field calibration started");
+}
+
+static void calib_cancel(void)
+{
+    hal_power_calib_stop();
+    s_ui_mode = UI_MODE_BROWSE;
+    s_force_redraw = true;
+    storage_log_debug("CALIB", "Field calibration cancelled");
+}
+
+/* Ends the run: saves "YYYY-MM-DD PASS/FAIL", shows it for 3s, stays on the calibration screen */
+static void calib_finish(const telemetry_data_t *telemetry)
+{
+    int tips = intermcu_get_calib_tips();
+    hal_power_calib_stop();
+
+    char result[20];
+    const char *pt = telemetry->present_time;
+    if (strlen(pt) >= 8 && strncmp(pt, "20", 2) == 0) {
+        snprintf(result, sizeof(result), "%.4s-%.2s-%.2s %s", pt, pt + 4, pt + 6, (tips == CALIB_PASS_TIPS) ? "PASS" : "FAIL");
+    } else {
+        snprintf(result, sizeof(result), "0000-00-00 %s", (tips == CALIB_PASS_TIPS) ? "PASS" : "FAIL");
+    }
+    if (!flash_nvram_set_calib_result(result)) {
+        storage_log_debug("ERROR", "Could not save calibration result");
+    }
+
+    char msg[48];
+    snprintf(msg, sizeof(msg), "Field calibration: %d tips, %s", tips, result);
+    storage_log_debug("CALIB", msg);
+
+    char line[17];
+    lcd_command(0x80);
+    lcd_print("FIELD CALIB:    ");
+    snprintf(line, sizeof(line), "%-16.16s", result);
+    lcd_command(0xC0);
+    lcd_print(line);
+    vTaskDelay(3000 / portTICK_RATE_MS);
+
+    s_ui_mode = UI_MODE_BROWSE;
+    s_force_redraw = true;
+}
+
+/* Show the power save prompt, remembering the mode to return to if the operator declines */
+static void sleep_confirm_open(void)
+{
+    if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+        lcd_command(0x0C); /* Hide edit cursor while the prompt is showing */
+    }
+    s_mode_before_confirm = (s_ui_mode == UI_MODE_ERASE_CONFIRM) ? UI_MODE_BROWSE : s_ui_mode;
+    s_mode_timeout_ticks = SLEEP_CONFIRM_TIMEOUT_TICKS;
+    s_ui_mode = UI_MODE_SLEEP_CONFIRM;
+    s_force_redraw = true;
+}
+
+static void sleep_confirm_cancel(void)
+{
+    s_ui_mode = s_mode_before_confirm;
+    if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+        lcd_command(0x0F); /* Restore edit cursor */
+    }
+    s_force_redraw = true;
+}
+
+/* Jump to a screen in this build's carousel; does nothing if the build doesn't have it */
+static void goto_screen(screen_type_t scr)
+{
+    for (size_t i = 0; i < NUM_SCREENS; i++) {
+        if (s_screens[i] == scr) {
+            s_current_screen_idx = i;
+            return;
+        }
+    }
+}
+
 void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_t *modem_stat)
 {
+    if (s_system_asleep) {
+        return;
+    }
+
+    /* Boot type comes from the LCD rail in the LPC845's first status frame. Its slot wake
+     * leaves the LCD off; a DSP wake or first power-up has it on. */
+    if (!s_boot_mode_known) {
+        if (telemetry->usb_power_flag == 'u') {
+            s_scheduled_boot = true;
+            s_display_active = false;
+            LPC_GPIO2->FIOCLR = (MASK_LCD_RS | MASK_LCD_RW | MASK_LCD_EN | MASK_LCD_D4 | MASK_LCD_D5 | MASK_LCD_D6 | MASK_LCD_D7 | MASK_LCD_BL);
+            storage_log_debug("BOOT", "Boot type: SCHEDULED (LCD rail off, LCD stays off)");
+            s_boot_mode_known = true;
+        } else if (telemetry->usb_power_flag == 'U') {
+            storage_log_debug("BOOT", "Boot type: OPERATOR (LCD rail on)");
+            s_boot_mode_known = true;
+        } else if (++s_boot_wait_ticks >= (3 * 20)) {
+            storage_log_debug("ERROR", "No status from LPC845 after 3s: assuming OPERATOR boot, check UART3 link");
+            hal_power_lcd_on();
+            lcd_init_hw();
+            s_boot_mode_known = true;
+        }
+        /* Keep the UI running while waiting: the keypad must work as soon as the LCD is up */
+    }
+
+    /* Operator-requested power save, deferred while a slot was running */
+    if (s_sleep_deferred && !s_slot_busy && !slot_scheduler_is_due()) {
+        s_sleep_deferred = false;
+        ui_enter_sleep();
+        return;
+    }
+
+    /* The LPC845's slot wake also cuts the LCD rail when someone is using the unit:
+     * turn it back on rather than leave them with a dark screen. */
+    if (s_display_active && telemetry->usb_power_flag == 'u') {
+        if (++s_lcd_rail_off_ticks >= (5 * 20)) {
+            s_lcd_rail_off_ticks = 0;
+            storage_log_debug("UI", "LCD rail was off while in use: restoring it");
+            hal_power_lcd_on();
+            lcd_init_hw();
+            if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+                lcd_command(0x0F);
+            }
+        }
+    } else {
+        s_lcd_rail_off_ticks = 0;
+    }
+
     s_anim_counter++;
+
+    /* An SMS should finish well inside 4 minutes. If its task is stuck it still holds the
+     * modem, which would push 15-minute slots into backlog, so restart between slots. */
+    static uint32_t s_sms_sending_ticks = 0;
+    if (s_status_sms_state == STATUS_UI_SENDING) {
+        if (++s_sms_sending_ticks >= (240 * 20) && !s_slot_busy && !slot_scheduler_is_due()) {
+            storage_log_debug("ERROR", "Status SMS stuck for 4 min: restarting LPC1768");
+            storage_log_flush();
+            NVIC_SystemReset();
+        }
+    } else {
+        s_sms_sending_ticks = 0;
+    }
 
     /* Countdown timer for status SMS result message */
     if (s_status_sms_timer > 0) {
@@ -920,14 +1223,23 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         }
     }
 
-    /* In Calibration Mode, sync tipping bucket count from coprocessor */
+    /* The LCD stays on for the whole run, which stops itself after 5 minutes */
     if (s_ui_mode == UI_MODE_CALIB) {
-        if (telemetry->rf_tips_15m != s_calib_last_raw_tips) {
-            uint16_t diff = telemetry->rf_tips_15m - s_calib_last_raw_tips;
-            s_calib_tips += diff;
-            s_calib_last_raw_tips = telemetry->rf_tips_15m;
+        s_inactivity_ticks = 0;
+        if (++s_calib_ticks >= CALIB_TIMEOUT_TICKS) {
+            calib_finish(telemetry);
+            return;
         }
     }
+
+    /* Drop keys pressed while the UI was blocked (e.g. a 3s message screen) so they
+     * don't act late on the wrong screen. In v6.1.9 these presses were never scanned. */
+    static portTickType s_last_step_tick = 0;
+    portTickType now_tick = xTaskGetTickCount();
+    if ((now_tick - s_last_step_tick) > (250 / portTICK_RATE_MS)) {
+        s_kbd_tail = s_kbd_head;
+    }
+    s_last_step_tick = now_tick;
 
     key_code_t key = ui_keypad_scan();
 
@@ -947,24 +1259,31 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         return;
     }
 
-    /* Auto-sleep after 2 minutes of inactivity (120s = 2400 ticks of 50ms) */
+    /* ESP32 timeout: off after 1 minute without a key, or 3 minutes while the modem is working */
     if (key != KEY_NONE) {
         s_operator_touched_key = true;
         s_inactivity_ticks = 0;
-    } else if (s_status_sms_state != STATUS_UI_SENDING) {
+    } else if (s_status_sms_state != STATUS_UI_SENDING && !s_slot_busy) {
         s_inactivity_ticks++;
-        if (s_inactivity_ticks >= (120 * 20)) {
-            storage_log_debug("UI", "2-minute inactivity timeout reached -> entering auto-sleep");
+        if (s_inactivity_ticks >= ((sim7600_is_busy() ? 180U : 60U) * 20U)) {
+            storage_log_debug("UI", "Inactivity timeout reached -> entering auto-sleep");
             ui_enter_sleep();
             return;
         }
     }
 
-    /* Global DSP key handler: Sleep display on demand */
-    if (key == KEY_DSP) {
-        storage_log_debug("UI", "Operator pressed DSP key -> entering sleep");
-        ui_enter_sleep();
-        return;
+    /* Prompts that close by themselves if the operator walks away */
+    if (key == KEY_NONE && s_mode_timeout_ticks > 0 &&
+        (s_ui_mode == UI_MODE_SLEEP_CONFIRM || s_ui_mode == UI_MODE_KEY_TEST)) {
+        s_mode_timeout_ticks--;
+        if (s_mode_timeout_ticks == 0) {
+            if (s_ui_mode == UI_MODE_SLEEP_CONFIRM) {
+                sleep_confirm_cancel();
+            } else {
+                s_ui_mode = UI_MODE_BROWSE;
+                s_force_redraw = true;
+            }
+        }
     }
 
     if (key != KEY_NONE) {
@@ -974,60 +1293,59 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
 
         ui_reset_activity_timer();
         s_force_redraw = true;
+        s_sleep_deferred = false; /* Operator is back: cancel any deferred power save */
+
+        /* --- Mode: Key Test (reports every key instead of acting on it) --- */
+        if (s_ui_mode == UI_MODE_KEY_TEST) {
+            s_mode_timeout_ticks = KEY_TEST_TIMEOUT_TICKS;
+            if (key == KEY_BACK && s_key_test_last == KEY_BACK) {
+                s_ui_mode = UI_MODE_BROWSE;
+            }
+            s_key_test_last = key;
+            return;
+        }
 
         #if (UNIT_CFG == KSNDMC_TWS)
+        /* CALIB is for TRG only: TWS has no rain gauge, so the key has no function */
         if (key == KEY_CALIB) {
-            /* TWS Total Weather Station has no rain gauge.
-             * Show momentary feedback banner matching golden TWS6 ui.c line 1016 */
-            lcd_command(0x80);
-            lcd_print("  VARSHA - TWS  ");
-            lcd_command(0xC0);
-            lcd_print(" NO RAIN GAUGE  ");
-            vTaskDelay(1200 / portTICK_RATE_MS);
-            s_force_redraw = true;
             return;
         }
         #else
         /* Global CALIB key handler for TRG mode */
         if (key == KEY_CALIB && s_ui_mode == UI_MODE_BROWSE) {
-            s_ui_mode = UI_MODE_CALIB;
-            s_calib_tips = 0;
-            s_calib_last_raw_tips = telemetry->rf_tips_15m;
+            goto_screen(SCR_FIELD_CALIB);
+            calib_start();
             return;
         }
         #endif
 
+        /* --- Mode: Power Save Prompt (EN powers down, anything else goes back) --- */
+        if (s_ui_mode == UI_MODE_SLEEP_CONFIRM) {
+            if (key == KEY_EN) {
+                storage_log_debug("UI", "Operator confirmed power save -> entering sleep");
+                if (s_status_sms_state == STATUS_UI_SENDING) {
+                    sim7600_request_cancel();
+                }
+                s_ui_mode = UI_MODE_BROWSE;
+                request_power_save();
+            } else {
+                sleep_confirm_cancel();
+            }
+            return;
+        }
+
+        /* DSP opens the power save prompt from any screen, except during a calibration run */
+        if (key == KEY_DSP && s_ui_mode != UI_MODE_CALIB) {
+            sleep_confirm_open();
+            return;
+        }
+
         /* --- Mode: Field Calibration --- */
         if (s_ui_mode == UI_MODE_CALIB) {
-            if (key == KEY_UP) {
-                /* Operator manual bench test tip */
-                s_calib_tips++;
-            } else if (key == KEY_BACK) {
-                /* Cancel calibration */
-                lcd_command(0x80);
-                lcd_print("Calibration     ");
-                lcd_command(0xC0);
-                lcd_print("CANCELLED       ");
-                vTaskDelay(1500 / portTICK_RATE_MS);
-                s_ui_mode = UI_MODE_BROWSE;
-            } else if (key == KEY_EN) {
-                /* Confirm calibration test */
-                s_calib_status_pass = (s_calib_tips == 10);
-                if (strlen(telemetry->present_time) >= 8) {
-                    snprintf(s_calib_last_date, sizeof(s_calib_last_date), "%.4s-%.2s-%.2s",
-                             telemetry->present_time, telemetry->present_time + 4, telemetry->present_time + 6);
-                }
-
-                lcd_command(0x80);
-                lcd_print("CALIB RESULT:   ");
-                lcd_command(0xC0);
-                if (s_calib_status_pass) {
-                    lcd_print("PASS (10 tips)  ");
-                } else {
-                    lcd_print("FAIL (<>10 tips)");
-                }
-                vTaskDelay(3000 / portTICK_RATE_MS);
-                s_ui_mode = UI_MODE_BROWSE;
+            if (key == KEY_BACK) {
+                calib_cancel();
+            } else if (key == KEY_EN || key == KEY_CALIB) {
+                calib_finish(telemetry);
             }
             return;
         }
@@ -1043,6 +1361,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
 
                 intermcu_reset_cumulative_rain();
                 storage_backlog_clear_all();
+                flash_log_erase_all();
 
                 vTaskDelay(1500 / portTICK_RATE_MS);
                 lcd_command(0x80);
@@ -1088,22 +1407,9 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             } else if (key == KEY_RIGHT) {
                 s_edit_pos = (s_edit_pos < 5) ? (s_edit_pos + 1) : 0;
             } else if (key == KEY_BACK) {
-                /* Clear buffer: if any non-zero, clear all to '0' */
-                bool all_zero = true;
-                for (int i = 0; i < 6; i++) {
-                    if (s_edit_stn_id[i] != '0') {
-                        all_zero = false;
-                        break;
-                    }
-                }
-                if (!all_zero) {
-                    memset(s_edit_stn_id, '0', 6);
-                    s_edit_pos = 0;
-                } else {
-                    /* If already all zeros, cancel edit mode */
-                    lcd_command(0x0C);
-                    s_ui_mode = UI_MODE_BROWSE;
-                }
+                /* Leave without saving */
+                lcd_command(0x0C);
+                s_ui_mode = UI_MODE_BROWSE;
             } else if (key == KEY_EN) {
                 /* Save new Station ID to Sector 1 Flash & RAM */
                 lcd_command(0x0C);
@@ -1127,23 +1433,38 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             return;
         }
 
+        /* --- Mode: MENU Shortcuts --- */
+        if (s_ui_mode == UI_MODE_MENU) {
+            if (key == KEY_DOWN || key == KEY_RIGHT) {
+                s_menu_pos = (s_menu_pos + 1) % NUM_MENU_ITEMS;
+            } else if (key == KEY_UP || key == KEY_LEFT) {
+                s_menu_pos = (s_menu_pos + NUM_MENU_ITEMS - 1) % NUM_MENU_ITEMS;
+            } else if (key == KEY_BACK || key == KEY_MENU) {
+                s_ui_mode = UI_MODE_BROWSE;
+            } else if (key == KEY_EN) {
+                const menu_item_t *item = &s_menu_items[s_menu_pos];
+                s_ui_mode = UI_MODE_BROWSE;
+                if (item->action == MENU_GOTO_SCREEN) {
+                    goto_screen(item->screen);
+                } else if (item->action == MENU_KEY_TEST) {
+                    s_key_test_last = KEY_NONE;
+                    s_mode_timeout_ticks = KEY_TEST_TIMEOUT_TICKS;
+                    s_ui_mode = UI_MODE_KEY_TEST;
+                } else {
+                    sleep_confirm_open();
+                }
+            }
+            return;
+        }
+
         /* --- Mode: Browse Mode Navigation --- */
         if (key == KEY_DOWN || key == KEY_RIGHT) {
             s_current_screen_idx = (s_current_screen_idx + 1) % NUM_SCREENS;
         } else if (key == KEY_UP || key == KEY_LEFT) {
             s_current_screen_idx = (s_current_screen_idx + NUM_SCREENS - 1) % NUM_SCREENS;
         } else if (key == KEY_MENU) {
-            /* Quick jump between sections matching golden TWS6 ui.c line 997:
-             * Station/Sensors (0..3) -> Battery (4) -> Signal (6) -> Send Status (9) -> Station (0) */
-            if (s_current_screen_idx < 4) {
-                s_current_screen_idx = 4; /* Battery */
-            } else if (s_current_screen_idx < 6) {
-                s_current_screen_idx = 6; /* Signal */
-            } else if (s_current_screen_idx < 9) {
-                s_current_screen_idx = 9; /* Send Status */
-            } else {
-                s_current_screen_idx = 0; /* Station ID */
-            }
+            s_menu_pos = 0;
+            s_ui_mode = UI_MODE_MENU;
         } else if (key == KEY_BACK) {
             if (s_status_sms_state == STATUS_UI_SENDING) {
                 sim7600_request_cancel();
@@ -1173,10 +1494,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 s_edit_pos = 0;
                 lcd_command(0x0F); /* Turn ON blinking hardware cursor */
             } else if (active_scr == SCR_FIELD_CALIB) {
-                /* Enter Field Calibration */
-                s_ui_mode = UI_MODE_CALIB;
-                s_calib_tips = 0;
-                s_calib_last_raw_tips = telemetry->rf_tips_15m;
+                calib_start();
             } else if (active_scr == SCR_ERASE_DATA) {
                 /* Prompt Erase Confirmation */
                 s_ui_mode = UI_MODE_ERASE_CONFIRM;
@@ -1185,18 +1503,20 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 if (s_status_sms_state != STATUS_UI_SENDING && s_sms_task_handle == NULL) {
                     s_status_sms_state = STATUS_UI_SENDING;
                     strncpy(s_status_sms_substep, "MODEM POWER ON  ", sizeof(s_status_sms_substep) - 1);
-                    xTaskCreate(vStatusSms_Task, (const signed char *)"SmsTask", 512, NULL, 1, &s_sms_task_handle);
+                    /* 768 words: booting the modem from here is the deepest call chain in the
+                     * firmware, and 512 overflowed it */
+                    if (xTaskCreate(vStatusSms_Task, (const signed char *)"SmsTask", 768, NULL, 1, &s_sms_task_handle) != pdPASS) {
+                        storage_log_debug("ERROR", "Not enough memory to start status SMS task");
+                        s_sms_task_handle = NULL;
+                        s_status_sms_state = STATUS_UI_FAILED;
+                        strncpy(s_status_sms_substep, "NO MEMORY       ", sizeof(s_status_sms_substep) - 1);
+                        s_status_sms_timer = 60;
+                    }
                 }
             } else if (active_scr == SCR_SLEEP) {
                 /* Operator selected Sleep System */
-                storage_log_debug("UI", "Operator confirmed SLEEP SYSTEM? -> entering sleep");
-                lcd_command(0x80);
-                lcd_print("SYSTEM SLEEPING ");
-                lcd_command(0xC0);
-                lcd_print("POWERING DOWN...");
-                vTaskDelay(1200 / portTICK_RATE_MS);
-
-                ui_enter_sleep();
+                storage_log_debug("UI", "Operator confirmed power save -> entering sleep");
+                request_power_save();
                 return;
             }
         }

@@ -16,7 +16,8 @@ typedef struct __attribute__((packed)) {
     float rf_resolution;     /* e.g. 0.25mm */
     uint8_t sd_debug_dump;   /* 1 = enabled, 0 = disabled */
     char last_logged[20];    /* e.g. "04-11-2026 18:45" */
-    char reserved[218];      /* Pad to 256 bytes for IAP write alignment */
+    char calib_result[20];   /* e.g. "2026-11-05 PASS" */
+    char reserved[198];      /* Pad to 256 bytes for IAP write alignment */
 } station_nvram_params_t;
 
 void flash_nvram_init(void);
@@ -24,6 +25,11 @@ const char *flash_nvram_get_station_id(void);
 bool flash_nvram_set_station_id(const char *new_id);
 const char *flash_nvram_get_last_logged(void);
 bool flash_nvram_set_last_logged(const char *last_logged_str);
+/* RAM only: per-slot updates are kept on the SD card to avoid wearing out this flash sector */
+void flash_nvram_note_last_logged(const char *last_logged_str);
+/* Last field calibration result, or "" if never calibrated */
+const char *flash_nvram_get_calib_result(void);
+bool flash_nvram_set_calib_result(const char *result);
 bool flash_nvram_read(station_nvram_params_t *out_params);
 bool flash_nvram_write(const station_nvram_params_t *in_params);
 

@@ -4,6 +4,7 @@
 #include "user_config.h"
 #include "flash_nvram.h"
 #include "intermcu_protocol.h"
+#include "telemetry_formatter.h"
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
 #include "lpc17xx_gpio.h"
@@ -82,6 +83,11 @@ void sim7600_request_cancel(void)
     s_cancel_requested = true;
 }
 
+void sim7600_clear_cancel(void)
+{
+    s_cancel_requested = false;
+}
+
 bool sim7600_is_cancel_requested(void)
 {
     return s_cancel_requested;
@@ -89,6 +95,9 @@ bool sim7600_is_cancel_requested(void)
 
 static void report_progress(const char *msg)
 {
+    if (msg) {
+        storage_log_debug("STEP", msg);
+    }
     if (s_progress_cb && msg) {
         s_progress_cb(msg);
     }
@@ -210,6 +219,17 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
         delay_ms(10);
         elapsed += 10;
     }
+
+    /* Silence is the fault worth seeing: record what was awaited and anything partial */
+    char timeout_msg[112];
+    uint16_t tail = s_rx_tail, head = s_rx_head, idx = 0;
+    while (tail != head && idx < sizeof(s_rx_temp) - 1) {
+        s_rx_temp[idx++] = s_rx_buf[tail];
+        tail = (tail + 1) % RX_BUFFER_SIZE;
+    }
+    s_rx_temp[idx] = '\0';
+    snprintf(timeout_msg, sizeof(timeout_msg), "No '%s' in %ums. Got: %.60s", expected, (unsigned int)timeout_ms, s_rx_temp);
+    storage_log_debug("MODEM_TIMEOUT", timeout_msg);
     return false;
 }
 
@@ -251,8 +271,50 @@ static void parse_cops_operator(const char *cops_resp, char *out_carrier, size_t
     out_carrier[max_len - 1] = '\0';
 }
 
+/* ESP32 flow: the server's clock is the reference. Correct the RTC only past the drift limit:
+ * 90s after a delivered record, 45s after a rejected one (often caused by the clock itself). */
+#define CLOCK_DRIFT_LIMIT_SEC           90
+#define CLOCK_DRIFT_LIMIT_REJECTED_SEC  45
+
+static void sync_clock_from_server(const char *http_response, bool rejected)
+{
+    char server_ts[16];
+    telemetry_data_t t;
+    char msg[72];
+
+    if (!intermcu_parse_server_time(http_response, server_ts, sizeof(server_ts))) {
+        storage_log_debug("RTC", "No usable time in server reply");
+        return;
+    }
+
+    bool have_clock = intermcu_get_telemetry(&t);
+    long drift = have_clock ? intermcu_clock_drift_sec(t.present_time, server_ts) : -1;
+    if (drift >= 0 && drift < (rejected ? CLOCK_DRIFT_LIMIT_REJECTED_SEC : CLOCK_DRIFT_LIMIT_SEC)) {
+        return;
+    }
+
+    snprintf(msg, sizeof(msg), "RTC corrected from server: %.14s -> %s (drift %lds)",
+             have_clock ? t.present_time : "none", server_ts, drift);
+    storage_log_debug("RTC", msg);
+    hal_power_sync_rtc(server_ts);
+    intermcu_update_time(server_ts);
+}
+
+/* True if the LPC845's RTC is giving a believable time */
+static bool clock_is_valid(void)
+{
+    telemetry_data_t t;
+    return intermcu_get_telemetry(&t) && intermcu_clock_drift_sec(t.present_time, t.present_time) == 0;
+}
+
+/* ESP32 flow: the modem's clock may not have heard from the network, so it only sets the RTC
+ * when the RTC has no valid time at all */
 static bool sim7600_sync_time_step(void)
 {
+    if (clock_is_valid()) {
+        return true;
+    }
+
     char capture[128];
     clear_rx();
     send_raw("AT+CCLK?\r\n");
@@ -357,6 +419,10 @@ bool sim7600_power_on(void)
     wait_response("OK", 500, NULL, 0);
     send_raw("AT+CGEREP=0\r\n");        /* Silence unsolicited packet domain reports */
     wait_response("OK", 500, NULL, 0);
+    send_raw("AT+CREG=0\r\n");          /* Silence registration reports (ESP32 flow) */
+    wait_response("OK", 500, NULL, 0);
+    send_raw("AT+CEREG=0\r\n");
+    wait_response("OK", 500, NULL, 0);
     send_raw("AT&D0\r\n");              /* Ignore DTR line to prevent PPP teardown */
     wait_response("OK", 500, NULL, 0);
 
@@ -364,7 +430,7 @@ bool sim7600_power_on(void)
     report_progress("CHECKING SIM... ");
     char capture[256];
     bool sim_ready = false;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 15; i++) {
         if (sim7600_is_cancel_requested()) return false;
         clear_rx();
         send_raw("AT+CPIN?\r\n");
@@ -375,7 +441,7 @@ bool sim7600_power_on(void)
         delay_ms(1000);
     }
 
-    /* If SIM not ready after 10s, power-cycle radio via CFUN=0 / CFUN=1 once */
+    /* If SIM not ready after 15s, power-cycle radio via CFUN=0 / CFUN=1 once */
     if (!sim_ready) {
         storage_log_debug("MODEM", "SIM not ready, cycling radio CFUN=0 / CFUN=1");
         send_raw("AT+CFUN=0\r\n");
@@ -459,8 +525,17 @@ bool sim7600_power_on(void)
     send_raw("AT+CGDCONT=5,\"IP\",\"\"\r\n");
     wait_response("OK", 1000, NULL, 0);
 
-    /* 7. Radio Mode Selection: Automatic RAT selection (CNMP=2 allows seamless LTE/3G/2G attach) */
-    send_raw("AT+CNMP=2\r\n");
+    /* 7. Radio Mode Selection (ESP32 flow): start on the mode that last worked (4G by default),
+     * then try the other after 5 polls. The last mode is kept on SD; this chip powers off. */
+    char rat_saved[8] = "";
+    int rat_mode = 38;
+    if (storage_state_load(RAT_MODE_FILENAME, rat_saved, sizeof(rat_saved)) && atoi(rat_saved) == 13) {
+        rat_mode = 13;
+    }
+    int rat_at_boot = rat_mode;
+    char rat_cmd[20];
+    snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
+    send_raw(rat_cmd);
     wait_response("OK", 1000, NULL, 0);
 
     /* 8. Registration Polling (check LTE CEREG, GPRS CGREG, and GSM CREG) */
@@ -468,6 +543,14 @@ bool sim7600_power_on(void)
     bool registered = false;
     for (int i = 0; i < 25; i++) {
         if (sim7600_is_cancel_requested()) return false;
+
+        if (i == 5) {
+            rat_mode = (rat_mode == 38) ? 13 : 38;
+            snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
+            storage_log_debug("MODEM", "No registration after 5 polls, switching radio mode");
+            send_raw(rat_cmd);
+            wait_response("OK", 1000, NULL, 0);
+        }
 
         /* Check LTE CEREG */
         clear_rx();
@@ -507,6 +590,10 @@ bool sim7600_power_on(void)
 
     if (registered) {
         report_progress("NET REGISTERED  ");
+        if (rat_mode != rat_at_boot) {
+            snprintf(rat_saved, sizeof(rat_saved), "%02d\r\n", rat_mode);
+            storage_state_save(RAT_MODE_FILENAME, rat_saved);
+        }
     } else {
         report_progress("NO NETWORK      ");
         storage_log_debug("MODEM", "Network registration timeout!");
@@ -833,6 +920,13 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
             sscanf(p, "+IPADDR: %31s", ip_str);
             snprintf(log_msg, sizeof(log_msg), "Assigned IP: %s", ip_str);
             storage_log_debug("TCP", log_msg);
+            /* No usable IP means a dead data connection: restart it on the next attempt */
+            if (ip_str[0] == '\0' || strstr(ip_str, "0.0.0.0")) {
+                storage_log_debug("TCP", "No valid IP on data connection, closing network");
+                send_raw("AT+NETCLOSE\r\n");
+                wait_response("OK", 2000, NULL, 0);
+                return false;
+            }
             strncpy(s_modem_status.ip_addr, ip_str, sizeof(s_modem_status.ip_addr) - 1);
         }
     }
@@ -909,13 +1003,22 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
         snprintf(log_resp, sizeof(log_resp), "Server Status: %s", resp_line);
         storage_log_debug("HTTP", log_resp);
 
-        if (strstr(s_http_capture, "200 OK") ||
+        /* These servers can answer HTTP 200 with "Rejected" in the body: that is not delivered */
+        if (strstr(s_http_capture, "Rejected") ||
+            strstr(s_http_capture, "rejected") ||
+            strstr(s_http_capture, "REJECTED") ||
+            strstr(s_http_capture, "Invalid") ||
+            strstr(s_http_capture, "invalid")) {
+            storage_log_debug("HTTP", "Server REJECTED the record");
+            sync_clock_from_server(s_http_capture, true);
+        } else if (strstr(s_http_capture, "200 OK") ||
             strstr(s_http_capture, "Success") ||
             strstr(s_http_capture, "SUCCESS") ||
             strstr(s_http_capture, "accepted") ||
             strstr(s_http_capture, "ACCEPTED")) {
             success = true;
             storage_log_debug("HTTP", "HTTP POST Verified OK (200 / Success)");
+            sync_clock_from_server(s_http_capture, false);
 
             /* Extract server Date: header if present to update RTC */
             char *d_ptr = strstr(s_http_capture, "Date: ");
@@ -1163,27 +1266,39 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
                  telem->slot_time + 8, telem->slot_time + 10);
     }
 
-    /* Format calib date: YYYY-MM-DD */
-    char calib_date[16] = "2026-01-01";
-    if (strlen(telem->present_time) >= 8) {
-        snprintf(calib_date, sizeof(calib_date), "%.4s-%.2s-%.2s",
-                 telem->present_time, telem->present_time + 4, telem->present_time + 6);
+    char calib_date[12] = "0000-00-00";
+    #if (UNIT_CFG == KSNDMC_TWS)
+    /* TWS has no rain gauge, so field calibration doesn't apply */
+    const char *calib_status = "CLB-NA";
+    #else
+    /* Last field calibration (ESP32 flow): date and result, FAIL if never calibrated */
+    const char *calib_result = flash_nvram_get_calib_result();
+    if (calib_result[0]) {
+        snprintf(calib_date, sizeof(calib_date), "%.10s", calib_result);
     }
+    const char *calib_status = strstr(calib_result, "PASS") ? "CLB-OK" : "CLB-FAIL";
+    #endif
+
+    const char *sd_status = storage_sd_is_ok() ? "SDC-OK" : "SDC-FAIL";
 
     /* Exact ESP32 format:
      * <NETWORK>,<STATION_TYPE>,STATUS-F,<STATION_ID>,<YYYY-MM-DDTHH:MM>,<UNIT_VER>,15,<CSQ_DBM>,<BAT1>,<BAT2>,<SOLAR_CHARGING>,<SD_STATUS>,<CALIB_STATUS>,<CALIB_DATE>,<LAST_REC_DATE_TIME>,0\r\n
      */
     char status_msg[256];
+    char bat_str[8];
+    fmt_fixed(bat_str, sizeof(bat_str), telem->bat1_volt, 4, 1);
     snprintf(status_msg, sizeof(status_msg),
-        "%s,%s,STATUS-F,%s,%s,%s,15,%d,03.3,%04.1f,%c,SDC-OK,CLB-OK,%s,%s,0\r\n",
+        "%s,%s,STATUS-F,%s,%s,%s,15,%04d,03.3,%s,%c,%s,%s,%s,%s,0\r\n",
         network_name,
         stn_type,
         stn_id,
         time_iso,
         FIRMWARE_VERSION,
         csq_dbm,
-        telem->bat1_volt,
+        bat_str,
         (telem->solar_status == 'C' || telem->solar_volt > 4.0f) ? 'Y' : 'N',
+        sd_status,
+        calib_status,
         calib_date,
         slot_iso
     );
@@ -1230,10 +1345,14 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
 
         if (strstr(s_sms_capture, "#STATUS") || strstr(s_sms_capture, "#STAT")) {
             char reply[160];
+            char s_bat[8], s_rf15[8], s_cum[8];
+            fmt_fixed(s_bat, sizeof(s_bat), telemetry->bat1_volt, 4, 2);
+            fmt_fixed(s_rf15, sizeof(s_rf15), telemetry->rf_15m_mm, 4, 1);
+            fmt_fixed(s_cum, sizeof(s_cum), telemetry->rf_cum_mm, 4, 1);
             snprintf(reply, sizeof(reply),
-                "AIO STN:%s\nTIME:%s\nBAT:%04.2fV\nSIG:%ddBm\nRAIN 15M:%04.1fmm\nCUM:%04.1fmm",
-                flash_nvram_get_station_id(), telemetry->present_time, telemetry->bat1_volt,
-                s_modem_status.csq_dbm, telemetry->rf_15m_mm, telemetry->rf_cum_mm);
+                "AIO STN:%s\nTIME:%s\nBAT:%sV\nSIG:%ddBm\nRAIN 15M:%smm\nCUM:%smm",
+                flash_nvram_get_station_id(), telemetry->present_time, s_bat,
+                s_modem_status.csq_dbm, s_rf15, s_cum);
 
             const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
             sim7600_send_sms(target, reply);

@@ -62,6 +62,20 @@ void SysTick_Handler(void)
 	if(!tc1_5ms){
 		tc1_5ms = TC1_MAX_5MS_RF;
 		debounce_rfpin();
+
+		//A wake-up needs a real key press, not a brief dip on COL2
+		if(GPIO_PinRead(GPIO, LPC845_PORT, UI_COL_PIN) == USER_ACTIVE){
+			if(wake_key_low_cnt < WAKE_KEY_SAMPLES){
+				wake_key_low_cnt++;
+			}
+			else{
+				wake_key_pressed = 1;
+			}
+		}
+		else{
+			wake_key_low_cnt = 0;
+			wake_key_pressed = 0;
+		}
 	}
 
 	tc3_100ms--;
@@ -80,7 +94,9 @@ void SysTick_Handler(void)
 	tc2_1s--;
 	if(!tc2_1s){
 		tc2_1s = TC2_MAX_1S;
+#if SYSTEM == 1
 		read_pulse_counts_in_1sec();
+#endif
 		timer2_ovf_uart = 1;
 	}
 
@@ -90,18 +106,29 @@ void SysTick_Handler(void)
 void store_data()
 {
 	int i,m;
+	uint8_t close_dd = Present_Date_Time.date;
+	uint8_t close_mm = Present_Date_Time.month;
+	uint8_t close_yy = Present_Date_Time.year;
 
-	if ((Day_Samples[gi_cur_blk].dd != Present_Date_Time.date) ||
-			(Day_Samples[gi_cur_blk].mm != Present_Date_Time.month) ||
-			(Day_Samples[gi_cur_blk].yy != Present_Date_Time.year) ||
+	m = ((Present_Date_Time.hour*60) + Present_Date_Time.minute) / REC_INTERVAL ;
+
+	//After 08:30 this sample belongs to the rain day closing tomorrow
+	if(m > RAIN_CLOSE_SLOT){
+		Next_Date(&close_dd, &close_mm, &close_yy);
+	}
+
+	if ((Day_Samples[gi_cur_blk].dd != close_dd) ||
+			(Day_Samples[gi_cur_blk].mm != close_mm) ||
+			(Day_Samples[gi_cur_blk].yy != close_yy) ||
 			(Day_Samples[gi_cur_blk].cc != Present_Date_Time.century)){
 
 		gi_cur_blk++;
 		gi_cur_blk %= MAX_DAY_BLOCKS_RF;
-		Day_Samples[gi_cur_blk].dd = Present_Date_Time.date;
-		Day_Samples[gi_cur_blk].mm = Present_Date_Time.month;
-		Day_Samples[gi_cur_blk].yy = Present_Date_Time.year;
+		Day_Samples[gi_cur_blk].dd = close_dd;
+		Day_Samples[gi_cur_blk].mm = close_mm;
+		Day_Samples[gi_cur_blk].yy = close_yy;
 		Day_Samples[gi_cur_blk].cc = Present_Date_Time.century;
+		rain_day_tips = 0;
 
 		/*	for(i=0; i<LOG_INTERVAL_1MIN_RF; i++){
 			Day_Samples[gi_cur_blk].rf_1min[i] = 0xFF;
@@ -112,9 +139,16 @@ void store_data()
 		}
 	}
 
-	m = ((Present_Date_Time.hour*60) + Present_Date_Time.minute) / REC_INTERVAL ;
+	m = (m + RAIN_INDEX_SHIFT) % LOG_INTERVAL_15MIN_RF;	//sample 0 = 08:45, sample 95 = 08:30
 
-	Day_Samples[gi_cur_blk].rf_15min[m] = rf_val; //15 minute RF data stored in structure
+	//Take the count and clear it as one step: a tip arriving in between must not be lost
+	__disable_irq();
+	int slot_tips = rf_val;
+	rf_val = 0;
+	__enable_irq();
+
+	Day_Samples[gi_cur_blk].rf_15min[m] = slot_tips; //15 minute RF data stored in structure
+	rain_day_tips += slot_tips;
 	Day_Samples[gi_cur_blk].bat_adc_15min[m] = bat1_adc;
 	//for testing
 	Day_Samples[gi_cur_blk].wd[m] = present_wd;
@@ -145,9 +179,6 @@ void store_data()
 	last_rec_wd = Day_Samples[gi_cur_blk].wd[m];
 	last_rec_ws_sec = Day_Samples[gi_cur_blk].ws_sec[m];
 
-
-	rf_val = 0;
-
 }
 
 
@@ -155,10 +186,19 @@ void store_data()
 int get_cur_blk(){
 	int blk;
 	int match=0;
+	uint8_t close_dd = Get_Data_For_Date_Time.date;
+	uint8_t close_mm = Get_Data_For_Date_Time.month;
+	uint8_t close_yy = Get_Data_For_Date_Time.year;
+
+	//Blocks are labelled by rain-day closing date
+	if(((Get_Data_For_Date_Time.hour*60 + Get_Data_For_Date_Time.minute)/REC_INTERVAL) > RAIN_CLOSE_SLOT){
+		Next_Date(&close_dd, &close_mm, &close_yy);
+	}
+
 	for(blk=0; blk<MAX_DAY_BLOCKS_RF; blk++){
-		if ((Day_Samples[blk].dd == Get_Data_For_Date_Time.date) &&
-				(Day_Samples[blk].mm == Get_Data_For_Date_Time.month) &&
-				(Day_Samples[blk].yy == Get_Data_For_Date_Time.year) &&
+		if ((Day_Samples[blk].dd == close_dd) &&
+				(Day_Samples[blk].mm == close_mm) &&
+				(Day_Samples[blk].yy == close_yy) &&
 				(Day_Samples[blk].cc == Get_Data_For_Date_Time.century)){
 
 			match = 1;
@@ -243,6 +283,17 @@ void row2_output_configuration()
 }
 
 
+//One UART buffer serves all frames: don't overwrite a frame that is still being sent
+//(a full frame takes about 140 ms at 9600 baud)
+static void wait_tx_idle(void)
+{
+	volatile uint32_t guard = 2000000;
+	while(pAck_xmit && guard){
+		guard--;
+	}
+}
+
+
 void decode_command(void)
 {
 
@@ -288,13 +339,23 @@ void decode_command(void)
 		case 'C':
 			calib_mode = 1;
 			calib_rf = 0;
-			calib_timeout_min = ((Set_Date_Time.minute + 3) % 60) + 1 ;
+			//Safety stop if the LPC1768 never ends it (it stops at 5 minutes itself): tips must
+			//not keep going to the calibration counter instead of the rain total
+			calib_timeout_min = (Present_Date_Time.minute + 6) % 60;
 			break;
 
 		case 'c':
 			calib_mode = 0;
 			calib_rf = 0;
 			calib_timeout_min = 0;
+			break;
+
+		case 'R':									//Erase Data: restart the rain-day total
+			rain_day_tips = 0;
+			break;
+
+		case 'H':									//LPC1768 heartbeat: still making progress
+			time_since_reset_interval = 0;
 			break;
 
 		case 'n':									//User active
@@ -322,6 +383,7 @@ void decode_command(void)
 				//	GPIO_PortClear(GPIO, LPC845_PORT, 1u << UI_ROW_PIN);
 
 				row2_output_configuration();
+				sleep_holdoff_100ms = SLEEP_HOLDOFF_100MS;
 			}
 			break;
 
@@ -423,6 +485,7 @@ void Init_UART_I2C_ADC_Pins(void)
 	SWM_SetFixedPinSelect(SWM0, kSWM_I2C0_SCL, true);
 
 
+#if SYSTEM == 1
 	/* I2C0_SDA connect to P0_11 */
 	//	SWM_SetMovablePinSelect(SWM0, kSWM_I2C1_SDA, kSWM_PortPin_P0_20);
 	SWM_SetMovablePinSelect(SWM0, kSWM_I2C1_SDA, kSWM_PortPin_P0_20);
@@ -431,19 +494,24 @@ void Init_UART_I2C_ADC_Pins(void)
 	/* I2C0_SCL connect to P0_10 */
 	//	SWM_SetMovablePinSelect(SWM0, kSWM_I2C1_SCL, kSWM_PortPin_P0_22);
 	SWM_SetMovablePinSelect(SWM0, kSWM_I2C1_SCL, kSWM_PortPin_P0_22);
+#endif
 
 	// Configure the SWM
 
 
 
 	//	SWM_SetFixedPinSelect(SWM0, kSWM_ADC_CHN9, true);
+#if SYSTEM == 1
 	IOCON->PIO[IOCON_INDEX_PIO0_21] = 0x80;
 	IOCON->PIO[IOCON_INDEX_PIO0_18] = 0x80;
+#endif
 	IOCON->PIO[IOCON_INDEX_PIO0_17] = 0x80;
 
 
+#if SYSTEM == 1
 	SWM_SetFixedPinSelect(SWM0, kSWM_ADC_CHN5, true);
 	SWM_SetFixedPinSelect(SWM0, kSWM_ADC_CHN8, true);
+#endif
 	SWM_SetFixedPinSelect(SWM0, kSWM_ADC_CHN9, true);
 
 
@@ -1092,7 +1160,7 @@ void Get_Time(xDateTime_def *DateTime)
 void Set_Time()
 {
 	i2c_clkval[0]= 0;		// start address
-	i2c_clkval[1]= 0;		// always set the seconds to zero
+	i2c_clkval[1]= ((Set_Date_Time.sec)/10)*16+((Set_Date_Time.sec)%10);	// bit 7 clear keeps the clock running
 
 	i2c_clkval[2]= ((Set_Date_Time.minute)/10)*16+((Set_Date_Time.minute)%10);
 	i2c_clkval[3]= ((Set_Date_Time.hour)/10)*16+((Set_Date_Time.hour)%10);
@@ -1819,6 +1887,8 @@ int main(void)
 		for(j=0;j<2000;j++);
 
 
+#if SYSTEM == 1
+	//Wind counter and temperature/humidity bus: TWS only (TRG has its rain gauge on PIO0_19)
 	init_counter_ws();
 	for(i=0;i<1000;i++)
 		for(j=0;j<2000;j++);
@@ -1827,6 +1897,7 @@ int main(void)
 	I2C1_init();
 	for(i=0;i<1000;i++)
 		for(j=0;j<2000;j++);
+#endif
 
 
 	//	read_th_val();
@@ -1847,6 +1918,13 @@ int main(void)
 	avg_ws = 0;
 	ws_sec_cnt = 0;
 	last_rf = 0;
+	rain_day_tips = 0;
+	wake_key_low_cnt = 0;
+	wake_key_pressed = 0;
+	sleep_holdoff_100ms = 0;
+	wake_reason = 'B';
+	reset_status = SYSCON->SYSRSTSTAT;
+	SYSCON->SYSRSTSTAT = reset_status;	//writing the bits back clears them for the next restart
 	pckt_recvd = 0;
 
 	GPIO_PortClear(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);
@@ -1893,9 +1971,11 @@ int main(void)
 	while (1)
 	{
 
-		user_intr = GPIO_PinRead(GPIO, LPC845_PORT, UI_COL_PIN);
-
-		if(user_intr == USER_ACTIVE){
+		//Only a wake-up key while the LPC1768 is powered down. While it is running, COL2 also
+		//goes low on its normal keypad scan, which must not switch the rails.
+		if(wake_key_pressed && (sleep_holdoff_100ms == 0) && GPIO_PinRead(GPIO, LPC845_PORT, LPC1768_PWR_STDN)){
+			time_since_reset_interval = 0;
+			wake_reason = 'K';
 			GPIO_PortClear(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);//wake up LPC
 			GPIO_PortClear(GPIO, LPC845_PORT, 1u << SIM7600_PWR_STDN);//wake up communication module
 			GPIO_PortClear(GPIO, LPC845_PORT, 1u << LCD_PWR_STDN);//wake up lcd
@@ -1951,12 +2031,22 @@ int main(void)
 
 
 		if(timer3_ovf_100ms == 1){
-			time_since_reset_interval += 100;
+			//Hang timer only runs while the LPC1768 is powered: asleep is the normal state
+			if(GPIO_PinRead(GPIO, LPC845_PORT, LPC1768_PWR_STDN)){
+				time_since_reset_interval = 0;
+			}
+			else{
+				time_since_reset_interval += 100;
+			}
+			if(sleep_holdoff_100ms > 0){
+				sleep_holdoff_100ms--;
+			}
 			Get_Time();
 			timer3_ovf_100ms = 0;
 		}
 
 		if(timer4_ovf_10s == 1){
+#if SYSTEM == 1
 			read_th_val();
 			for(i=0;i<100;i++)
 				for(j=0;j<200;j++);
@@ -1964,6 +2054,7 @@ int main(void)
 			read_adc2_values();
 			for(i=0;i<100;i++)
 				for(j=0;j<200;j++);
+#endif
 
 			read_adc3_values();
 			for(i=0;i<100;i++)
@@ -1983,10 +2074,14 @@ int main(void)
 
 				time_since_reset_interval = 0;
 
-				//Power on LPC1768 and GPRS, keep LCD 5V OFF
+				//Power on LPC1768 and GPRS. Keep LCD 5V OFF for an unattended wake, but
+				//leave it alone if the LPC1768 is already running (operator may be using it)
+				if(GPIO_PinRead(GPIO, LPC845_PORT, LPC1768_PWR_STDN)){
+					GPIO_PortSet(GPIO, LPC845_PORT, 1u << LCD_PWR_STDN);
+					wake_reason = 'S';
+				}
 				GPIO_PortClear(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);
 				GPIO_PortClear(GPIO, LPC845_PORT, 1u << SIM7600_PWR_STDN);
-				GPIO_PortSet(GPIO, LPC845_PORT, 1u << LCD_PWR_STDN);
 				row2_input_configuration();
 
 
@@ -2000,13 +2095,9 @@ int main(void)
 
 		}
 
-		//if more than 11 minutes no response from LPC1768, LPC845 forcefully cuts all power
+		//if more than 11 minutes no heartbeat from LPC1768, LPC845 forcefully cuts all power.
+		//The next 15-minute slot or DSP key powers it back up.
 		if(time_since_reset_interval > (11*60*1000)){
-
-			NVIC_SystemReset();
-
-			for(i=0;i<100;i++)
-				for(j=0;j<2000;j++);
 
 			time_since_reset_interval = 0;
 			GPIO_PortSet(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);
@@ -2036,6 +2127,7 @@ int main(void)
 
 			if(calib_mode == 1){
 
+				wait_tx_idle();
 				sprintf(gc_xmit_buf, "$C%02d%02d%02d%02d%02d%02d%02d,%04d,%04d,%04d;",
 						Present_Date_Time.century,
 						Present_Date_Time.year,
@@ -2060,7 +2152,8 @@ int main(void)
 			//	float last_rec_temperature, last_rec_humid, last_rec_ws, last_rec_wd, inst_ws;
 
 			//sprintf(gc_xmit_buf, "$D%04d;", rf_val);
-			sprintf(gc_xmit_buf, "$D%02d%02d%02d%02d%02d%02d%02d,%02d%02d%02d%02d%02d%02d%02d,%04d,%04d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%c,%c,%c,%04d,%04d,%c;",
+			wait_tx_idle();
+			sprintf(gc_xmit_buf, "$D%02d%02d%02d%02d%02d%02d%02d,%02d%02d%02d%02d%02d%02d%02d,%04d,%04d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%c,%c,%c,%04d,%04d,%c,%d,%d,%c,%d;",
 					Present_Date_Time.century,
 					Present_Date_Time.year,
 					Present_Date_Time.month,
@@ -2093,7 +2186,11 @@ int main(void)
 					lpc845_ver,
 					sc_bat1,
 					sc_bat2,
-					solar_status);
+					solar_status,
+					(int)rain_day_tips,
+					SYSTEM,
+					wake_reason,
+					(int)reset_status);
 
 			xmit_ptr = gc_xmit_buf;
 			LPC845_UART0->INTENSET = kUSART_TxReady;
@@ -2108,6 +2205,7 @@ int main(void)
 		//gi_get_rec flag is enabled when request from LPC1768 for data
 		//Getting recorded data from structure and send it to LPC1765
 		if (gi_get_rec == 1){
+			wait_tx_idle();
 			gi_rec_blk_no = get_cur_blk();		//for getting the block_number
 
 			if(gi_rec_blk_found == 1){
@@ -2115,12 +2213,20 @@ int main(void)
 				rec_data = 'Y';
 
 				cur_offset_1min = (Get_Data_For_Date_Time.hour*60 + Get_Data_For_Date_Time.minute);
-				cur_offset_15min = (Get_Data_For_Date_Time.hour*60 + Get_Data_For_Date_Time.minute)/REC_INTERVAL;
+				cur_offset_15min = (((Get_Data_For_Date_Time.hour*60 + Get_Data_For_Date_Time.minute)/REC_INTERVAL) + RAIN_INDEX_SHIFT) % LOG_INTERVAL_15MIN_RF;
 
 				//		gi_rec_1min_rf = Day_Samples[gi_rec_blk_no].rf_1min[cur_offset_1min];
 				gi_rec_15min_rf = Day_Samples[gi_rec_blk_no].rf_15min[cur_offset_15min];
 				gi_rec_bat1_adc= Day_Samples[gi_rec_blk_no].bat_adc_15min[cur_offset_15min];
 				//		gi_rec_bat2_adc= Day_Samples[gi_rec_blk_no].adc2_15min[cur_offset_15min];
+
+				//Rain-day total up to and including this sample
+				uint32_t rec_cum_tips = 0;
+				for(i=0; i<=cur_offset_15min; i++){
+					if(Day_Samples[gi_rec_blk_no].rf_15min[i] != 0xFFFF){
+						rec_cum_tips += Day_Samples[gi_rec_blk_no].rf_15min[i];
+					}
+				}
 
 
 				for(i=0; i<80;i++){
@@ -2130,7 +2236,7 @@ int main(void)
 				if(gi_rec_15min_rf != 0xFFFF){
 					//sprintf(gc_xmit_buf, "$R%04d;", gi_rec_15min_rf);
 					//sprintf(gc_xmit_buf, "$R%04d;", gi_rec_15min_rf);
-					sprintf(gc_xmit_buf, "$G%c,%02d%02d%02d%02d%02d%02d%02d,%02d%02d%02d%02d%02d%02d%02d,%04d,%04d,%04d,%04d;",
+					sprintf(gc_xmit_buf, "$G%c,%02d%02d%02d%02d%02d%02d%02d,%02d%02d%02d%02d%02d%02d%02d,%d,%d,%d,%d,%d,%d,%d,%d;",
 							rec_data,
 							Present_Date_Time.century,
 							Present_Date_Time.year,
@@ -2146,10 +2252,14 @@ int main(void)
 							Get_Data_For_Date_Time.hour,
 							Get_Data_For_Date_Time.minute,
 							Get_Data_For_Date_Time.sec,
-							gi_rec_1min_rf,
 							gi_rec_15min_rf,
 							gi_rec_bat1_adc,
-							gi_rec_bat2_adc);
+							(int)Day_Samples[gi_rec_blk_no].temperature[cur_offset_15min],
+							(int)Day_Samples[gi_rec_blk_no].humidity[cur_offset_15min],
+							(int)Day_Samples[gi_rec_blk_no].ws[cur_offset_15min],
+							(int)Day_Samples[gi_rec_blk_no].wd[cur_offset_15min],
+							(int)Day_Samples[gi_rec_blk_no].ws_sec[cur_offset_15min],
+							(int)rec_cum_tips);
 
 					xmit_ptr = gc_xmit_buf;
 					LPC845_UART0->INTENSET = kUSART_TxReady;
@@ -2191,6 +2301,31 @@ int main(void)
 
 				for(i=0;i<500;i++)
 					for(j=0;j<500;j++);
+			}
+			else{
+				//This rain day is no longer held (or the LPC845 lost power)
+				rec_data = 'N';
+
+				sprintf(gc_xmit_buf, "$G%c,%02d%02d%02d%02d%02d%02d%02d,%02d%02d%02d%02d%02d%02d%02d;",
+						rec_data,
+						Present_Date_Time.century,
+						Present_Date_Time.year,
+						Present_Date_Time.month,
+						Present_Date_Time.date,
+						Present_Date_Time.hour,
+						Present_Date_Time.minute,
+						Present_Date_Time.sec,
+						Get_Data_For_Date_Time.century,
+						Get_Data_For_Date_Time.year,
+						Get_Data_For_Date_Time.month,
+						Get_Data_For_Date_Time.date,
+						Get_Data_For_Date_Time.hour,
+						Get_Data_For_Date_Time.minute,
+						Get_Data_For_Date_Time.sec);
+
+				xmit_ptr = gc_xmit_buf;
+				LPC845_UART0->INTENSET = kUSART_TxReady;
+				pAck_xmit = 1;
 			}
 
 			gi_get_rec = 0;

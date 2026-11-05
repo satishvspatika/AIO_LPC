@@ -96,10 +96,10 @@ elif [ "$FLASHER" = "PYOCD" ]; then
     fi
 
     echo "2. Programming Boot Stub (0x0) + Application (0x18000) via PyOCD..."
-    ${PYOCD} flash -t lpc1768 --erase "${ERASE_MODE}" "${HEX}"
+    ${PYOCD} flash -t lpc1768 -f 1000000 --erase "${ERASE_MODE}" "${HEX}"
 
     echo "3. Issuing Hardware Reset..."
-    ${PYOCD} reset -t lpc1768
+    ${PYOCD} reset -t lpc1768 || true
 fi
 
 echo "=== LPC1768 Flashed and Running! ==="

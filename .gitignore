@@ -49,3 +49,6 @@ LPC845/main.o
 !LPC1768/Debug/*.bin
 !LPC845/*.hex
 !LPC845/*.bin
+
+# LPC845 objects from the GCC build
+LPC845/build_gcc/

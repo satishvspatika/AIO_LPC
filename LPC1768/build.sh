@@ -59,6 +59,7 @@ ${CC} ${CFLAGS} "${LPC_DIR}/sim7600_driver.c" -o "${OUT_DIR}/sim7600_driver.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/ui_display.c" -o "${OUT_DIR}/ui_display.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/storage_log.c" -o "${OUT_DIR}/storage_log.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/flash_nvram.c" -o "${OUT_DIR}/flash_nvram.o"
+${CC} ${CFLAGS} "${LPC_DIR}/flash_log.c" -o "${OUT_DIR}/flash_log.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/cr_startup_lpc17.c" -o "${OUT_DIR}/cr_startup_lpc17.o"
 
 # Compile FatFs drivers
@@ -93,7 +94,6 @@ echo "=== 2. Linking LPC1768_AIO.axf ==="
 ${CC} \
   -mcpu=cortex-m3 -mthumb \
   --specs=nano.specs --specs=nosys.specs \
-  -u _printf_float \
   -L"${PROJECT_ROOT}/CMSISv1p30_LPC17xx/Debug" \
   -L"${PROJECT_ROOT}/FreeRTOS_Library/Debug" \
   -L"${OUT_DIR}" \
@@ -109,6 +109,7 @@ ${CC} \
   "${OUT_DIR}/sim7600_driver.o" \
   "${OUT_DIR}/ui_display.o" \
   "${OUT_DIR}/storage_log.o" \
+  "${OUT_DIR}/flash_log.o" \
   "${OUT_DIR}/flash_nvram.o" \
   "${OUT_DIR}/fat_sd/diskio.o" \
   "${OUT_DIR}/fat_sd/spi_sd_lpc17xx.o" \
