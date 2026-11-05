@@ -32,30 +32,40 @@
 #define MASK_LCD_D7     (1UL << PIN_LCD_D7)
 #define MASK_LCD_BL     (1UL << PIN_LCD_BL)
 
-/* --- 3x3 Keypad Matrix Hardware Interface ---
- * Strobes (Outputs, driven LOW one at a time):
- *   Col 0: P3.25 (Left Column:   MENU,  LEFT,  BACK)
- *   Col 1: P3.26 (Center Column: UP,    EN,    DOWN)
- *   Col 2: P1.21 (Right Column:  CALIB, RIGHT, DSP)
+/* --- 3x3 Keypad Matrix Hardware Interface (Matching Golden TWS6 kbd.c / kbd.h) ---
+ * Rows (GPIO Outputs, driven LOW one at a time):
+ *   Row 0: Port 3, Pin 25 (Top Row:    MENU,  UP,    CALIB)
+ *   Row 1: Port 3, Pin 26 (Middle Row: LEFT,  EN,    RIGHT)
+ *   Row 2: Port 1, Pin 21 (Bottom Row: BACK,  DOWN,  DSP)
  *
- * Sense Lines (Inputs with pull-ups, sampled on Port 0):
- *   Row 0: P0.21 (bit 1, mask 0x02): Top Row    [MENU,  UP,    CALIB]
- *   Row 1: P0.22 (bit 2, mask 0x04): Middle Row [LEFT,  EN,    RIGHT]
- *   Row 2: P0.20 (bit 0, mask 0x01): Bottom Row [BACK,  DOWN,  DSP]
+ * Columns (GPIO Inputs with internal pull-ups on Port 0):
+ *   Col 0: Port 0, Pin 22 (Left Column:   MENU,  LEFT,  BACK)
+ *   Col 1: Port 0, Pin 21 (Center Column: UP,    EN,    DOWN)
+ *   Col 2: Port 0, Pin 20 (Right Column:  CALIB, RIGHT, DSP)
  */
-#define KBD_COL0_PORT   3
-#define KBD_COL0_PIN    25      /* Left Strobe:   MENU, LEFT, BACK */
-#define KBD_COL1_PORT   3
-#define KBD_COL1_PIN    26      /* Center Strobe: UP,   EN,   DOWN */
-#define KBD_COL2_PORT   1
-#define KBD_COL2_PIN    21      /* Right Strobe:  CALIB,RIGHT,DSP */
+#define KBD_ROW0_PORT   3
+#define KBD_ROW0_PIN    25
+#define KBD_ROW0_MASK   (1UL << 25)
 
-#define KBD_ROW0_PORT   0
-#define KBD_ROW0_PIN    21      /* Top Sense:     MENU, UP,   CALIB */
-#define KBD_ROW1_PORT   0
-#define KBD_ROW1_PIN    22      /* Middle Sense:  LEFT, EN,   RIGHT */
-#define KBD_ROW2_PORT   0
-#define KBD_ROW2_PIN    20      /* Bottom Sense:  BACK, DOWN, DSP */
+#define KBD_ROW1_PORT   3
+#define KBD_ROW1_PIN    26
+#define KBD_ROW1_MASK   (1UL << 26)
+
+#define KBD_ROW2_PORT   1
+#define KBD_ROW2_PIN    21
+#define KBD_ROW2_MASK   (1UL << 21)
+
+#define KBD_COL0_PORT   0
+#define KBD_COL0_PIN    22
+#define KBD_COL0_MASK   (1UL << 22)
+
+#define KBD_COL1_PORT   0
+#define KBD_COL1_PIN    21
+#define KBD_COL1_MASK   (1UL << 21)
+
+#define KBD_COL2_PORT   0
+#define KBD_COL2_PIN    20
+#define KBD_COL2_MASK   (1UL << 20)
 
 /* Screen Type Enumeration */
 typedef enum {
@@ -144,6 +154,7 @@ typedef enum {
 
 static bool s_lcd_initialized = false;
 static bool s_display_active = true;
+static volatile bool s_system_asleep = false;
 static bool s_operator_touched_key = false;
 static uint32_t s_inactivity_ticks = 0; /* 50ms ticks, 2 mins = 2400 */
 static size_t s_current_screen_idx = 0;
@@ -412,125 +423,213 @@ static void keypad_init_hw(void)
     pin_cfg.Pinmode = PINSEL_PINMODE_PULLUP;
     pin_cfg.OpenDrain = PINSEL_PINMODE_NORMAL;
 
-    /* Rows as GPIO Outputs */
-    pin_cfg.Portnum = 3; pin_cfg.Pinnum = 26; PINSEL_ConfigPin(&pin_cfg);
-    pin_cfg.Portnum = 3; pin_cfg.Pinnum = 25; PINSEL_ConfigPin(&pin_cfg);
-    pin_cfg.Portnum = 1; pin_cfg.Pinnum = 21; PINSEL_ConfigPin(&pin_cfg);
+    /* Rows as GPIO Outputs (P3.25 = Row 0, P3.26 = Row 1, P1.21 = Row 2) */
+    pin_cfg.Portnum = KBD_ROW0_PORT; pin_cfg.Pinnum = KBD_ROW0_PIN; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = KBD_ROW1_PORT; pin_cfg.Pinnum = KBD_ROW1_PIN; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = KBD_ROW2_PORT; pin_cfg.Pinnum = KBD_ROW2_PIN; PINSEL_ConfigPin(&pin_cfg);
 
-    /* Columns as GPIO Inputs */
-    pin_cfg.Portnum = 0; pin_cfg.Pinnum = 22; PINSEL_ConfigPin(&pin_cfg);
-    pin_cfg.Portnum = 0; pin_cfg.Pinnum = 21; PINSEL_ConfigPin(&pin_cfg);
-    pin_cfg.Portnum = 0; pin_cfg.Pinnum = 20; PINSEL_ConfigPin(&pin_cfg);
+    /* Columns as GPIO Inputs (P0.22 = Col 0, P0.21 = Col 1, P0.20 = Col 2) */
+    pin_cfg.Portnum = KBD_COL0_PORT; pin_cfg.Pinnum = KBD_COL0_PIN; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = KBD_COL1_PORT; pin_cfg.Pinnum = KBD_COL1_PIN; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = KBD_COL2_PORT; pin_cfg.Pinnum = KBD_COL2_PIN; PINSEL_ConfigPin(&pin_cfg);
 
     /* Direct register configuration for maximum hardware reliability */
     LPC_PINCON->PINSEL7 &= ~((0x03UL << 18) | (0x03UL << 20)); /* P3.25, P3.26 */
-    LPC_PINCON->PINMODE7 &= ~((0x03UL << 18) | (0x03UL << 20)); /* Pull-Up */
-    LPC_PINCON->PINMODE_OD3 &= ~((1UL << 25) | (1UL << 26));    /* Push-Pull */
-    LPC_GPIO3->FIODIR |= ((1UL << 25) | (1UL << 26));           /* Outputs */
-    LPC_GPIO3->FIOMASK &= ~((1UL << 25) | (1UL << 26));         /* Unmask */
-    LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26));             /* Idle HIGH */
+    LPC_PINCON->PINMODE7 &= ~((0x03UL << 18) | (0x03UL << 20)); /* Pull-Up (00) */
+    LPC_PINCON->PINMODE_OD3 &= ~(KBD_ROW0_MASK | KBD_ROW1_MASK);
+    LPC_GPIO3->FIODIR |= (KBD_ROW0_MASK | KBD_ROW1_MASK);       /* Outputs */
+    LPC_GPIO3->FIOMASK &= ~(KBD_ROW0_MASK | KBD_ROW1_MASK);     /* Unmask */
+    LPC_GPIO3->FIOSET = (KBD_ROW0_MASK | KBD_ROW1_MASK);         /* Idle HIGH */
 
     LPC_PINCON->PINSEL3 &= ~(0x03UL << 10);                     /* P1.21 */
-    LPC_PINCON->PINMODE3 &= ~(0x03UL << 10);                    /* Pull-Up */
-    LPC_PINCON->PINMODE_OD1 &= ~(1UL << 21);                    /* Push-Pull */
-    LPC_GPIO1->FIODIR |= (1UL << 21);                           /* Output */
-    LPC_GPIO1->FIOMASK &= ~(1UL << 21);                         /* Unmask */
-    LPC_GPIO1->FIOSET = (1UL << 21);                            /* Idle HIGH */
+    LPC_PINCON->PINMODE3 &= ~(0x03UL << 10);                    /* Pull-Up (00) */
+    LPC_PINCON->PINMODE_OD1 &= ~KBD_ROW2_MASK;
+    LPC_GPIO1->FIODIR |= KBD_ROW2_MASK;                        /* Output */
+    LPC_GPIO1->FIOMASK &= ~KBD_ROW2_MASK;                      /* Unmask */
+    LPC_GPIO1->FIOSET = KBD_ROW2_MASK;                         /* Idle HIGH */
 
     LPC_PINCON->PINSEL1 &= ~((0x03UL << 8) | (0x03UL << 10) | (0x03UL << 12)); /* P0.20, P0.21, P0.22 */
-    LPC_PINCON->PINMODE1 &= ~((0x03UL << 8) | (0x03UL << 10) | (0x03UL << 12)); /* Pull-Up */
-    LPC_PINCON->PINMODE_OD0 &= ~((1UL << 20) | (1UL << 21) | (1UL << 22));      /* Push-Pull */
-    LPC_GPIO0->FIODIR &= ~((1UL << 20) | (1UL << 21) | (1UL << 22));           /* Inputs */
-    LPC_GPIO0->FIOMASK &= ~((1UL << 20) | (1UL << 21) | (1UL << 22));          /* Explicitly unmasked */
+    LPC_PINCON->PINMODE1 &= ~((0x03UL << 8) | (0x03UL << 10) | (0x03UL << 12)); /* Pull-Up (00) */
+    LPC_PINCON->PINMODE_OD0 &= ~(KBD_COL0_MASK | KBD_COL1_MASK | KBD_COL2_MASK);
+    LPC_GPIO0->FIODIR &= ~(KBD_COL0_MASK | KBD_COL1_MASK | KBD_COL2_MASK);      /* Inputs */
+    LPC_GPIO0->FIOMASK &= ~(KBD_COL0_MASK | KBD_COL1_MASK | KBD_COL2_MASK);     /* Explicitly unmasked */
+}
+
+static void kbd_release_pins_for_sleep(void)
+{
+    PINSEL_CFG_Type pin_cfg;
+    pin_cfg.Funcnum = PINSEL_FUNC_0;
+    pin_cfg.Pinmode = PINSEL_PINMODE_TRISTATE;
+    pin_cfg.OpenDrain = PINSEL_PINMODE_NORMAL;
+
+    pin_cfg.Portnum = KBD_ROW0_PORT; pin_cfg.Pinnum = KBD_ROW0_PIN; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = KBD_ROW1_PORT; pin_cfg.Pinnum = KBD_ROW1_PIN; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = KBD_ROW2_PORT; pin_cfg.Pinnum = KBD_ROW2_PIN; PINSEL_ConfigPin(&pin_cfg);
+
+    pin_cfg.Portnum = KBD_COL0_PORT; pin_cfg.Pinnum = KBD_COL0_PIN; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = KBD_COL1_PORT; pin_cfg.Pinnum = KBD_COL1_PIN; PINSEL_ConfigPin(&pin_cfg);
+    pin_cfg.Portnum = KBD_COL2_PORT; pin_cfg.Pinnum = KBD_COL2_PIN; PINSEL_ConfigPin(&pin_cfg);
+
+    /* Direct register configuration to guarantee High-Z inputs with pull-ups disabled */
+    LPC_GPIO3->FIODIR &= ~(KBD_ROW0_MASK | KBD_ROW1_MASK);
+    LPC_GPIO1->FIODIR &= ~KBD_ROW2_MASK;
+    LPC_GPIO0->FIODIR &= ~(KBD_COL0_MASK | KBD_COL1_MASK | KBD_COL2_MASK);
+
+    LPC_PINCON->PINMODE7 |= ((0x02UL << 18) | (0x02UL << 20)); /* P3.25, P3.26 Tristate */
+    LPC_PINCON->PINMODE3 |= (0x02UL << 10);                     /* P1.21 Tristate */
+    LPC_PINCON->PINMODE1 |= ((0x02UL << 8) | (0x02UL << 10) | (0x02UL << 12)); /* P0.20..P0.22 Tristate */
 }
 
 static void Output_Row(int iRow)
 {
     /* Set all row pins logic HIGH first */
-    LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26));
-    LPC_GPIO1->FIOSET = (1UL << 21);
+    LPC_GPIO3->FIOSET = (KBD_ROW0_MASK | KBD_ROW1_MASK);
+    LPC_GPIO1->FIOSET = KBD_ROW2_MASK;
 
     /* Assert selected row LOW */
     if (iRow == 0) {
-        LPC_GPIO3->FIOCLR = (1UL << 26); /* Row 0 (P3.26) */
+        LPC_GPIO3->FIOCLR = KBD_ROW0_MASK; /* Row 0: P3.25 */
     } else if (iRow == 1) {
-        LPC_GPIO3->FIOCLR = (1UL << 25); /* Row 1 (P3.25) */
+        LPC_GPIO3->FIOCLR = KBD_ROW1_MASK; /* Row 1: P3.26 */
     } else if (iRow == 2) {
-        LPC_GPIO1->FIOCLR = (1UL << 21); /* Row 2 (P1.21) */
+        LPC_GPIO1->FIOCLR = KBD_ROW2_MASK; /* Row 2: P1.21 */
     }
-}
-
-static int Read_Col_Pressed(void)
-{
-    int iCol_Number = 0;
-    uint32_t pin0 = LPC_GPIO0->FIOPIN;
-
-    /* Check columns on Port 0 (matching golden kbd.c lines 149-163):
-     * Col 2: P0.20 -> iCol_Number = 3
-     * Col 1: P0.21 -> iCol_Number = 2
-     * Col 0: P0.22 -> iCol_Number = 1
-     */
-    if ((pin0 & (1UL << 20)) == 0) {
-        iCol_Number = 3; /* Col 2 (P0.20) */
-    } else if ((pin0 & (1UL << 21)) == 0) {
-        iCol_Number = 2; /* Col 1 (P0.21) */
-    } else if ((pin0 & (1UL << 22)) == 0) {
-        iCol_Number = 1; /* Col 0 (P0.22) */
-    }
-
-    /* Set all rows back to logic HIGH immediately */
-    LPC_GPIO3->FIOSET = ((1UL << 25) | (1UL << 26));
-    LPC_GPIO1->FIOSET = (1UL << 21);
-
-    return iCol_Number;
 }
 
 static int Kbd_Scan(void)
 {
     int iKey_Value = 0;
 
+    /* 1. Ensure all rows are idle HIGH before scanning */
+    LPC_GPIO3->FIOSET = (KBD_ROW0_MASK | KBD_ROW1_MASK);
+    LPC_GPIO1->FIOSET = KBD_ROW2_MASK;
+
+    /* 2. Baseline qualification: Read columns while ALL rows are driven HIGH.
+     * If all 3 column lines read 0, the front-panel 5V rail is off or unpowered.
+     * Discard immediately to prevent phantom keys on power-down transitions. */
+    uint32_t baseline_port0 = LPC_GPIO0->FIOPIN;
+    uint32_t stuck_cols = 0;
+
+    if ((baseline_port0 & KBD_COL0_MASK) == 0) stuck_cols |= KBD_COL0_MASK;
+    if ((baseline_port0 & KBD_COL1_MASK) == 0) stuck_cols |= KBD_COL1_MASK;
+    if ((baseline_port0 & KBD_COL2_MASK) == 0) stuck_cols |= KBD_COL2_MASK;
+
+    if (stuck_cols == (KBD_COL0_MASK | KBD_COL1_MASK | KBD_COL2_MASK)) {
+        return 0; /* Whole bus low: unpowered display or floating rail */
+    }
+
+    /* 3. Scan rows 0..2 */
     for (int iRow_No = 0; iRow_No < 3; iRow_No++) {
         Output_Row(iRow_No);
-        vTaskDelay(1 / portTICK_RATE_MS); /* 1ms settling delay for display/capacitance: golden kbd.c line 87 */
-        int iCol_No = Read_Col_Pressed();
+        vTaskDelay(1 / portTICK_RATE_MS); /* 1ms settling delay */
+        uint32_t port0 = LPC_GPIO0->FIOPIN;
 
-        if (iCol_No != 0) {
-            iKey_Value = iRow_No * 3 + iCol_No;
+        /* Restore rows to HIGH immediately after reading columns */
+        LPC_GPIO3->FIOSET = (KBD_ROW0_MASK | KBD_ROW1_MASK);
+        LPC_GPIO1->FIOSET = KBD_ROW2_MASK;
+
+        /* A valid key requires column to be LOW during row assert AND NOT stuck LOW at baseline */
+        if ((port0 & KBD_COL0_MASK) == 0 && !(stuck_cols & KBD_COL0_MASK)) {
+            iKey_Value = iRow_No * 3 + 1;
+            break;
+        } else if ((port0 & KBD_COL1_MASK) == 0 && !(stuck_cols & KBD_COL1_MASK)) {
+            iKey_Value = iRow_No * 3 + 2;
+            break;
+        } else if ((port0 & KBD_COL2_MASK) == 0 && !(stuck_cols & KBD_COL2_MASK)) {
+            iKey_Value = iRow_No * 3 + 3;
             break;
         }
     }
 
+    /* Ensure rows remain HIGH */
+    LPC_GPIO3->FIOSET = (KBD_ROW0_MASK | KBD_ROW1_MASK);
+    LPC_GPIO1->FIOSET = KBD_ROW2_MASK;
+
     return iKey_Value;
 }
+
+enum {
+    KBD_STATE_IDLE = 0,
+    KBD_STATE_DEBOUNCE,
+    KBD_STATE_WAIT_RELEASE
+};
 
 static void vKbd_Task(void *pvParameters)
 {
     (void)pvParameters;
-    portTickType xLastWakeTime = xTaskGetTickCount();
-    int iOld_Key = 0;
-    int iDebounce_Count = 0;
+    int kbd_state = KBD_STATE_IDLE;
+    int candidate_key = 0;
+    int debounce_count = 0;
+    int hold_timer = 0;
+    bool pins_released = false;
+
+    keypad_init_hw();
+    vTaskDelay(300 / portTICK_RATE_MS);
 
     for (;;) {
-        vTaskDelayUntil(&xLastWakeTime, 10 / portTICK_RATE_MS);
+        vTaskDelay(10 / portTICK_RATE_MS);
 
-        int iNew_Key = Kbd_Scan();
-
-        if (iNew_Key) {
-            if (iNew_Key != iOld_Key) {
-                iOld_Key = iNew_Key;
-                iDebounce_Count = 4; /* 4 consecutive matching 10ms scans (~40ms debounce) */
-            } else if (iDebounce_Count) {
-                iDebounce_Count--;
-                if (0 == iDebounce_Count) {
-                    /* Confirmed single keypress event: enqueue to FIFO */
-                    g_dbg_last_key = (uint32_t)iNew_Key;
-                    kbd_fifo_put((key_code_t)iNew_Key);
-                }
+        if (!s_display_active || s_system_asleep) {
+            if (!pins_released) {
+                kbd_release_pins_for_sleep();
+                pins_released = true;
+                kbd_state = KBD_STATE_IDLE;
             }
-        } else {
-            /* Key physically released: reset engine */
-            iOld_Key = 0;
-            iDebounce_Count = 0;
+            vTaskDelay(200 / portTICK_RATE_MS);
+            continue;
+        } else if (pins_released) {
+            keypad_init_hw();
+            pins_released = false;
+            kbd_state = KBD_STATE_IDLE;
+            vTaskDelay(50 / portTICK_RATE_MS);
+        }
+
+        int scanned_key = Kbd_Scan();
+
+        switch (kbd_state) {
+        case KBD_STATE_IDLE:
+            if (scanned_key != 0) {
+                candidate_key = scanned_key;
+                debounce_count = 1;
+                kbd_state = KBD_STATE_DEBOUNCE;
+            }
+            break;
+
+        case KBD_STATE_DEBOUNCE:
+            if (scanned_key == candidate_key) {
+                debounce_count++;
+                if (debounce_count >= 2) {
+                    /* Confirmed stable keypress event (20ms hold): enqueue to FIFO */
+                    g_dbg_last_key = (uint32_t)candidate_key;
+                    kbd_fifo_put((key_code_t)candidate_key);
+                    hold_timer = 0;
+                    kbd_state = KBD_STATE_WAIT_RELEASE;
+                }
+            } else {
+                /* Noise / flutter: discard */
+                kbd_state = KBD_STATE_IDLE;
+            }
+            break;
+
+        case KBD_STATE_WAIT_RELEASE:
+            hold_timer++;
+            if (scanned_key == 0) {
+                /* Clean physical release confirmed */
+                kbd_state = KBD_STATE_IDLE;
+            } else if (scanned_key != candidate_key) {
+                /* New key pressed before previous was released */
+                candidate_key = scanned_key;
+                debounce_count = 1;
+                kbd_state = KBD_STATE_DEBOUNCE;
+            } else if (hold_timer >= 40) {
+                /* Stuck key recovery after 400ms hold */
+                kbd_state = KBD_STATE_IDLE;
+            }
+            break;
+
+        default:
+            kbd_state = KBD_STATE_IDLE;
+            break;
         }
     }
 }
@@ -570,6 +669,7 @@ void ui_display_init(void)
     sim7600_set_progress_callback(on_sms_progress);
     s_calib_tips = 0;
     s_display_active = true;
+    s_system_asleep = false;
     s_operator_touched_key = false;
     s_force_redraw = true;
     s_cached_line1[0] = '\0';
@@ -592,9 +692,10 @@ void ui_display_init(void)
 
 void ui_enter_sleep(void)
 {
-    storage_log_debug("PWR", "Entering sleep: shutting down UI, modem, and sending $f1;");
+    storage_log_debug("PWR", "Entering sleep: shutting down UI, modem, and sending $f7;");
 
-    /* 1. Mark display inactive IMMEDIATELY so vModem_Task will not attempt to restart modem */
+    /* 1. Mark system and display asleep */
+    s_system_asleep = true;
     s_display_active = false;
     s_operator_touched_key = false;
     s_inactivity_ticks = 0;
@@ -602,28 +703,60 @@ void ui_enter_sleep(void)
     s_cached_line1[0] = '\0';
     s_cached_line2[0] = '\0';
 
-    /* 2. Turn off cursor if in edit mode */
+    /* 2. Purge keypad FIFO */
+    s_kbd_head = 0;
+    s_kbd_tail = 0;
+
+    /* 3. Turn off cursor if in edit mode */
     if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
         lcd_command(0x0C);
     }
     s_ui_mode = UI_MODE_BROWSE;
 
-    /* 3. Turn off LCD display and backlight */
+    /* 4. Display sleep banner on LCD */
+    lcd_command(0x80);
+    lcd_print("POWERING DOWN...");
+    lcd_command(0xC0);
+    lcd_print("DSP KEY TO WAKE ");
+    vTaskDelay(1200 / portTICK_RATE_MS);
+
+    /* 5. Clear LCD and turn off display & backlight */
+    lcd_command(0x01);
+    delay_us(2000);
     lcd_command(0x08); /* Display OFF */
     LPC_GPIO2->FIOCLR = MASK_LCD_BL; /* Backlight OFF */
 
-    /* 4. Power off SIM7600 cellular modem completely */
+    /* 6. Power off SIM7600 cellular modem completely */
     sim7600_power_off();
 
-    /* 5. Flush any pending logs to SD card */
+    /* 7. Flush any pending logs to SD card */
     storage_log_flush();
 
-    /* 6. Cut LCD 5V rail */
-    hal_power_lcd_off();
-
-    /* 7. Send sentry sleep command to LPC845 coprocessor ($f1;) */
+    /* 8. Release keypad pins to High-Z Tristate so LPC845 sees open circuit */
+    kbd_release_pins_for_sleep();
     vTaskDelay(100 / portTICK_RATE_MS);
-    hal_power_sleep_system();
+
+    /* 9. Clear cached intermcu power flags */
+    intermcu_clear_power_flags();
+
+    /* 10. Cut LCD 5V rail and send full power cut command ($f7;) to LPC845 coprocessor */
+    hal_power_lcd_off();
+    vTaskDelay(100 / portTICK_RATE_MS);
+    hal_power_sleep_system(); /* Sends $f7;\012 */
+
+    /* 11. Sentry sleep loop:
+     * On battery, LPC845 cuts LPC1768 power rail and system shuts down completely.
+     * On bench power (debugger probe supplying 3.3V), LPC1768 sits in this low-power loop.
+     * When LPC845 restores power rails ('U' or 'G') on DSP key or 15-minute slot,
+     * LPC1768 triggers NVIC_SystemReset(), rebooting cleanly into active operation! */
+    while (s_system_asleep) {
+        vTaskDelay(200 / portTICK_RATE_MS);
+        if (intermcu_is_rails_active()) {
+            s_system_asleep = false;
+            storage_log_debug("PWR", "LPC845 awakened rails -> resetting LPC1768");
+            NVIC_SystemReset();
+        }
+    }
 }
 
 /* Screen Rendering Engine */
@@ -1021,10 +1154,12 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         }
 
         /* --- Mode: Browse Mode Navigation --- */
-        if (key == KEY_DOWN || key == KEY_RIGHT) {
+        if (key == KEY_DOWN) {
             s_current_screen_idx = (s_current_screen_idx + 1) % NUM_SCREENS;
-        } else if (key == KEY_UP || key == KEY_LEFT) {
+        } else if (key == KEY_UP) {
             s_current_screen_idx = (s_current_screen_idx + NUM_SCREENS - 1) % NUM_SCREENS;
+        } else if (key == KEY_RIGHT || key == KEY_LEFT) {
+            /* Left and Right keys are dedicated to cursor navigation in Edit mode; strictly NO-OP in browse */
         } else if (key == KEY_MENU) {
             /* Quick jump between Station ID (0) and Send Status */
             if (s_current_screen_idx == 0) {

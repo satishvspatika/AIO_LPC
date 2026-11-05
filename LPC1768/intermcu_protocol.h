@@ -31,6 +31,8 @@ bool intermcu_get_telemetry(telemetry_data_t *out_data);
 void intermcu_update_time(const char *timestamp14);
 void intermcu_tick_second(void);
 void intermcu_reset_cumulative_rain(void);
+bool intermcu_is_rails_active(void);
+void intermcu_clear_power_flags(void);
 
 #endif /* INTERMCU_PROTOCOL_H */
 

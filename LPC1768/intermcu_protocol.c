@@ -248,3 +248,27 @@ void intermcu_tick_second(void)
              "%04d%02d%02d%02d%02d%02d", yr, mo, da, hr, mi, se);
 }
 
+bool intermcu_is_rails_active(void)
+{
+    /* Check if LPC845 coprocessor has asserted power rails active ('U' for 5V LCD, 'G' for 3.8V GPRS) */
+    if (s_latest_telemetry.usb_power_flag == 'U' || s_latest_telemetry.gprs_power_flag == 'G') {
+        return true;
+    }
+
+    /* Also check physical DSP key sense line (P0.20):
+     * During sentry sleep ($f7;), LPC845 drives Row 2 (P1.21) LOW and monitors Col 2 (P0.20).
+     * Pressing the DSP key bridges P0.20 to P1.21, pulling P0.20 to ground. */
+    if ((LPC_GPIO0->FIOPIN & (1UL << 20)) == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+void intermcu_clear_power_flags(void)
+{
+    s_latest_telemetry.usb_power_flag = 'u';
+    s_latest_telemetry.gprs_power_flag = 'g';
+}
+
+

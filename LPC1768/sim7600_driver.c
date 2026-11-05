@@ -1019,14 +1019,13 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
     send_raw("AT+CSCS=\"GSM\"\r\n");
     wait_response("OK", 1000, NULL, 0);
 
-    /* 3. Query SMS Service Center Address (SMSC) - fallback to KA standard if empty */
+    /* 3. Query SMS Service Center Address (SMSC) for diagnostics (do not overwrite SIM native SMSC) */
     clear_rx();
     send_raw("AT+CSCA?\r\n");
     if (wait_response("+CSCA:", 1000, cap, sizeof(cap))) {
-        if (strstr(cap, "\"\"") || !strstr(cap, "+")) {
-            send_raw("AT+CSCA=\"+919845080001\",145\r\n");
-            wait_response("OK", 1000, NULL, 0);
-        }
+        char smsc_log[64];
+        snprintf(smsc_log, sizeof(smsc_log), "SMSC: %s", cap);
+        storage_log_debug("SMS", smsc_log);
     }
 
     /* 4. Initiate AT+CMGS */
@@ -1039,6 +1038,9 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
         const char esc[] = {0x1B, '\0'};
         send_raw(esc);
         wait_response("OK", 1000, NULL, 0);
+        char err_log[80];
+        snprintf(err_log, sizeof(err_log), "No '>' prompt. Cap: %s", cap);
+        storage_log_debug("SMS", err_log);
         if (strstr(cap, "+CMS ERROR:")) {
             char *p = strstr(cap, "+CMS ERROR:");
             char err_txt[17];
@@ -1049,6 +1051,9 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
         }
         return false;
     }
+
+    /* Wait 50ms before sending payload after '>' prompt */
+    delay_ms(50);
 
     /* 5. Build clean message payload terminated by single Ctrl+Z (0x1A) */
     char send_buf[300];
@@ -1068,8 +1073,14 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
     /* 6. Wait for cellular network SMS acknowledgement */
     if (wait_response("+CMGS:", 20000, cap, sizeof(cap))) {
         report_progress("STATUS SENT OK  ");
+        char ok_log[80];
+        snprintf(ok_log, sizeof(ok_log), "SMS Sent OK: %s", cap);
+        storage_log_debug("SMS", ok_log);
         return true;
     } else {
+        char fail_log[80];
+        snprintf(fail_log, sizeof(fail_log), "SMS Send Failed: %s", cap);
+        storage_log_debug("SMS", fail_log);
         if (strstr(cap, "+CMS ERROR:")) {
             char *p = strstr(cap, "+CMS ERROR:");
             char err_txt[17];

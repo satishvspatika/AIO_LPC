@@ -75,7 +75,7 @@ void hal_power_modem_off(void)
 
 void hal_power_sleep_system(void)
 {
-    send_intermcu_cmd("$f1;\012");
+    send_intermcu_cmd("$f7;\012");
     s_is_5v_on = false;
     s_is_modem_on = false;
 }
