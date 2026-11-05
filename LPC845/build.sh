@@ -42,93 +42,35 @@ ${CC} -c -mcpu=cortex-m0plus -mthumb \
     -O2 -g -Wall -fcommon -ffunction-sections -fdata-sections \
     "${DIR}/main.c" -o "${DIR}/main.o"
 
-# Locate Redlib libraries for Cortex-M0+ (thumb/v6-m/nofp)
-REDLIB_DIR0=""
-GCC_LIB_DIR0=""
+# Always link with the toolchain's GCC C library, so every machine builds the same image. The
+# prebuilt driver objects in build_v2 were compiled for Redlib, so drivers are compiled from source.
+echo "=== 2. Compiling drivers & linking LPC845_TWS.axf (GCC libraries) ==="
+GCC_OBJ_DIR="${DIR}/build_gcc"
+mkdir -p "${GCC_OBJ_DIR}"
+GCC_OBJS=""
+for SRC in board/clock_config board/pin_mux device/system_LPC845 \
+           drivers/fsl_adc drivers/fsl_clock drivers/fsl_common drivers/fsl_gpio drivers/fsl_i2c \
+           drivers/fsl_power drivers/fsl_reset drivers/fsl_sctimer drivers/fsl_swm drivers/fsl_syscon drivers/fsl_usart; do
+    OBJ="${GCC_OBJ_DIR}/$(basename "${SRC}").o"
+    ${CC} -c -mcpu=cortex-m0plus -mthumb \
+        -DCPU_LPC845 -DCPU_LPC845M301JBD48 -D__USE_CMSIS -DNDEBUG \
+        -I"${DIR}" -I"${DIR}/CMSIS" -I"${DIR}/device" -I"${DIR}/drivers" -I"${DIR}/board" -I"${DIR}/utilities" \
+        -O2 -g -fcommon -ffunction-sections -fdata-sections \
+        "${DIR}/${SRC}.c" -o "${OBJ}"
+    GCC_OBJS="${GCC_OBJS} ${OBJ}"
+done
 
-if [ -n "${MCUX_TOOLS}" ] && [ -d "${MCUX_TOOLS}/arm-none-eabi/lib/thumb/v6-m/nofp" ]; then
-    REDLIB_DIR0="${MCUX_TOOLS}/arm-none-eabi/lib/thumb/v6-m/nofp"
-    GCC_LIB_DIR0=$(ls -d "${MCUX_TOOLS}"/lib/gcc/arm-none-eabi/*/thumb/v6-m/nofp 2>/dev/null | tail -n 1 || true)
-fi
+${CC} -mcpu=cortex-m0plus -mthumb -nostartfiles --specs=nano.specs --specs=nosys.specs \
+  -Wl,--gc-sections -Wl,--defsym=__main=main -Wl,-Map="${DIR}/LPC845_TWS.map" \
+  -L"${DIR}/Debug" \
+  -T "${DIR}/Debug/lpcxpresso845max_gpio_led_output_Debug.ld" \
+  -o "${DIR}/LPC845_TWS.axf" \
+  "${DIR}/main.o" "${DIR}/build_v2/startup/startup_lpc845.o" ${GCC_OBJS}
 
-if [ -z "${REDLIB_DIR0}" ] || [ ! -f "${REDLIB_DIR0}/libcr_c.a" ]; then
-    REDLIB_C0=$(find /Applications/MCUXpresso* -name "libcr_c.a" 2>/dev/null | grep -E "thumb/v6-?m" | head -n 1 || true)
-    if [ -n "${REDLIB_C0}" ]; then
-        REDLIB_DIR0=$(dirname "${REDLIB_C0}")
-        MCUX_BASE=$(cd "${REDLIB_DIR0}/../../../.." && pwd)
-        GCC_LIB_DIR0=$(ls -d "${MCUX_BASE}"/lib/gcc/arm-none-eabi/*/thumb/v6-m/nofp 2>/dev/null | tail -n 1 || true)
-    fi
-fi
-
-if [ -z "${REDLIB_DIR0}" ] && [ -d "${PROJECT_ROOT}/tools/lib" ]; then
-    REDLIB_DIR0="${PROJECT_ROOT}/tools/lib"
-fi
-
-if [ -n "${REDLIB_DIR0}" ] && [ -f "${REDLIB_DIR0}/libcr_c.a" ]; then
-    echo "=== 2. Linking LPC845_TWS.axf (Redlib: ${REDLIB_DIR0}) ==="
-    ${CC} \
-      -nostdlib \
-      -mcpu=cortex-m0plus -mthumb \
-      -L"${DIR}/Debug" \
-      -L"${REDLIB_DIR0}" \
-      ${GCC_LIB_DIR0:+-L"${GCC_LIB_DIR0}"} \
-      -T "${DIR}/Debug/lpcxpresso845max_gpio_led_output_Debug.ld" \
-      -o "${DIR}/LPC845_TWS.axf" \
-      "${DIR}/main.o" \
-      "${DIR}/build_v2/board/clock_config.o" \
-      "${DIR}/build_v2/board/pin_mux.o" \
-      "${DIR}/build_v2/device/system_LPC845.o" \
-      "${DIR}/build_v2/startup/startup_lpc845.o" \
-      "${DIR}/build_v2/drivers/fsl_adc.o" \
-      "${DIR}/build_v2/drivers/fsl_clock.o" \
-      "${DIR}/build_v2/drivers/fsl_common.o" \
-      "${DIR}/build_v2/drivers/fsl_gpio.o" \
-      "${DIR}/build_v2/drivers/fsl_i2c.o" \
-      "${DIR}/build_v2/drivers/fsl_power.o" \
-      "${DIR}/build_v2/drivers/fsl_reset.o" \
-      "${DIR}/build_v2/drivers/fsl_sctimer.o" \
-      "${DIR}/build_v2/drivers/fsl_swm.o" \
-      "${DIR}/build_v2/drivers/fsl_syscon.o" \
-      "${DIR}/build_v2/drivers/fsl_usart.o"
-
-    echo "=== 3. Generating Binary & Patching Checksum ==="
-    ${OBJCOPY} -O binary "${DIR}/LPC845_TWS.axf" "${DIR}/LPC845_TWS.bin"
-    python3 "${SCRIPTS_DIR}/lpc_checksum.py" "${DIR}/LPC845_TWS.bin"
-    ${OBJCOPY} -I binary -O ihex "${DIR}/LPC845_TWS.bin" "${DIR}/LPC845_TWS.hex"
-    ${SIZE} "${DIR}/LPC845_TWS.axf"
-    echo "=== LPC845 Build Completed Successfully! ==="
-    echo "Flashing HEX: ${DIR}/LPC845_TWS.hex"
-else
-    # No Redlib here: link with the toolchain's GCC C library. The prebuilt driver objects in
-    # build_v2 were compiled for Redlib, so the drivers are compiled fresh from source.
-    echo "=== 2. Compiling drivers & linking LPC845_TWS.axf (GCC libraries) ==="
-    GCC_OBJ_DIR="${DIR}/build_gcc"
-    mkdir -p "${GCC_OBJ_DIR}"
-    GCC_OBJS=""
-    for SRC in board/clock_config board/pin_mux device/system_LPC845 \
-               drivers/fsl_adc drivers/fsl_clock drivers/fsl_common drivers/fsl_gpio drivers/fsl_i2c \
-               drivers/fsl_power drivers/fsl_reset drivers/fsl_sctimer drivers/fsl_swm drivers/fsl_syscon drivers/fsl_usart; do
-        OBJ="${GCC_OBJ_DIR}/$(basename "${SRC}").o"
-        ${CC} -c -mcpu=cortex-m0plus -mthumb \
-            -DCPU_LPC845 -DCPU_LPC845M301JBD48 -D__USE_CMSIS -DNDEBUG \
-            -I"${DIR}" -I"${DIR}/CMSIS" -I"${DIR}/device" -I"${DIR}/drivers" -I"${DIR}/board" -I"${DIR}/utilities" \
-            -O2 -g -fcommon -ffunction-sections -fdata-sections \
-            "${DIR}/${SRC}.c" -o "${OBJ}"
-        GCC_OBJS="${GCC_OBJS} ${OBJ}"
-    done
-
-    ${CC} -mcpu=cortex-m0plus -mthumb -nostartfiles --specs=nano.specs --specs=nosys.specs \
-      -Wl,--gc-sections -Wl,--defsym=__main=main -Wl,-Map="${DIR}/LPC845_TWS.map" \
-      -L"${DIR}/Debug" \
-      -T "${DIR}/Debug/lpcxpresso845max_gpio_led_output_Debug.ld" \
-      -o "${DIR}/LPC845_TWS.axf" \
-      "${DIR}/main.o" "${DIR}/build_v2/startup/startup_lpc845.o" ${GCC_OBJS}
-
-    echo "=== 3. Generating Binary & Patching Checksum ==="
-    ${OBJCOPY} -O binary "${DIR}/LPC845_TWS.axf" "${DIR}/LPC845_TWS.bin"
-    python3 "${SCRIPTS_DIR}/lpc_checksum.py" "${DIR}/LPC845_TWS.bin"
-    ${OBJCOPY} -I binary -O ihex "${DIR}/LPC845_TWS.bin" "${DIR}/LPC845_TWS.hex"
-    ${SIZE} "${DIR}/LPC845_TWS.axf"
-    echo "=== LPC845 Build Completed (GCC libraries)! ==="
-fi
+echo "=== 3. Generating Binary & Patching Checksum ==="
+${OBJCOPY} -O binary "${DIR}/LPC845_TWS.axf" "${DIR}/LPC845_TWS.bin"
+python3 "${SCRIPTS_DIR}/lpc_checksum.py" "${DIR}/LPC845_TWS.bin"
+${OBJCOPY} -I binary -O ihex "${DIR}/LPC845_TWS.bin" "${DIR}/LPC845_TWS.hex"
+${SIZE} "${DIR}/LPC845_TWS.axf"
+echo "=== LPC845 Build Completed (GCC libraries)! ==="
 echo "=== LPC845 Build Successful! Output: ${DIR}/LPC845_TWS.hex ==="
