@@ -27,6 +27,8 @@ static volatile uint16_t s_rx_tail = 0;
 static char s_rx_temp[RX_BUFFER_SIZE];
 static char s_http_req[1024];
 static char s_http_capture[1024];
+static const char *s_active_apn = "";
+static bool s_bearer_ready = false; /* AT+CGACT done since the modem last started or changed APN */
 static char s_sms_capture[512];
 
 static modem_status_t s_modem_status = {
@@ -178,6 +180,29 @@ static void clear_rx(void)
     NVIC_EnableIRQ(UART2_IRQn);
 }
 
+/* A match can land mid-reply ("+NETOPEN:" before its ": 1"). Wait for the modem to stop sending,
+ * then take everything, so nothing acts on half a line. */
+static void rx_settle_and_snapshot(void)
+{
+    uint16_t last = s_rx_head;
+    for (int i = 0; i < 15; i++) {
+        delay_ms(20);
+        if (s_rx_head == last) {
+            break;
+        }
+        last = s_rx_head;
+    }
+
+    uint16_t tail = s_rx_tail;
+    uint16_t head = s_rx_head;
+    uint16_t idx = 0;
+    while (tail != head && idx < sizeof(s_rx_temp) - 1) {
+        s_rx_temp[idx++] = s_rx_buf[tail];
+        tail = (tail + 1) % RX_BUFFER_SIZE;
+    }
+    s_rx_temp[idx] = '\0';
+}
+
 static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_capture, size_t capture_size)
 {
     uint32_t elapsed = 0;
@@ -196,6 +221,8 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
 
             char *match = strstr(s_rx_temp, expected);
             if (match != NULL) {
+                rx_settle_and_snapshot();
+                head = s_rx_head;
                 if (out_capture && capture_size > 0) {
                     strncpy(out_capture, s_rx_temp, capture_size - 1);
                     out_capture[capture_size - 1] = '\0';
@@ -207,6 +234,8 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
 
             /* Detect error response to avoid useless long timeouts */
             if (strstr(s_rx_temp, "ERROR") != NULL && strstr(expected, "ERROR") == NULL) {
+                rx_settle_and_snapshot();
+                head = s_rx_head;
                 if (out_capture && capture_size > 0) {
                     strncpy(out_capture, s_rx_temp, capture_size - 1);
                     out_capture[capture_size - 1] = '\0';
@@ -353,6 +382,45 @@ static void sim7600_ntp_sync_step(void)
     }
 }
 
+/* APN from the SIM (ESP32 get_network rules). An unknown SIM gets airtelgprs.com. */
+static const char *select_apn(const char *iccid, const char *imsi)
+{
+    static const char *const bsnl_iccid[] = {"89917", "89913", "89915"};
+    static const char *const bsnl_imsi[] = {"40434", "40438", "40454", "40455", "40471", "40475", "40522", "40523", "40524"};
+    const char *carrier = "";
+    const char *apn = "airtelgprs.com";
+    bool bsnl = false;
+
+    for (size_t i = 0; i < sizeof(bsnl_iccid) / sizeof(bsnl_iccid[0]); i++) {
+        bsnl = bsnl || (strncmp(iccid, bsnl_iccid[i], 5) == 0);
+    }
+    for (size_t i = 0; i < sizeof(bsnl_imsi) / sizeof(bsnl_imsi[0]); i++) {
+        bsnl = bsnl || (strncmp(imsi, bsnl_imsi[i], 5) == 0);
+    }
+
+    if (bsnl) {
+        apn = "bsnlnet";
+        carrier = "BSNL";
+    } else if (strncmp(iccid, "899116", 6) == 0 || strncmp(iccid, "899110", 6) == 0 || strncmp(iccid, "899145", 6) == 0) {
+        /* Airtel IoT/M2M SIMs */
+        apn = "airteliot.com";
+        carrier = "Airtel";
+    } else if (strncmp(imsi, "40586", 5) == 0 || strncmp(imsi, "40587", 5) == 0) {
+        apn = "jionet";
+        carrier = "Jio";
+    } else if (strncmp(imsi, "40411", 5) == 0 || strncmp(imsi, "40420", 5) == 0) {
+        apn = "www";
+        carrier = "Vi";
+    } else if (strncmp(imsi, "40445", 5) == 0 || strncmp(imsi, "40552", 5) == 0) {
+        carrier = "Airtel";
+    }
+
+    if (carrier[0]) {
+        strncpy(s_modem_status.carrier, carrier, sizeof(s_modem_status.carrier) - 1);
+    }
+    return apn;
+}
+
 bool sim7600_power_on(void)
 {
     if (s_modem_status.is_registered) {
@@ -475,29 +543,7 @@ bool sim7600_power_on(void)
         }
     }
 
-    /* Smart APN Chain Lookup:
-     * - ICCID prefixes (Airtel IoT/M2M SIMs refuse airtelgprs.com):
-     *   899116, 899110, 899145 -> airteliot.com
-     * - IMSI MCC-MNC prefixes (first 5 digits):
-     *   40445 (Airtel KA), 40552 (Airtel Bihar) -> airtelgprs.com
-     *   40471 (BSNL KA), 40475 (BSNL Bihar)    -> bsnlnet
-     *   40586, 40587 (Reliance Jio)            -> jionet
-     *   40411, 40420 (Vodafone Idea)           -> www
-     */
-    const char *apn = "airtelgprs.com";
-    if (strncmp(s_modem_status.iccid, "899116", 6) == 0 ||
-        strncmp(s_modem_status.iccid, "899110", 6) == 0 ||
-        strncmp(s_modem_status.iccid, "899145", 6) == 0) {
-        apn = "airteliot.com";
-    } else if (strncmp(imsi, "40471", 5) == 0 || strncmp(imsi, "40475", 5) == 0) {
-        apn = "bsnlnet";
-    } else if (strncmp(imsi, "40586", 5) == 0 || strncmp(imsi, "40587", 5) == 0) {
-        apn = "jionet";
-    } else if (strncmp(imsi, "40411", 5) == 0 || strncmp(imsi, "40420", 5) == 0) {
-        apn = "www";
-    } else if (strncmp(imsi, "40445", 5) == 0 || strncmp(imsi, "40552", 5) == 0) {
-        apn = "airtelgprs.com";
-    }
+    const char *apn = select_apn(s_modem_status.iccid, imsi);
 
     char log_apn[64];
     snprintf(log_apn, sizeof(log_apn), "APN Selected: %s (IMSI: %s, ICCID: %s)", apn, imsi, s_modem_status.iccid);
@@ -505,6 +551,8 @@ bool sim7600_power_on(void)
 
     /* Configure PDP Context 1 */
     char apn_cmd[64];
+    s_active_apn = apn;
+    s_bearer_ready = false;
     snprintf(apn_cmd, sizeof(apn_cmd), "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", apn);
     clear_rx();
     send_raw(apn_cmd);
@@ -519,10 +567,6 @@ bool sim7600_power_on(void)
 
     clear_rx();
     send_raw("AT+CSOCKSETPN=1\r\n");
-    wait_response("OK", 1000, NULL, 0);
-
-    /* Define PDP Context 5 as Network Default empty APN */
-    send_raw("AT+CGDCONT=5,\"IP\",\"\"\r\n");
     wait_response("OK", 1000, NULL, 0);
 
     /* 7. Radio Mode Selection (ESP32 flow): start on the mode that last worked (4G by default),
@@ -683,6 +727,7 @@ void sim7600_power_off(void)
 
     /* Reset worker state so supervisor does not poll while powered down */
     s_worker_state = MODEM_ST_UNINIT;
+    s_bearer_ready = false;
     s_modem_status.is_registered = false;
     s_modem_status.is_pdp_active = false;
     s_modem_status.csq_val = 99;
@@ -759,27 +804,11 @@ void sim7600_worker_step(void)
                 if (*p) sscanf(p, "%15s", imsi);
             }
 
-            const char *apn = "airtelgprs.com";
-            if (strncmp(s_modem_status.iccid, "899116", 6) == 0 ||
-                strncmp(s_modem_status.iccid, "899110", 6) == 0 ||
-                strncmp(s_modem_status.iccid, "899145", 6) == 0) {
-                apn = "airteliot.com";
-                strncpy(s_modem_status.carrier, "Airtel", sizeof(s_modem_status.carrier) - 1);
-            } else if (strncmp(imsi, "40471", 5) == 0 || strncmp(imsi, "40475", 5) == 0) {
-                apn = "bsnlnet";
-                strncpy(s_modem_status.carrier, "BSNL", sizeof(s_modem_status.carrier) - 1);
-            } else if (strncmp(imsi, "40586", 5) == 0 || strncmp(imsi, "40587", 5) == 0) {
-                apn = "jionet";
-                strncpy(s_modem_status.carrier, "Jio", sizeof(s_modem_status.carrier) - 1);
-            } else if (strncmp(imsi, "40411", 5) == 0 || strncmp(imsi, "40420", 5) == 0) {
-                apn = "www";
-                strncpy(s_modem_status.carrier, "Vi", sizeof(s_modem_status.carrier) - 1);
-            } else if (strncmp(imsi, "40445", 5) == 0 || strncmp(imsi, "40552", 5) == 0) {
-                apn = "airtelgprs.com";
-                strncpy(s_modem_status.carrier, "Airtel", sizeof(s_modem_status.carrier) - 1);
-            }
+            const char *apn = select_apn(s_modem_status.iccid, imsi);
 
             char apn_cmd[64];
+            s_active_apn = apn;
+            s_bearer_ready = false;
             snprintf(apn_cmd, sizeof(apn_cmd), "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", apn);
             clear_rx();
             send_raw(apn_cmd);
@@ -877,12 +906,225 @@ void sim7600_worker_step(void)
     sim7600_release();
 }
 
-bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, char *date_hdr_out, size_t date_hdr_size)
+/* The carrier's own view of the data connection: the APN and address really in use */
+static void log_bearer_details(void)
 {
-    if (!endpoint || !payload) return false;
+    clear_rx();
+    send_raw("AT+CGCONTRDP=1\r\n");
+    wait_response("OK", 3000, NULL, 0);
+}
 
+/* ESP32 try_activate_apn, plus AT+CGSOCKCONT and AT+CSOCKSETPN, which the SIM7600's own socket
+ * stack needs. CID 1's APN is only rewritten if it differs: this runs up to 96 times a day, and
+ * the modem keeps it in flash. */
+static bool __attribute__((noinline)) activate_apn(const char *apn)
+{
+    const char *pdp_type = (strcmp(apn, "jionet") == 0) ? "IPV4V6" : "IP";
+    char cmd[64];
+    char reply[256] = "";
+    char log_msg[72];
+
+    snprintf(log_msg, sizeof(log_msg), "Activating data connection on APN %s", apn);
+    storage_log_debug("APN", log_msg);
+    report_progress("ACTIVATING DATA ");
+
+    /* The ESP32 blanks these side channels. CID 5 came from older firmware here: delete it. */
+    clear_rx();
+    send_raw("AT+CGDCONT=5\r\n");
+    wait_response("OK", 1000, NULL, 0);
+    clear_rx();
+    send_raw("AT+CGDCONT=8,\"IP\",\"\"\r\n");
+    wait_response("OK", 1000, NULL, 0);
+    clear_rx();
+    send_raw("AT+CGDCONT=9,\"IP\",\"\"\r\n");
+    wait_response("OK", 1000, NULL, 0);
+
+    snprintf(cmd, sizeof(cmd), "+CGDCONT: 1,\"%s\",\"%s\"", pdp_type, apn);
+    clear_rx();
+    send_raw("AT+CGDCONT?\r\n");
+    bool apn_stored = wait_response("OK", 2000, reply, sizeof(reply)) && strstr(reply, cmd);
+    if (!apn_stored) {
+        snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"%s\",\"%s\"\r\n", pdp_type, apn);
+        clear_rx();
+        send_raw(cmd);
+        wait_response("OK", 3000, NULL, 0);
+    }
+    delay_ms(800);
+
+    snprintf(cmd, sizeof(cmd), "AT+CGSOCKCONT=1,\"%s\",\"%s\"\r\n", pdp_type, apn);
+    clear_rx();
+    send_raw(cmd);
+    wait_response("OK", 2000, NULL, 0);
+    clear_rx();
+    send_raw("AT+CSOCKSETPN=1\r\n");
+    wait_response("OK", 1000, NULL, 0);
+
+    bool active = false;
+    for (int attempt = 0; attempt < 2 && !active; attempt++) {
+        clear_rx();
+        send_raw("AT+CGACT=1,1\r\n");
+        active = wait_response("OK", 25000, NULL, 0);
+        if (!active && attempt == 0) {
+            clear_rx();
+            send_raw("AT+CGATT=1\r\n");
+            wait_response("OK", 3000, NULL, 0);
+            delay_ms(1500);
+        }
+    }
+
+    /* A SIM7600 can answer ERROR when CID 1 is already up, so ask rather than assume */
+    if (!active) {
+        reply[0] = '\0';
+        clear_rx();
+        send_raw("AT+CGACT?\r\n");
+        active = wait_response("OK", 3000, reply, sizeof(reply)) && strstr(reply, "+CGACT: 1,1");
+    }
+    if (!active) {
+        storage_log_debug("APN", "Data connection did not activate");
+        return false;
+    }
+
+    /* After a cold start the address can take a few seconds to arrive */
+    for (int i = 0; i < 8; i++) {
+        delay_ms(i == 0 ? 1000 : 2500);
+        reply[0] = '\0';
+        clear_rx();
+        send_raw("AT+CGPADDR=1\r\n");
+        if (wait_response("OK", 3000, reply, sizeof(reply)) && !strstr(reply, "0.0.0.0")) {
+            return true;
+        }
+    }
+    storage_log_debug("APN", "Activated, but no address (0.0.0.0) after 20s: treating as failed");
+    return false;
+}
+
+/* An attached LTE modem keeps the APN it attached with, so the radio restarts for the change.
+ * AT+CFUN=4 rather than 0: at 0 the SIM drops out and AT+CGDCONT answers ERROR. */
+static bool __attribute__((noinline)) reattach_on_apn(const char *apn)
+{
+    char cmd[64];
+    char reg[64];
+
+    clear_rx();
+    send_raw("AT+NETCLOSE\r\n");
+    wait_response("+NETCLOSE", 3000, NULL, 0);
+
+    clear_rx();
+    send_raw("AT+CFUN=4\r\n");
+    wait_response("OK", 5000, NULL, 0);
+    delay_ms(1000);
+
+    snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"%s\",\"%s\"\r\n", (strcmp(apn, "jionet") == 0) ? "IPV4V6" : "IP", apn);
+    clear_rx();
+    send_raw(cmd);
+    wait_response("OK", 3000, NULL, 0);
+
+    clear_rx();
+    send_raw("AT+CFUN=1\r\n");
+    wait_response("OK", 5000, NULL, 0);
+
+    s_active_apn = apn;
+    s_bearer_ready = false;
+
+    for (int i = 0; i < 15; i++) {
+        delay_ms(2000);
+        for (int which = 0; which < 2; which++) {
+            reg[0] = '\0';
+            clear_rx();
+            send_raw(which ? "AT+CGREG?\r\n" : "AT+CEREG?\r\n");
+            if (wait_response(which ? "+CGREG:" : "+CEREG:", 1500, reg, sizeof(reg)) && (strstr(reg, ",1") || strstr(reg, ",5"))) {
+                return true;
+            }
+        }
+    }
+    storage_log_debug("APN", "Did not register on this APN");
+    return false;
+}
+
+/* ESP32 flow: the SIM's APN first, then the fallback list, then a CGATT reset. The list stops
+ * after about 3 minutes so a bad SIM can't use up the slot. If all fail, the send still runs. */
+#define BEARER_SEARCH_MAX_TICKS (180000 / portTICK_RATE_MS)
+
+static void __attribute__((noinline)) ensure_bearer(void)
+{
+    static const char *const fallback_apns[] = {"airteliot.com", "airtelgprs.com", "bsnlnet", "jionet", "bsnlm2m"};
+
+    if (s_bearer_ready) {
+        return;
+    }
+
+    const char *primary = s_active_apn;
+    portTickType start = xTaskGetTickCount();
+
+    s_bearer_ready = primary[0] && activate_apn(primary);
+
+    for (size_t i = 0; i < sizeof(fallback_apns) / sizeof(fallback_apns[0]) && !s_bearer_ready; i++) {
+        if (strcmp(fallback_apns[i], primary) == 0 || (xTaskGetTickCount() - start) > BEARER_SEARCH_MAX_TICKS) {
+            continue;
+        }
+        s_bearer_ready = reattach_on_apn(fallback_apns[i]) && activate_apn(fallback_apns[i]);
+    }
+
+    if (!s_bearer_ready && primary[0]) {
+        storage_log_debug("APN", "All APNs failed: resetting with AT+CGATT");
+        reattach_on_apn(primary);
+        clear_rx();
+        send_raw("AT+CGATT=0\r\n");
+        wait_response("OK", 5000, NULL, 0);
+        delay_ms(1000);
+        clear_rx();
+        send_raw("AT+CGATT=1\r\n");
+        wait_response("OK", 5000, NULL, 0);
+        delay_ms(2000);
+        s_bearer_ready = activate_apn(primary);
+    }
+
+    log_bearer_details();
+}
+
+/* "+IPD" only says a reply has started. Collect the rest, up to 8s as the ESP32 does, because a
+ * "Rejected" in the body can arrive after the "200 OK" in the header. */
+#define HTTP_REPLY_MAX_MS   8000
+#define HTTP_REPLY_QUIET_MS 1500
+
+static void collect_http_reply(char *buf, size_t size)
+{
+    size_t start = strlen(buf);
+    size_t len = start;
+    uint32_t quiet_ms = 0;
+
+    for (uint32_t elapsed = 0; elapsed < HTTP_REPLY_MAX_MS; elapsed += 20) {
+        bool got_data = false;
+        while (s_rx_tail != s_rx_head) {
+            char c = s_rx_buf[s_rx_tail];
+            s_rx_tail = (s_rx_tail + 1) % RX_BUFFER_SIZE;
+            got_data = true;
+            if (len < size - 1) {
+                buf[len++] = c;
+            }
+        }
+        buf[len] = '\0';
+
+        if (strstr(buf, "+IPCLOSE")) {
+            break; /* Server has finished and closed the connection */
+        }
+        quiet_ms = got_data ? 0 : quiet_ms + 20;
+        if (quiet_ms >= HTTP_REPLY_QUIET_MS && strstr(buf, "HTTP/1.")) {
+            break;
+        }
+        delay_ms(20);
+    }
+
+    if (len > start) {
+        storage_log_debug("MODEM_RX", &buf[start]);
+    }
+}
+
+/* Direct TCP socket. *got_reply says the server answered, so its verdict stands. */
+static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpoint, const char *host, const char *payload, char *date_hdr_out, size_t date_hdr_size, bool *got_reply)
+{
     char log_msg[128];
-    char capture[256];
+    char capture[256] = "";
 
     /* Step 1: Ensure IP Stack (NETOPEN) is active */
     bool net_is_open = false;
@@ -896,6 +1138,11 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
     }
 
     if (!net_is_open) {
+        /* Only accepted while the network is closed */
+        clear_rx();
+        send_raw("AT+CIPMODE=0\r\n");
+        wait_response("OK", 1000, NULL, 0);
+
         clear_rx();
         send_raw("AT+NETOPEN\r\n");
         /* SIM7600 responds OK immediately, then asynchronously +NETOPEN: 0 on bearer activation */
@@ -938,8 +1185,8 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
 
     /* Step 4: Open Layer-4 direct TCP socket to endpoint */
     char open_cmd[128];
-    snprintf(open_cmd, sizeof(open_cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%d\r\n", endpoint->ip, endpoint->port);
-    snprintf(log_msg, sizeof(log_msg), "Connecting to %s:%d...", endpoint->ip, endpoint->port);
+    snprintf(open_cmd, sizeof(open_cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%d\r\n", host, endpoint->port);
+    snprintf(log_msg, sizeof(log_msg), "Connecting to %s:%d...", host, endpoint->port);
     storage_log_debug("TCP", log_msg);
 
     clear_rx();
@@ -955,15 +1202,20 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
 
     /* Step 5: Format HTTP Request Headers */
     const char *content_type = (endpoint->format == FORMAT_JSON) ? "application/json" : "application/x-www-form-urlencoded";
+    /* Host is what we connected to, as in the TWS6 firmware that delivers on this board */
+    char port_text[8] = "";
+    if (endpoint->port != 80) {
+        snprintf(port_text, sizeof(port_text), ":%d", endpoint->port);
+    }
     int req_len = snprintf(s_http_req, sizeof(s_http_req),
         "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
+        "Host: %s%s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
         "Connection: close\r\n"
         "\r\n"
         "%s",
-        endpoint->path, endpoint->domain, content_type, (int)strlen(payload), payload
+        endpoint->path, host, port_text, content_type, (int)strlen(payload), payload
     );
 
     /* Step 6: Send Data */
@@ -983,8 +1235,14 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
 
     /* Step 7: Wait for Server Response */
     bool success = false;
-    if (wait_response("+IPD", 15000, s_http_capture, sizeof(s_http_capture))) {
+    s_http_capture[0] = '\0';
+    /* "+IP" catches +IPD and +IPCLOSE: a closed socket can't answer, so stop waiting */
+    if (wait_response("+IP", 15000, s_http_capture, sizeof(s_http_capture)) && !strstr(s_http_capture, "+IPD")) {
+        storage_log_debug("HTTP", "Connection closed with no reply from the server");
+    } else if (strstr(s_http_capture, "+IPD")) {
         storage_log_debug("TCP", "Received server response (+IPD)");
+        *got_reply = true;
+        collect_http_reply(s_http_capture, sizeof(s_http_capture));
         storage_log_http(s_http_capture);
 
         /* Parse and log HTTP status line or first line of response */
@@ -1044,6 +1302,320 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
 
     return success;
 }
+
+/* The modem's own HTTP commands: the ESP32's fallback when a TCP post gets no answer */
+static bool __attribute__((noinline)) http_post_modem_stack(const http_endpoint_t *endpoint, const char *payload)
+{
+    const char *content_type = (endpoint->format == FORMAT_JSON) ? "application/json" : "application/x-www-form-urlencoded";
+    char log_msg[96];
+    bool success = false;
+
+    storage_log_debug("HTTP", "TCP post unconfirmed, trying modem HTTP commands");
+
+    /* A session left open makes HTTPINIT fail */
+    clear_rx();
+    send_raw("AT+HTTPTERM\r\n");
+    wait_response("OK", 1000, NULL, 0);
+
+    clear_rx();
+    send_raw("AT+HTTPINIT\r\n");
+    if (!wait_response("OK", 5000, NULL, 0)) {
+        storage_log_debug("HTTP", "AT+HTTPINIT failed");
+        return false;
+    }
+
+    if (endpoint->port == 80) {
+        snprintf(s_http_req, sizeof(s_http_req), "AT+HTTPPARA=\"URL\",\"http://%s%s\"\r\n", endpoint->domain, endpoint->path);
+    } else {
+        snprintf(s_http_req, sizeof(s_http_req), "AT+HTTPPARA=\"URL\",\"http://%s:%d%s\"\r\n", endpoint->domain, endpoint->port, endpoint->path);
+    }
+    clear_rx();
+    send_raw(s_http_req);
+    wait_response("OK", 1000, NULL, 0);
+
+    snprintf(s_http_req, sizeof(s_http_req), "AT+HTTPPARA=\"CONTENT\",\"%s\"\r\n", content_type);
+    clear_rx();
+    send_raw(s_http_req);
+    wait_response("OK", 1000, NULL, 0);
+
+    clear_rx();
+    send_raw("AT+HTTPPARA=\"ACCEPT\",\"*/*\"\r\n");
+    wait_response("OK", 1000, NULL, 0);
+
+    snprintf(s_http_req, sizeof(s_http_req), "AT+HTTPDATA=%d,5000\r\n", (int)strlen(payload));
+    clear_rx();
+    send_raw(s_http_req);
+    if (!wait_response("DOWNLOAD", 5000, NULL, 0)) {
+        storage_log_debug("HTTP", "AT+HTTPDATA: no DOWNLOAD prompt");
+        goto done;
+    }
+
+    clear_rx();
+    send_raw(payload);
+    if (!wait_response("OK", 6000, NULL, 0)) {
+        storage_log_debug("HTTP", "AT+HTTPDATA: payload not confirmed");
+        goto done;
+    }
+
+    clear_rx();
+    send_raw("AT+HTTPACTION=1\r\n");
+    if (!wait_response("+HTTPACTION:", 25000, s_http_capture, sizeof(s_http_capture))) {
+        storage_log_debug("HTTP", "AT+HTTPACTION: no result in 25s");
+        goto done;
+    }
+
+    /* +HTTPACTION: 1,<status>,<length> */
+    int status = 0;
+    int length = 0;
+    const char *field = strstr(s_http_capture, "+HTTPACTION:");
+    field = field ? strchr(field, ',') : NULL;
+    if (field) {
+        status = atoi(field + 1);
+        field = strchr(field + 1, ',');
+        length = field ? atoi(field + 1) : 0;
+    }
+    snprintf(log_msg, sizeof(log_msg), "Modem HTTP status %d, body %d bytes", status, length);
+    storage_log_debug("HTTP", log_msg);
+    if (status < 200 || status > 202) {
+        goto done;
+    }
+
+    s_http_capture[0] = '\0';
+    if (length > 0) {
+        clear_rx();
+        send_raw("AT+HTTPREAD=0,512\r\n");
+        wait_response("+HTTPREAD:", 10000, s_http_capture, sizeof(s_http_capture));
+    }
+    storage_log_http(s_http_capture);
+
+    if (strstr(s_http_capture, "Rejected") || strstr(s_http_capture, "rejected") ||
+        strstr(s_http_capture, "REJECTED") || strstr(s_http_capture, "Invalid") ||
+        strstr(s_http_capture, "invalid")) {
+        storage_log_debug("HTTP", "Server REJECTED the record");
+        sync_clock_from_server(s_http_capture, true);
+    } else {
+        success = true;
+        storage_log_debug("HTTP", "HTTP POST Verified OK through modem HTTP commands");
+        sync_clock_from_server(s_http_capture, false);
+    }
+
+done:
+    clear_rx();
+    send_raw("AT+HTTPTERM\r\n");
+    wait_response("OK", 2000, NULL, 0);
+    return success;
+}
+
+bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, char *date_hdr_out, size_t date_hdr_size)
+{
+    if (!endpoint || !payload) return false;
+
+    ensure_bearer();
+
+    bool got_reply = false;
+    /* TWS6 order: IP, then domain. If the server answered "no", asking again another way
+     * won't change that. */
+    bool success = http_post_tcp(endpoint, endpoint->ip, payload, date_hdr_out, date_hdr_size, &got_reply);
+    if (!success && !got_reply) {
+        delay_ms(1000);
+        success = http_post_tcp(endpoint, endpoint->domain, payload, date_hdr_out, date_hdr_size, &got_reply);
+    }
+    if (!success && !got_reply) {
+        success = http_post_modem_stack(endpoint, payload);
+    }
+
+    if (!success && !got_reply) {
+        log_bearer_details();
+    }
+    return success;
+}
+
+#if ENABLE_TEST_SEND
+/* TEMPORARY: runs after a failed TEST SEND to show which layer drops the data. The GETs store
+ * nothing. Every result is in the log under [DIAG]. */
+static void diag_query(const char *cmd)
+{
+    clear_rx();
+    send_raw(cmd);
+    wait_response("OK", 2000, NULL, 0);
+}
+
+/* A socket can linger after its reply: restart the network so each check starts clean */
+static void diag_restart_network(void)
+{
+    clear_rx();
+    send_raw("AT+NETCLOSE\r\n");
+    wait_response("+NETCLOSE", 5000, NULL, 0);
+    delay_ms(500);
+    clear_rx();
+    send_raw("AT+NETOPEN\r\n");
+    wait_response("+NETOPEN: 0", 10000, NULL, 0);
+}
+
+static void __attribute__((noinline)) diag_get(const char *host, int port, const char *path)
+{
+    char line[112];
+    int len = snprintf(s_http_req, sizeof(s_http_req), "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
+    const char *result = "COULD NOT CONNECT";
+
+    clear_rx();
+    send_raw("AT+CIPCLOSE=0\r\n");
+    wait_response("OK", 1000, NULL, 0);
+
+    snprintf(line, sizeof(line), "AT+CIPOPEN=0,\"TCP\",\"%s\",%d\r\n", host, port);
+    clear_rx();
+    send_raw(line);
+    if (wait_response("+CIPOPEN: 0,0", 20000, NULL, 0)) {
+        snprintf(line, sizeof(line), "AT+CIPSEND=0,%d\r\n", len);
+        clear_rx();
+        send_raw(line);
+        result = "NO SEND PROMPT";
+        if (wait_response(">", 5000, NULL, 0)) {
+            s_http_capture[0] = '\0';
+            clear_rx();
+            send_raw(s_http_req);
+            result = "NO RESPONSE IN 15S";
+            if (wait_response("+IP", 15000, s_http_capture, sizeof(s_http_capture))) {
+                if (strstr(s_http_capture, "+IPD")) {
+                    collect_http_reply(s_http_capture, sizeof(s_http_capture));
+                    result = "GOT A REPLY";
+                } else {
+                    result = "CLOSED WITH NO REPLY";
+                }
+            }
+        }
+    }
+    clear_rx();
+    send_raw("AT+CIPCLOSE=0\r\n");
+    wait_response("OK", 1000, NULL, 0);
+
+    snprintf(line, sizeof(line), "GET %s:%d%s -> %s", host, port, path, result);
+    storage_log_debug("DIAG", line);
+    diag_restart_network();
+}
+
+/* The POST with AT+CIPRXGET=1 (manual receive), the mode of the gprs_v2 flow known to work with
+ * this SIM. The mode can only change while the network is closed. */
+static bool __attribute__((noinline)) diag_post_rxget(const http_endpoint_t *endpoint, const char *payload)
+{
+    char line[80];
+    bool sent = false;
+    const char *result = "COULD NOT CONNECT";
+    int len = snprintf(s_http_req, sizeof(s_http_req),
+        "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: %s\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+        endpoint->path, endpoint->ip,
+        (endpoint->format == FORMAT_JSON) ? "application/json" : "application/x-www-form-urlencoded",
+        (int)strlen(payload), payload);
+
+    clear_rx();
+    send_raw("AT+NETCLOSE\r\n");
+    wait_response("+NETCLOSE", 3000, NULL, 0);
+    diag_query("AT+CIPRXGET=1\r\n");
+    clear_rx();
+    send_raw("AT+NETOPEN\r\n");
+    wait_response("+NETOPEN: 0", 10000, NULL, 0);
+
+    snprintf(line, sizeof(line), "AT+CIPOPEN=0,\"TCP\",\"%s\",%d\r\n", endpoint->ip, endpoint->port);
+    clear_rx();
+    send_raw(line);
+    if (wait_response("+CIPOPEN: 0,0", 20000, NULL, 0)) {
+        snprintf(line, sizeof(line), "AT+CIPSEND=0,%d\r\n", len);
+        clear_rx();
+        send_raw(line);
+        result = "NO SEND PROMPT";
+        if (wait_response(">", 5000, NULL, 0)) {
+            s_http_capture[0] = '\0';
+            clear_rx();
+            send_raw(s_http_req);
+            result = "NO RESPONSE IN 15S";
+            /* Wait past our own send confirmation for what happens next */
+            wait_response("+CIPSEND:", 5000, s_http_capture, sizeof(s_http_capture));
+            if (!strstr(s_http_capture, "+CIPRXGET: 1") && !strstr(s_http_capture, "+IPCLOSE")) {
+                wait_response("+", 15000, s_http_capture, sizeof(s_http_capture));
+            }
+            if (strstr(s_http_capture, "+CIPRXGET: 1")) {
+                s_http_capture[0] = '\0';
+                clear_rx();
+                send_raw("AT+CIPRXGET=2,0,512\r\n");
+                wait_response("OK", 5000, s_http_capture, sizeof(s_http_capture));
+                storage_log_http(s_http_capture);
+                result = "GOT A REPLY";
+                sent = strstr(s_http_capture, "200 OK") && !strstr(s_http_capture, "Rejected") && !strstr(s_http_capture, "Invalid");
+            } else if (strstr(s_http_capture, "+IPCLOSE")) {
+                result = "CLOSED WITH NO REPLY";
+            }
+        }
+    }
+    clear_rx();
+    send_raw("AT+CIPCLOSE=0\r\n");
+    wait_response("OK", 1000, NULL, 0);
+    clear_rx();
+    send_raw("AT+NETCLOSE\r\n");
+    wait_response("+NETCLOSE", 3000, NULL, 0);
+    diag_query("AT+CIPRXGET=0\r\n");
+
+    snprintf(line, sizeof(line), "POST with AT+CIPRXGET=1 -> %s%s", result, sent ? ", DELIVERED" : "");
+    storage_log_debug("DIAG", line);
+    return sent;
+}
+
+bool sim7600_net_diagnostics(const http_endpoint_t *endpoint, const char *payload)
+{
+    storage_log_debug("DIAG", "=== Checks after a failed send ===");
+    report_progress("RUNNING CHECKS  ");
+
+    /* 1. Modem firmware and its stored socket settings */
+    diag_query("AT+CGMR\r\n");
+    diag_query("AT+CIPCCFG?\r\n");
+    diag_query("AT+CIPTIMEOUT?\r\n");
+    diag_query("AT+CIPSENDMODE?\r\n");
+    diag_query("AT+CIPHEAD?\r\n");
+    diag_query("AT+CIPRXGET?\r\n");
+
+    /* 2. Is the data connection up, and can it reach the server at all? */
+    clear_rx();
+    send_raw("AT+NETOPEN\r\n");
+    wait_response("+NETOPEN: 0", 10000, NULL, 0);
+
+    char ping[64];
+    snprintf(ping, sizeof(ping), "AT+CPING=\"%s\",1,3,64,1000,10000,255\r\n", endpoint->ip);
+    clear_rx();
+    send_raw(ping);
+    wait_response("+CPING: 3", 20000, NULL, 0);
+
+    /* 3. A reply from this server to a GET says the POST is what gets dropped. A reply from other
+     *    sites, but not this one, points at the route to this server. The gprs_v2 flow known to
+     *    work with this SIM used the test server on 8090 and Bihar on 8085, never port 80, so
+     *    those two separate this firmware from the port. */
+    diag_restart_network();
+    diag_get(endpoint->ip, endpoint->port, endpoint->path);
+    diag_get("rtdas.ksndmc.net", 80, "/tws_gprs/update_tws_data_v3");
+    diag_get("example.com", 80, "/");
+    diag_get("sittest5.eastus.cloudapp.azure.com", 8090, "/trg/test");
+    diag_get("115.245.49.114", 8085, "/Home/UpdateTRGData"); /* The ESP32's active Bihar server */
+
+    /* 4. The receive mode of the flow known to work with this SIM */
+    if (diag_post_rxget(endpoint, payload)) {
+        return true;
+    }
+    clear_rx();
+    send_raw("AT+NETOPEN\r\n");
+    wait_response("+NETOPEN: 0", 10000, NULL, 0);
+
+    /* 5. TWS6 never sends AT&D0, and this close code can mean DTR went off */
+    bool got_reply = false;
+    storage_log_debug("DIAG", "Repeating the POST with AT&D1 (TWS6 does not set AT&D0)");
+    diag_query("AT&D1\r\n");
+    bool sent = http_post_tcp(endpoint, endpoint->ip, payload, NULL, 0, &got_reply);
+    diag_query("AT&D0\r\n");
+
+    storage_log_debug("DIAG", sent ? "POST with AT&D1: DELIVERED" :
+                               got_reply ? "POST with AT&D1: server replied, record refused" :
+                               "POST with AT&D1: no reply");
+    return sent;
+}
+#endif /* ENABLE_TEST_SEND */
 
 void sim7600_get_status(modem_status_t *out_status)
 {

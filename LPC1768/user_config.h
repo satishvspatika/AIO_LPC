@@ -16,11 +16,21 @@
 
 /* Active Station Selection: Choose one of KSNDMC_TRG, BIHAR_TRG, KSNDMC_TWS */
 #ifndef UNIT_CFG
-#define UNIT_CFG        KSNDMC_TWS
+#define UNIT_CFG        BIHAR_TRG
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.2.9"
+#define FIRMWARE_VERSION    "v6.5.2"
+
+/* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
+#define ENABLE_TEST_SEND    1
+#if (UNIT_CFG == KSNDMC_TRG)
+#define TEST_STATION_ID     "1001"
+#elif (UNIT_CFG == BIHAR_TRG)
+#define TEST_STATION_ID     "1003"
+#else
+#define TEST_STATION_ID     "1002"
+#endif
 #define STATION_ID_DEFAULT  "001061"
 
 /* Status SMS Destination & Network Identifiers */

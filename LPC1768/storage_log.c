@@ -21,9 +21,11 @@ static volatile uint16_t s_head = 0;
 static volatile uint16_t s_tail = 0;
 static volatile uint32_t s_dropped_lines = 0; /* Lines lost because the ring buffer was full */
 static uint32_t s_write_failures = 0;         /* Times the log file could not be written */
+static int s_last_write_error = 0;            /* FatFs result of the last failure */
 static bool s_log_dir_ready = false;
 static portTickType s_next_log_retry_tick = 0;
 #define LOG_RETRY_TICKS (5000 / portTICK_RATE_MS) /* With no card, don't keep retrying the card */
+#define LOG_WRITE_RETRY_TICKS (500 / portTICK_RATE_MS)
 
 /* FreeRTOS Mutex for thread-safe FatFs access across tasks */
 static xSemaphoreHandle s_fs_mutex = NULL;
@@ -212,7 +214,11 @@ void storage_log_slot(const char *csv_line)
         f_lseek(&s_http_file, s_http_file.fsize);
         f_write(&s_http_file, csv_line, strlen(csv_line), &bw);
         f_write(&s_http_file, "\r\n", 2, &bw);
-        f_close(&s_http_file);
+        FRESULT res = f_close(&s_http_file);
+        if (res != FR_OK) {
+            s_write_failures++;
+            s_last_write_error = (int)res;
+        }
     } else {
         s_write_failures++;
     }
@@ -296,6 +302,32 @@ static void current_log_path(char *path, size_t size)
     snprintf(path, size, "%s", DEBUG_LOG_FILENAME);
 }
 
+/* A failed write keeps its lines in the buffer, to be written again. With no card, the oldest go
+ * once the buffer is nearly full, so the newest lines are the ones kept. */
+static void log_write_failed(FRESULT res, portTickType retry_ticks)
+{
+    s_write_failures++;
+    s_last_write_error = (int)res;
+    s_next_log_retry_tick = xTaskGetTickCount() + retry_ticks;
+
+    taskENTER_CRITICAL();
+    uint16_t count = (s_head >= s_tail) ? (s_head - s_tail) : (RING_BUFFER_SIZE - s_tail + s_head);
+    if (count > (RING_BUFFER_SIZE - 200)) {
+        /* At least 128 bytes, ending on a line ending so the rest are whole lines */
+        for (uint16_t n = 0; s_tail != s_head; n++) {
+            char c = s_ring_buffer[s_tail];
+            s_tail = (s_tail + 1) % RING_BUFFER_SIZE;
+            if (c == '\n') {
+                s_dropped_lines++;
+                if (n >= 128) {
+                    break;
+                }
+            }
+        }
+    }
+    taskEXIT_CRITICAL();
+}
+
 void storage_log_drain_step(void)
 {
     if (s_head == s_tail) return; /* No data to flush */
@@ -316,61 +348,95 @@ void storage_log_drain_step(void)
     static char s_log_path[24];
     current_log_path(s_log_path, sizeof(s_log_path));
 
-    if (f_open(&s_drain_file, s_log_path, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
-        f_lseek(&s_drain_file, s_drain_file.fsize);
+    FRESULT res = f_open(&s_drain_file, s_log_path, FA_OPEN_ALWAYS | FA_WRITE);
+    if (res != FR_OK) {
+        /* SD card might have been pulled or not ready yet */
+        f_mount(0, &s_fatfs); /* Forces a fresh card start on the next try */
+        log_write_failed(res, LOG_RETRY_TICKS);
+        fs_unlock();
+        return;
+    }
 
-        static char s_drain_buf[512];
-        uint16_t drain_idx = 0;
+    /* Only copied here: they leave the buffer once the card has taken them */
+    static char s_drain_buf[512];
+    uint16_t drain_idx = 0;
+    uint16_t read_pos = s_tail;
 
+    taskENTER_CRITICAL();
+    while (read_pos != s_head && drain_idx < sizeof(s_drain_buf)) {
+        s_drain_buf[drain_idx++] = s_ring_buffer[read_pos];
+        read_pos = (read_pos + 1) % RING_BUFFER_SIZE;
+    }
+    taskEXIT_CRITICAL();
+
+    /* Whole lines only, so the note below can't land inside one. A line is under 256 bytes. */
+    uint16_t whole = drain_idx;
+    while (whole > 0 && s_drain_buf[whole - 1] != '\n') {
+        whole--;
+    }
+    if (whole > 0 && whole < drain_idx) {
+        read_pos = (s_tail + whole) % RING_BUFFER_SIZE;
+        drain_idx = whole;
+    }
+
+    UINT bw = 0;
+    res = f_lseek(&s_drain_file, s_drain_file.fsize);
+    if (res == FR_OK) {
+        res = f_write(&s_drain_file, s_drain_buf, drain_idx, &bw);
+    }
+    if (res == FR_OK && bw != drain_idx) {
+        res = FR_DENIED; /* Card is full */
+    }
+
+    /* Record anything the log itself lost, so gaps in it can be explained */
+    uint32_t dropped = 0;
+    uint32_t failures = s_write_failures;
+    if (res == FR_OK) {
         taskENTER_CRITICAL();
-        while (s_tail != s_head && drain_idx < sizeof(s_drain_buf)) {
-            s_drain_buf[drain_idx++] = s_ring_buffer[s_tail];
-            s_tail = (s_tail + 1) % RING_BUFFER_SIZE;
-        }
-        taskEXIT_CRITICAL();
-
-        if (drain_idx > 0) {
-            UINT bw;
-            f_write(&s_drain_file, s_drain_buf, drain_idx, &bw);
-        }
-
-        /* Record anything the log itself lost, so gaps in it can be explained */
-        taskENTER_CRITICAL();
-        uint32_t dropped = s_dropped_lines;
+        dropped = s_dropped_lines;
         s_dropped_lines = 0;
         taskEXIT_CRITICAL();
-        if (dropped > 0 || s_write_failures > 0) {
-            char note[64];
-            UINT bw;
-            int note_len = snprintf(note, sizeof(note), "[LOG] LOST %u lines (buffer full), %u SD write failures\r\n",
-                                    (unsigned int)dropped, (unsigned int)s_write_failures);
-            s_write_failures = 0;
+        if (dropped > 0 || failures > 0) {
+            char note[88];
+            UINT note_bw;
+            int note_len = snprintf(note, sizeof(note), "[LOG] LOST %u lines (buffer full), %u SD write failures, last error %d\r\n",
+                                    (unsigned int)dropped, (unsigned int)failures, s_last_write_error);
             if (note_len > 0) {
-                f_write(&s_drain_file, note, (UINT)note_len, &bw);
+                f_write(&s_drain_file, note, (UINT)note_len, &note_bw);
             }
         }
-        f_close(&s_drain_file);
+    }
+
+    /* The file size only reaches the card at close: until then nothing is really written */
+    FRESULT close_res = f_close(&s_drain_file);
+    if (res == FR_OK) {
+        res = close_res;
+    }
+
+    if (res == FR_OK) {
+        s_tail = read_pos;
+        s_write_failures = 0;
     } else {
-        /* If opening failed, SD card might have been pulled or not ready yet.
-         * Drop up to 128 bytes if ring buffer is nearly full (>1800 bytes) so we don't stall. */
-        s_write_failures++;
-        s_next_log_retry_tick = xTaskGetTickCount() + LOG_RETRY_TICKS;
-        f_mount(0, &s_fatfs); /* Forces a fresh card start on the next try */
         taskENTER_CRITICAL();
-        uint16_t count = (s_head >= s_tail) ? (s_head - s_tail) : (RING_BUFFER_SIZE - s_tail + s_head);
-        if (count > (RING_BUFFER_SIZE - 200)) {
-            s_tail = (s_tail + 128) % RING_BUFFER_SIZE;
-        }
+        s_dropped_lines += dropped; /* Its note wasn't saved */
         taskEXIT_CRITICAL();
+        log_write_failed(res, LOG_WRITE_RETRY_TICKS);
     }
     fs_unlock();
 }
 
+/* Runs before power is cut, so it can't wait out the retry delay */
 void storage_log_flush(void)
 {
-    for (int i = 0; i < 8; i++) {
-        if (s_tail == s_head) break;
+    int failed_tries = 0;
+    for (int i = 0; i < 16 && s_tail != s_head && failed_tries < 3; i++) {
+        uint16_t before = s_tail;
+        s_next_log_retry_tick = 0;
         storage_log_drain_step();
+        if (s_tail == before) {
+            failed_tries++;
+            vTaskDelay(100 / portTICK_RATE_MS);
+        }
     }
 }
 

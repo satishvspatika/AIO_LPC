@@ -591,15 +591,6 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         intermcu_get_telemetry(telem);
     }
 
-    /* A wrong LPC845 build means wrong sensor pins, so the record's data can't be trusted */
-    int lpc845_system = intermcu_get_845_system();
-    int expected_system = (UNIT_CFG == KSNDMC_TWS) ? 1 : 0;
-    if (lpc845_system != expected_system) {
-        snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 build mismatch: reports SYSTEM %d, this unit needs SYSTEM %d",
-                 lpc845_system, expected_system);
-        storage_log_debug("ERROR", s_slot_line);
-    }
-
     const char *boot_mode = ui_was_scheduled_boot() ? "SCHEDULED" : "OPERATOR";
     char s_bat[8], s_rf15[8], s_rfday[8];
     fmt_fixed(s_rf15, sizeof(s_rf15), telem->rf_15m_mm, 5, 2);

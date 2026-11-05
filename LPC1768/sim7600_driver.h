@@ -29,6 +29,7 @@ void sim7600_worker_step(void);
 
 /* Transmit HTTP Telemetry via Layer-4 TCP Socket */
 bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, char *date_hdr_out, size_t date_hdr_size);
+bool sim7600_net_diagnostics(const http_endpoint_t *endpoint, const char *payload); /* TEMPORARY: TEST SEND only */
 
 /* Query live modem status */
 void sim7600_get_status(modem_status_t *out_status);

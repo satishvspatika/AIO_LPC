@@ -94,9 +94,7 @@ void SysTick_Handler(void)
 	tc2_1s--;
 	if(!tc2_1s){
 		tc2_1s = TC2_MAX_1S;
-#if SYSTEM == 1
 		read_pulse_counts_in_1sec();
-#endif
 		timer2_ovf_uart = 1;
 	}
 
@@ -485,7 +483,6 @@ void Init_UART_I2C_ADC_Pins(void)
 	SWM_SetFixedPinSelect(SWM0, kSWM_I2C0_SCL, true);
 
 
-#if SYSTEM == 1
 	/* I2C0_SDA connect to P0_11 */
 	//	SWM_SetMovablePinSelect(SWM0, kSWM_I2C1_SDA, kSWM_PortPin_P0_20);
 	SWM_SetMovablePinSelect(SWM0, kSWM_I2C1_SDA, kSWM_PortPin_P0_20);
@@ -494,24 +491,19 @@ void Init_UART_I2C_ADC_Pins(void)
 	/* I2C0_SCL connect to P0_10 */
 	//	SWM_SetMovablePinSelect(SWM0, kSWM_I2C1_SCL, kSWM_PortPin_P0_22);
 	SWM_SetMovablePinSelect(SWM0, kSWM_I2C1_SCL, kSWM_PortPin_P0_22);
-#endif
 
 	// Configure the SWM
 
 
 
 	//	SWM_SetFixedPinSelect(SWM0, kSWM_ADC_CHN9, true);
-#if SYSTEM == 1
 	IOCON->PIO[IOCON_INDEX_PIO0_21] = 0x80;
 	IOCON->PIO[IOCON_INDEX_PIO0_18] = 0x80;
-#endif
 	IOCON->PIO[IOCON_INDEX_PIO0_17] = 0x80;
 
 
-#if SYSTEM == 1
 	SWM_SetFixedPinSelect(SWM0, kSWM_ADC_CHN5, true);
 	SWM_SetFixedPinSelect(SWM0, kSWM_ADC_CHN8, true);
-#endif
 	SWM_SetFixedPinSelect(SWM0, kSWM_ADC_CHN9, true);
 
 
@@ -1887,8 +1879,8 @@ int main(void)
 		for(j=0;j<2000;j++);
 
 
-#if SYSTEM == 1
-	//Wind counter and temperature/humidity bus: TWS only (TRG has its rain gauge on PIO0_19)
+	//Wind counter and temperature/humidity bus. Always on: this firmware serves TRG and TWS alike,
+	//and the LPC1768 build uses what its profile needs. PIO0_19 feeds both the wind and rain counters.
 	init_counter_ws();
 	for(i=0;i<1000;i++)
 		for(j=0;j<2000;j++);
@@ -1897,7 +1889,6 @@ int main(void)
 	I2C1_init();
 	for(i=0;i<1000;i++)
 		for(j=0;j<2000;j++);
-#endif
 
 
 	//	read_th_val();
@@ -2046,7 +2037,6 @@ int main(void)
 		}
 
 		if(timer4_ovf_10s == 1){
-#if SYSTEM == 1
 			read_th_val();
 			for(i=0;i<100;i++)
 				for(j=0;j<200;j++);
@@ -2054,7 +2044,6 @@ int main(void)
 			read_adc2_values();
 			for(i=0;i<100;i++)
 				for(j=0;j<200;j++);
-#endif
 
 			read_adc3_values();
 			for(i=0;i<100;i++)
@@ -2153,7 +2142,7 @@ int main(void)
 
 			//sprintf(gc_xmit_buf, "$D%04d;", rf_val);
 			wait_tx_idle();
-			sprintf(gc_xmit_buf, "$D%02d%02d%02d%02d%02d%02d%02d,%02d%02d%02d%02d%02d%02d%02d,%04d,%04d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%c,%c,%c,%04d,%04d,%c,%d,%d,%c,%d;",
+			sprintf(gc_xmit_buf, "$D%02d%02d%02d%02d%02d%02d%02d,%02d%02d%02d%02d%02d%02d%02d,%04d,%04d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%c,%c,%c,%04d,%04d,%c,%d,%d,%c,%d,%d;",
 					Present_Date_Time.century,
 					Present_Date_Time.year,
 					Present_Date_Time.month,
@@ -2188,9 +2177,10 @@ int main(void)
 					sc_bat2,
 					solar_status,
 					(int)rain_day_tips,
-					SYSTEM,
+					LPC845_FW_TYPE,
 					wake_reason,
-					(int)reset_status);
+					(int)reset_status,
+					(int)rf_val);	//Tips so far in this slot, for the LCD
 
 			xmit_ptr = gc_xmit_buf;
 			LPC845_UART0->INTENSET = kUSART_TxReady;

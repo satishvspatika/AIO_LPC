@@ -3,11 +3,9 @@
  ******************************************************************************/
 #define LPC845_PORT 0U
 
-//Station type, same meaning as the LPC1768's UNIT_CFG: KSNDMC_TRG and BIHAR_TRG are SYSTEM 0,
-//KSNDMC_TWS is SYSTEM 1. Set this to match the LPC1768 build.
-#ifndef SYSTEM
-#define SYSTEM 1
-#endif
+//One firmware for every station type: it always measures rain and the weather sensors, and the
+//LPC1768 build uses what its profile needs. Reported in the status frame.
+#define LPC845_FW_TYPE 2
 //#define LED_PIN  14U
 
 #define LPC845_VERSION 'b'
@@ -25,13 +23,9 @@
 #define TC4_MAX_10S		  5000
 
 #define MAX_RF_DEBCNT 	2
-#if SYSTEM == 0
-#define RF_PIN		   19		//TRG: rain gauge on RAINFALL_PC
+#define RF_PIN		   19		//Rain gauge on RAINFALL_PC. Also the wind counter input (SCT): a TWS
+							//unit's tip count is wind pulses, which its LPC1768 build ignores
 #define RF_PIN_ALT	   14
-#else
-#define RF_PIN		   14		//TWS: PIO0_19 is the wind speed counter input
-#define RF_PIN_ALT	   19
-#endif
 
 #define UI_ROW_PIN  1U
 #define UI_COL_PIN  15U

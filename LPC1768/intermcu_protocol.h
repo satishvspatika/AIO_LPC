@@ -15,6 +15,7 @@ typedef struct {
     uint16_t rf_tips_15m;      /* 15-minute rainfall tips count */
     float rf_15m_mm;           /* 15-minute rainfall in mm */
     float rf_cum_mm;           /* 24-hour cumulative rainfall in mm */
+    float rf_live_15m_mm;      /* LCD only: rain so far in this slot. Records use rf_15m_mm */
     float bat1_volt;           /* Battery 1 voltage (V) */
     float temp_c;              /* Ambient temperature (deg C) */
     float humidity_pct;        /* Relative humidity (%) */
@@ -33,6 +34,7 @@ typedef struct {
 void intermcu_protocol_init(void);
 void intermcu_process_byte(uint8_t byte);
 bool intermcu_get_telemetry(telemetry_data_t *out_data);
+uint32_t intermcu_get_fat_time(void);
 void intermcu_update_time(const char *timestamp14);
 void intermcu_tick_second(void);
 void intermcu_reset_cumulative_rain(void);

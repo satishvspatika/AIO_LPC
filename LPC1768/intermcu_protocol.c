@@ -397,6 +397,7 @@ static void parse_d_packet(const char *frame)
     char solar_state = 'S';
     int rain_day_tips = 0;
     int lpc845_system = -1;
+    int live_tips = -1;
 
     while (token != NULL) {
         switch (field_idx) {
@@ -425,6 +426,7 @@ static void parse_d_packet(const char *frame)
             case 22: lpc845_system = atoi(token); break;
             case 23: wake_reason = token[0]; break;
             case 24: reset_status = atoi(token); break;
+            case 25: live_tips = atoi(token); break;
             default: break;
         }
         field_idx++;
@@ -450,6 +452,8 @@ static void parse_d_packet(const char *frame)
 
         s_latest_telemetry.rf_tips_15m = (uint16_t)rf_tips;
         s_latest_telemetry.rf_15m_mm = rf_tips * RF_BUCKET_RESOLUTION;
+        /* Older LPC845 firmware has no live count: show the last finished slot */
+        s_latest_telemetry.rf_live_15m_mm = ((live_tips >= 0) ? live_tips : rf_tips) * RF_BUCKET_RESOLUTION;
 
         if (field_idx >= 23) {
             s_845_system = lpc845_system;
@@ -531,6 +535,28 @@ bool intermcu_get_telemetry(telemetry_data_t *out_data)
     if (!out_data || !s_latest_telemetry.is_valid) return false;
     memcpy(out_data, &s_latest_telemetry, sizeof(telemetry_data_t));
     return true;
+}
+
+/* The LPC845 clock in FAT format, for the dates on SD card files. 0 if the clock isn't valid.
+ * FatFs calls this deep inside a write, so it copies only the time, not the whole record. */
+uint32_t intermcu_get_fat_time(void)
+{
+    char t[15];
+    memcpy(t, s_latest_telemetry.present_time, 14);
+    for (int i = 0; i < 14; i++) {
+        if (t[i] < '0' || t[i] > '9') {
+            return 0;
+        }
+    }
+    #define TWO_DIGITS(p) ((uint32_t)((t[(p)] - '0') * 10 + (t[(p) + 1] - '0')))
+    uint32_t year = TWO_DIGITS(0) * 100 + TWO_DIGITS(2);
+    uint32_t month = TWO_DIGITS(4), day = TWO_DIGITS(6);
+    uint32_t hour = TWO_DIGITS(8), minute = TWO_DIGITS(10), second = TWO_DIGITS(12);
+    #undef TWO_DIGITS
+    if (year < 2020 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+        return 0;
+    }
+    return ((year - 1980) << 25) | (month << 21) | (day << 16) | (hour << 11) | (minute << 5) | (second >> 1);
 }
 
 void intermcu_update_time(const char *timestamp14)

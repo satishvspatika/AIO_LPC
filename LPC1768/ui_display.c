@@ -146,7 +146,8 @@ typedef enum {
     UI_MODE_ERASE_CONFIRM,
     UI_MODE_MENU,
     UI_MODE_SLEEP_CONFIRM,
-    UI_MODE_KEY_TEST
+    UI_MODE_KEY_TEST,
+    UI_MODE_TEST_SEND
 } ui_mode_t;
 
 /* MENU key: operator shortcuts. Screen items jump to that screen, so actions such as
@@ -154,7 +155,8 @@ typedef enum {
 typedef enum {
     MENU_GOTO_SCREEN = 0,
     MENU_KEY_TEST,
-    MENU_POWER_SAVE
+    MENU_POWER_SAVE,
+    MENU_TEST_SEND
 } menu_action_t;
 
 typedef struct {
@@ -164,6 +166,9 @@ typedef struct {
 } menu_item_t;
 
 static const menu_item_t s_menu_items[] = {
+    #if ENABLE_TEST_SEND
+    { "TEST SEND",       MENU_TEST_SEND,   SCR_STATION_ID },
+    #endif
     { "STATION ID",      MENU_GOTO_SCREEN, SCR_STATION_ID },
     #if (UNIT_CFG == KSNDMC_TWS)
     { "LIVE READINGS",   MENU_GOTO_SCREEN, SCR_TEMP_HUM },
@@ -210,6 +215,13 @@ static size_t s_current_screen_idx = 0;
 static ui_mode_t s_ui_mode = UI_MODE_BROWSE;
 static char s_edit_stn_id[8] = "000000";
 static int s_edit_pos = 0;
+static int s_edit_first_pos = 0; /* 2 hides a leading "00": the stored ID stays 6 digits */
+
+/* ESP32 display rule: a 6-digit ID starting "00" shows as its last 4 digits */
+static const char *station_id_for_display(const char *id)
+{
+    return (strlen(id) == 6 && strncmp(id, "00", 2) == 0) ? (id + 2) : id;
+}
 static size_t s_menu_pos = 0;
 static ui_mode_t s_mode_before_confirm = UI_MODE_BROWSE;
 static uint32_t s_mode_timeout_ticks = 0;
@@ -304,6 +316,237 @@ static void vStatusSms_Task(void *pvParameters)
     s_sms_task_handle = NULL;
     vTaskDelete(NULL);
 }
+
+#if ENABLE_TEST_SEND
+/* TEMPORARY bench tool: sends one dummy record for a chosen past 15-minute slot, so the server
+ * link can be tested without waiting for a slot. Uses its own station ID, and stays out of
+ * flash, DATA/ and the backlog.
+ * Remove with ENABLE_TEST_SEND once deliveries are proven. */
+static volatile bool s_test_running = false;
+
+/* TEST_DATE_HELPERS_BEGIN */
+typedef enum { TEST_DAY = 0, TEST_MONTH, TEST_YEAR, TEST_HOUR, TEST_MIN, TEST_FIELD_COUNT } test_field_t;
+
+static int s_test_year = 2026, s_test_month = 1, s_test_day = 1;
+static int s_test_slot_min = 0;   /* Minutes since midnight, always on a 15-minute boundary */
+
+static int test_days_in_month(int year, int month)
+{
+    static const unsigned char days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    return (month == 2 && leap) ? 29 : days[month - 1];
+}
+
+static void test_step_day(int dir)
+{
+    s_test_day += dir;
+    if (s_test_day < 1) {
+        if (--s_test_month < 1) {
+            s_test_month = 12;
+            s_test_year--;
+        }
+        s_test_day = test_days_in_month(s_test_year, s_test_month);
+    } else if (s_test_day > test_days_in_month(s_test_year, s_test_month)) {
+        s_test_day = 1;
+        if (++s_test_month > 12) {
+            s_test_month = 1;
+            s_test_year++;
+        }
+    }
+}
+
+/* Moves by one 15-minute slot, carrying into the date */
+static void test_step_slot(int dir)
+{
+    s_test_slot_min += dir * 15;
+    if (s_test_slot_min < 0) {
+        s_test_slot_min += 1440;
+        test_step_day(-1);
+    } else if (s_test_slot_min >= 1440) {
+        s_test_slot_min -= 1440;
+        test_step_day(1);
+    }
+}
+
+/* UP/DOWN on one field. Only the minute field carries, so setting the others can't move them. */
+static void test_adjust_field(test_field_t field, int dir)
+{
+    int max_day;
+    switch (field) {
+    case TEST_DAY:
+        max_day = test_days_in_month(s_test_year, s_test_month);
+        s_test_day += dir;
+        if (s_test_day < 1) s_test_day = max_day;
+        if (s_test_day > max_day) s_test_day = 1;
+        break;
+    case TEST_MONTH:
+        s_test_month += dir;
+        if (s_test_month < 1) s_test_month = 12;
+        if (s_test_month > 12) s_test_month = 1;
+        break;
+    case TEST_YEAR:
+        s_test_year += dir;
+        if (s_test_year < 2020) s_test_year = 2020;
+        if (s_test_year > 2099) s_test_year = 2099;
+        break;
+    case TEST_HOUR:
+        s_test_slot_min += dir * 60;
+        if (s_test_slot_min < 0) s_test_slot_min += 1440;
+        if (s_test_slot_min >= 1440) s_test_slot_min -= 1440;
+        break;
+    default:
+        test_step_slot(dir);
+        break;
+    }
+    /* A shorter month or a non-leap year can leave the day out of range */
+    max_day = test_days_in_month(s_test_year, s_test_month);
+    if (s_test_day > max_day) s_test_day = max_day;
+}
+/* TEST_DATE_HELPERS_END */
+
+static test_field_t s_test_field = TEST_MIN;
+static const char *volatile s_test_status = NULL; /* NULL: show which field UP/DOWN changes */
+
+static void vTestSend_Task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    char payload[256];
+    char line[104];
+    telemetry_data_t t;
+    int slot_min = s_test_slot_min;
+    bool sent = false;
+    int csq = -113;
+    portTickType start_tick = xTaskGetTickCount();
+
+    memset(&t, 0, sizeof(t));
+    intermcu_get_telemetry(&t);
+    float bat = t.bat1_volt;
+
+    /* The slot being tested, with values that are easy to spot on the server */
+    snprintf(t.slot_time, sizeof(t.slot_time), "%04d%02d%02d%02d%02d00", s_test_year, s_test_month, s_test_day, slot_min / 60, slot_min % 60);
+    t.temp_c = 25.5f;
+    t.humidity_pct = 55.5f;
+    t.wind_speed_avg = 1.5f;
+    t.wind_dir_deg = 90;
+    t.rf_15m_mm = 0.5f;
+    t.rf_cum_mm = 1.0f;
+
+    snprintf(line, sizeof(line), "Dummy record, station %s, slot %.12s, clock %.14s", TEST_STATION_ID, t.slot_time, t.present_time);
+    storage_log_debug("TEST_START", line);
+
+    if (!sim7600_acquire(5000)) {
+        storage_log_debug("TEST_END", "Modem busy, nothing sent");
+        s_test_status = "MODEM BUSY";
+        s_test_running = false;
+        s_sms_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    sim7600_clear_cancel();
+    if (sim7600_power_on()) {
+        modem_status_t m;
+        sim7600_get_status(&m);
+        csq = m.csq_dbm;
+
+        #if (UNIT_CFG == KSNDMC_TRG)
+        format_payload_ksndmc_trg(payload, sizeof(payload), TEST_STATION_ID, &t, csq);
+        #elif (UNIT_CFG == BIHAR_TRG)
+        format_payload_bihar_trg(payload, sizeof(payload), TEST_STATION_ID, &t, csq);
+        #else
+        format_payload_ksndmc_tws(payload, sizeof(payload), TEST_STATION_ID, &t, csq);
+        #endif
+        storage_log_debug("HTTP_POST", payload);
+
+        sent = sim7600_http_post(telemetry_get_endpoint(UNIT_CFG), payload, NULL, 0);
+        if (!sent) {
+            sent = sim7600_net_diagnostics(telemetry_get_endpoint(UNIT_CFG), payload);
+        }
+    } else {
+        storage_log_debug("TEST", "Modem did not come up");
+    }
+    sim7600_release();
+
+    unsigned int duration = (unsigned int)((xTaskGetTickCount() - start_tick) / configTICK_RATE_HZ);
+    snprintf(line, sizeof(line), "%s station=%s slot=%.12s csq=%d took=%us", sent ? "SENT" : "NOT_CONFIRMED", TEST_STATION_ID, t.slot_time, csq, duration);
+    storage_log_debug("TEST_END", line);
+
+    char s_bat[8];
+    fmt_fixed(s_bat, sizeof(s_bat), bat, 4, 2);
+    snprintf(line, sizeof(line), "%.14s,%.14s,%s,DUMMY_TEST,1,%d,%u,%s,TEST,0",
+             t.present_time, t.slot_time, sent ? "SENT" : "FAILED", csq, duration, s_bat);
+    storage_log_slot(line);
+
+    /* A pass moves on, so each test uses a different slot. A failure stays, to retry it. */
+    if (sent) {
+        test_step_slot(-1);
+    }
+    s_test_status = sent ? "SENT OK EN=NEXT" : "FAILED EN=RETRY";
+    s_test_running = false;
+    s_sms_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void test_send_open(const telemetry_data_t *telemetry)
+{
+    const char *p = telemetry->present_time;
+    s_test_status = NULL;
+    s_test_field = TEST_MIN;
+    if (strlen(p) >= 12 && strncmp(p, "20", 2) == 0 && p[2] != '0') {
+        s_test_year = (p[0] - '0') * 1000 + (p[1] - '0') * 100 + (p[2] - '0') * 10 + (p[3] - '0');
+        s_test_month = (p[4] - '0') * 10 + (p[5] - '0');
+        s_test_day = (p[6] - '0') * 10 + (p[7] - '0');
+        int now_min = ((p[8] - '0') * 10 + (p[9] - '0')) * 60 + (p[10] - '0') * 10 + (p[11] - '0');
+        /* The previous slot, unless it is under 2 minutes old: the server refuses a slot in its
+         * first 62s, so then the one before it */
+        s_test_slot_min = (now_min / 15) * 15;
+        if (now_min - s_test_slot_min < 2) {
+            test_step_slot(-1);
+        }
+    } else {
+        s_test_status = "NO CLOCK:SET IT";
+    }
+    s_ui_mode = UI_MODE_TEST_SEND;
+}
+
+static void test_send_key(key_code_t key)
+{
+    if (s_test_running) {
+        return; /* Locked until the send finishes */
+    }
+    if (key == KEY_BACK || key == KEY_MENU) {
+        s_ui_mode = UI_MODE_BROWSE;
+    } else if (key == KEY_LEFT) {
+        s_test_field = (test_field_t)((s_test_field + TEST_FIELD_COUNT - 1) % TEST_FIELD_COUNT);
+        s_test_status = NULL;
+    } else if (key == KEY_RIGHT) {
+        s_test_field = (test_field_t)((s_test_field + 1) % TEST_FIELD_COUNT);
+        s_test_status = NULL;
+    } else if (key == KEY_UP) {
+        test_adjust_field(s_test_field, 1);
+        s_test_status = NULL;
+    } else if (key == KEY_DOWN) {
+        test_adjust_field(s_test_field, -1);
+        s_test_status = NULL;
+    } else if (key == KEY_EN) {
+        if (s_slot_busy || slot_scheduler_is_due()) {
+            s_test_status = "SLOT DUE, WAIT";
+        } else if (s_sms_task_handle != NULL) {
+            s_test_status = "SMS BUSY, WAIT";
+        } else {
+            s_test_running = true;
+            strncpy(s_status_sms_substep, "STARTING...", sizeof(s_status_sms_substep) - 1);
+            if (xTaskCreate(vTestSend_Task, (const signed char *)"TestSend", 768, NULL, 2, &s_sms_task_handle) != pdPASS) {
+                s_sms_task_handle = NULL;
+                s_test_running = false;
+                s_test_status = "NO MEMORY";
+                storage_log_debug("ERROR", "Test send: no memory for its task");
+            }
+        }
+    }
+}
+#endif /* ENABLE_TEST_SEND */
 
 volatile uint32_t g_dbg_last_key = 0;
 volatile uint32_t g_dbg_cols_r0 = 7;
@@ -845,7 +1088,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
 
     if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
         snprintf(line1, sizeof(line1), "SET STATION ID  ");
-        snprintf(line2, sizeof(line2), "ID: %-6.6s      ", s_edit_stn_id);
+        snprintf(line2, sizeof(line2), "ID: %-6.6s      ", s_edit_stn_id + s_edit_first_pos);
     } else if (s_ui_mode == UI_MODE_CALIB) {
         int tips = intermcu_get_calib_tips();
         fmt_fixed(num, sizeof(num), tips * RF_BUCKET_RESOLUTION, 4, 2);
@@ -857,6 +1100,19 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
     } else if (s_ui_mode == UI_MODE_MENU) {
         snprintf(line1, sizeof(line1), "MENU       %02u/%02u", (unsigned int)(s_menu_pos + 1), (unsigned int)NUM_MENU_ITEMS);
         snprintf(line2, sizeof(line2), ">%-15.15s", s_menu_items[s_menu_pos].label);
+#if ENABLE_TEST_SEND
+    } else if (s_ui_mode == UI_MODE_TEST_SEND) {
+        static const char *const field_names[] = {"DAY", "MON", "YEAR", "HOUR", "MIN"};
+        snprintf(line1, sizeof(line1), "%02d-%02d-%04d %02d:%02d", s_test_day, s_test_month, s_test_year,
+                 s_test_slot_min / 60, s_test_slot_min % 60);
+        if (s_test_running) {
+            snprintf(line2, sizeof(line2), "%-16.16s", s_status_sms_substep);
+        } else if (s_test_status) {
+            snprintf(line2, sizeof(line2), "%-16.16s", s_test_status);
+        } else {
+            snprintf(line2, sizeof(line2), "SET %-4s EN=SEND", field_names[s_test_field]);
+        }
+#endif
     } else if (s_ui_mode == UI_MODE_SLEEP_CONFIRM) {
         snprintf(line1, sizeof(line1), "POWER SAVE MODE?");
         snprintf(line2, sizeof(line2), "EN=YES  OTHER=NO");
@@ -880,7 +1136,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 #else
                 snprintf(line1, sizeof(line1), "KSNDMC - TWS");
                 #endif
-                snprintf(line2, sizeof(line2), "ID:%-6s %s", flash_nvram_get_station_id(), FIRMWARE_VERSION);
+                snprintf(line2, sizeof(line2), "ID:%-6s %s", station_id_for_display(flash_nvram_get_station_id()), FIRMWARE_VERSION);
                 break;
 
             case SCR_DATETIME:
@@ -898,14 +1154,15 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
             case SCR_RAINFALL:
                 #if (UNIT_CFG == BIHAR_TRG)
                 /* BIHAR_TRG shows both 15M and Cumulative Rainfall */
-                fmt_fixed(num, sizeof(num), telemetry->rf_15m_mm, 4, 1);
+                /* Live, as on the ESP32: tips show at once, not at the next slot */
+                fmt_fixed(num, sizeof(num), telemetry->rf_live_15m_mm, 4, 1);
                 snprintf(line1, sizeof(line1), "RF 15M: %s mm", num);
-                fmt_fixed(num, sizeof(num), telemetry->rf_cum_mm, 4, 1);
+                fmt_fixed(num, sizeof(num), telemetry->rf_cum_mm + telemetry->rf_live_15m_mm, 4, 1);
                 snprintf(line2, sizeof(line2), "CUM RF: %s mm", num);
                 #else
                 /* KSNDMC_TRG shows ONLY Cumulative Rainfall */
                 snprintf(line1, sizeof(line1), "CUM RAINFALL    ");
-                fmt_fixed(num, sizeof(num), telemetry->rf_cum_mm, 4, 1);
+                fmt_fixed(num, sizeof(num), telemetry->rf_cum_mm + telemetry->rf_live_15m_mm, 4, 1);
                 snprintf(line2, sizeof(line2), "    %s mm    ", num);
                 #endif
                 break;
@@ -1045,8 +1302,8 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
     lcd_print(line2);
 
     if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
-        /* Line 2 format: "ID: 001922      " -> digits start at col 4 */
-        lcd_set_cursor(1, 4 + s_edit_pos);
+        /* Line 2 format: "ID: 1922        " -> digits start at col 4 */
+        lcd_set_cursor(1, 4 + s_edit_pos - s_edit_first_pos);
     }
 }
 
@@ -1263,7 +1520,11 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
     if (key != KEY_NONE) {
         s_operator_touched_key = true;
         s_inactivity_ticks = 0;
-    } else if (s_status_sms_state != STATUS_UI_SENDING && !s_slot_busy) {
+    } else if (s_status_sms_state != STATUS_UI_SENDING && !s_slot_busy
+#if ENABLE_TEST_SEND
+               && !s_test_running
+#endif
+               ) {
         s_inactivity_ticks++;
         if (s_inactivity_ticks >= ((sim7600_is_busy() ? 180U : 60U) * 20U)) {
             storage_log_debug("UI", "Inactivity timeout reached -> entering auto-sleep");
@@ -1304,6 +1565,13 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             s_key_test_last = key;
             return;
         }
+
+        #if ENABLE_TEST_SEND
+        if (s_ui_mode == UI_MODE_TEST_SEND) {
+            test_send_key(key);
+            return;
+        }
+        #endif
 
         #if (UNIT_CFG == KSNDMC_TWS)
         /* CALIB is for TRG only: TWS has no rain gauge, so the key has no function */
@@ -1403,9 +1671,9 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                     s_edit_stn_id[s_edit_pos] = '9';
                 }
             } else if (key == KEY_LEFT) {
-                s_edit_pos = (s_edit_pos > 0) ? (s_edit_pos - 1) : 5;
+                s_edit_pos = (s_edit_pos > s_edit_first_pos) ? (s_edit_pos - 1) : 5;
             } else if (key == KEY_RIGHT) {
-                s_edit_pos = (s_edit_pos < 5) ? (s_edit_pos + 1) : 0;
+                s_edit_pos = (s_edit_pos < 5) ? (s_edit_pos + 1) : s_edit_first_pos;
             } else if (key == KEY_BACK) {
                 /* Leave without saving */
                 lcd_command(0x0C);
@@ -1450,6 +1718,10 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                     s_key_test_last = KEY_NONE;
                     s_mode_timeout_ticks = KEY_TEST_TIMEOUT_TICKS;
                     s_ui_mode = UI_MODE_KEY_TEST;
+                #if ENABLE_TEST_SEND
+                } else if (item->action == MENU_TEST_SEND) {
+                    test_send_open(telemetry);
+                #endif
                 } else {
                     sleep_confirm_open();
                 }
@@ -1485,13 +1757,16 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 if (cur) {
                     size_t len = strlen(cur);
                     if (len > 6) len = 6;
+                    /* Right-aligned: a stored "1922" is 001922, not 192200 */
                     for (size_t i = 0; i < len; i++) {
                         if (cur[i] >= '0' && cur[i] <= '9') {
-                            s_edit_stn_id[i] = cur[i];
+                            s_edit_stn_id[6 - len + i] = cur[i];
                         }
                     }
                 }
-                s_edit_pos = 0;
+                /* A longer real ID keeps all its digits editable */
+                s_edit_first_pos = (strncmp(s_edit_stn_id, "00", 2) == 0) ? 2 : 0;
+                s_edit_pos = s_edit_first_pos;
                 lcd_command(0x0F); /* Turn ON blinking hardware cursor */
             } else if (active_scr == SCR_FIELD_CALIB) {
                 calib_start();

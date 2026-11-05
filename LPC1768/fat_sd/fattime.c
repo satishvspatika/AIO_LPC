@@ -41,9 +41,16 @@ DWORD get_fattime (void)
 /* the system does not support a real time clock.          */
 /* This is not required in read-only configuration.        */
 
+extern unsigned long intermcu_get_fat_time(void);
+
 DWORD get_fattime (void)
 {
-	/* If no RTC support. Return a fixed value 2010/4/26 0:00:00 */
+	DWORD now = (DWORD)intermcu_get_fat_time();
+	if (now != 0) {
+		return now; /* Real date on the file, from the LPC845 clock */
+	}
+
+	/* No valid clock yet: a fixed value 2010/4/26 0:00:00 */
 	return	  ((DWORD)(2010 - 1980) << 25)	/* Y */
 			| ((DWORD)4  << 21)				/* M */
 			| ((DWORD)26 << 16)				/* D */

@@ -52,6 +52,8 @@
 #include "lpc17xx_gpdma.h"
 
 #include "integer.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include "spi_sd_lpc17xx.h"
 
 /// #include "monitor.h"
@@ -865,16 +867,24 @@ static inline void spi_xmit_block (
 /*-----------------------------------------------------------------------*/
 /* Wait for card ready                                                   */
 /*-----------------------------------------------------------------------*/
+/* Real time, not a loop count: 50000 loops is only about 20ms at full SPI speed, while a card can
+ * stay busy for hundreds of ms after a write. Giving up early made writes fail at random. Timer1
+ * and Timer2 can't time this: they stop whenever the task that ticks them is using the card.
+ * The loop limit only guards against the tick count not moving. */
+#define SD_BUSY_TIMEOUT_TICKS  (750 / portTICK_RATE_MS)
+#define SD_TOKEN_TIMEOUT_TICKS (250 / portTICK_RATE_MS)
+#define SD_WAIT_LOOP_LIMIT     4000000UL
+
 static BYTE wait_ready (void)
 {
 	BYTE res;
-	uint32_t retries = 50000;
+	uint32_t retries = SD_WAIT_LOOP_LIMIT;
+	portTickType start = xTaskGetTickCount();
 
-	Timer2 = 50;	/* Wait for ready in timeout of 500ms */
 	rcvr_spi();
 	do {
 		res = rcvr_spi();
-	} while ((res != 0xFF) && Timer2 && --retries);
+	} while ((res != 0xFF) && ((xTaskGetTickCount() - start) < SD_BUSY_TIMEOUT_TICKS) && --retries);
 
 	return res;
 }
@@ -926,11 +936,11 @@ static Bool rcvr_datablock (
 	BYTE token;
 
 
-	Timer1 = 10;
-	uint32_t retries = 50000;
-	do {							/* Wait for data packet in timeout of 100ms */
+	uint32_t retries = SD_WAIT_LOOP_LIMIT;
+	portTickType start = xTaskGetTickCount();
+	do {							/* Wait for the data packet */
 		token = rcvr_spi();
-	} while ((token == 0xFF) && Timer1 && --retries);
+	} while ((token == 0xFF) && ((xTaskGetTickCount() - start) < SD_TOKEN_TIMEOUT_TICKS) && --retries);
 	if(token != 0xFE) return FALSE;	/* If not valid data token, return with error */
 
 #if ( SPI_SD_ACCESS_MODE == SPI_SD_USE_DMA )
