@@ -2277,6 +2277,10 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     const char *network_name = STATUS_SMS_NETWORK_NAME;
     const char *stn_type = (UNIT_CFG == KSNDMC_TWS) ? "TWS" : "TRG";
     const char *stn_id = flash_nvram_get_station_id();
+    /* The status SMS carries the number without its leading zeros: 001923 goes as 1923 */
+    while (stn_id[0] == '0' && stn_id[1] != '\0') {
+        stn_id++;
+    }
 
     /* Format timestamp in ISO: YYYY-MM-DDTHH:MM */
     char time_iso[24] = "2026-01-01T00:00";
@@ -2315,13 +2319,14 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     char bat_str[8];
     fmt_fixed(bat_str, sizeof(bat_str), telem->bat1_volt, 4, 1);
     snprintf(status_msg, sizeof(status_msg),
-        "%s,%s,STATUS-F,%s,%s,%s,15,%04d,03.3,%s,%c,%s,%s,%s,%s,0\r\n",
+        "%s,%s,STATUS-F,%s,%s,%s,15,%04d,%s,%s,%c,%s,%s,%s,%s,0\r\n",
         network_name,
         stn_type,
         stn_id,
         time_iso,
         FIRMWARE_VERSION,
         csq_dbm,
+        bat_str, /* The server shows only this first battery field, so it carries the real voltage */
         bat_str,
         (telem->solar_status == 'C' || telem->solar_volt > 4.0f) ? 'Y' : 'N',
         sd_status,
