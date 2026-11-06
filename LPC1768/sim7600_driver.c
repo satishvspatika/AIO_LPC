@@ -320,6 +320,9 @@ static void sync_clock_from_server(const char *http_response, bool rejected)
     bool have_clock = intermcu_get_telemetry(&t);
     long drift = have_clock ? intermcu_clock_drift_sec(t.present_time, server_ts) : -1;
     if (drift >= 0 && drift < (rejected ? CLOCK_DRIFT_LIMIT_REJECTED_SEC : CLOCK_DRIFT_LIMIT_SEC)) {
+        /* Every slot, so a card shows how fast this RTC really drifts */
+        snprintf(msg, sizeof(msg), "Clock %lds from server, no change", drift);
+        storage_log_debug("RTC", msg);
         return;
     }
 
@@ -422,6 +425,13 @@ static const char *select_apn(const char *iccid, const char *imsi)
     return apn;
 }
 
+static bool s_sim_missing = false;
+
+bool sim7600_sim_missing(void)
+{
+    return s_sim_missing;
+}
+
 bool sim7600_power_on(void)
 {
     if (s_modem_status.is_registered) {
@@ -519,7 +529,24 @@ bool sim7600_power_on(void)
         send_raw("AT+CFUN=1\r\n");
         wait_response("OK", 5000, NULL, 0);
         delay_ms(2000);
+
+        /* Still nothing: no SIM can register, so don't spend the battery trying */
+        for (int i = 0; i < 5 && !sim_ready; i++) {
+            clear_rx();
+            send_raw("AT+CPIN?\r\n");
+            sim_ready = wait_response("+CPIN: READY", 1000, NULL, 0);
+            if (!sim_ready) {
+                delay_ms(1000);
+            }
+        }
+        if (!sim_ready) {
+            s_sim_missing = true;
+            storage_log_debug("ERROR", "No usable SIM: not trying to register");
+            report_progress("NO SIM CARD     ");
+            return false;
+        }
     }
+    s_sim_missing = false;
 
     report_progress("SIM READY       ");
 
@@ -1122,6 +1149,38 @@ static void collect_http_reply(char *buf, size_t size)
 }
 
 /* Direct TCP socket. *got_reply says the server answered, so its verdict stands. */
+/* The request went out and no answer came back, so the server may well have it. It's not counted
+ * as delivered, but it waits for the next slot rather than going straight out again. */
+static bool s_post_unanswered = false;
+static bool s_post_rejected = false;
+
+bool sim7600_post_rejected(void)
+{
+    return s_post_rejected;
+}
+
+/* Checks the network is still there before spending more battery on it */
+bool sim7600_still_registered(void)
+{
+    static const char *const cmds[] = { "AT+CEREG?\r\n", "AT+CGREG?\r\n", "AT+CREG?\r\n" };
+    static const char *const keys[] = { "+CEREG: ", "+CGREG: ", "+CREG: " };
+    char capture[64];
+    for (int i = 0; i < 3; i++) {
+        clear_rx();
+        send_raw(cmds[i]);
+        if (wait_response(keys[i], 800, capture, sizeof(capture)) &&
+            (strstr(capture, ",1") || strstr(capture, ",5"))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool sim7600_post_unanswered(void)
+{
+    return s_post_unanswered;
+}
+
 static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpoint, const char *host, const char *payload, char *date_hdr_out, size_t date_hdr_size, bool *got_reply)
 {
     char log_msg[128];
@@ -1232,6 +1291,7 @@ static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpo
 
     storage_log_debug("TCP", "Streaming HTTP payload...");
     clear_rx();
+    s_post_unanswered = true;
     send_raw(s_http_req);
 
     /* Step 7: Wait for Server Response */
@@ -1243,6 +1303,7 @@ static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpo
     } else if (strstr(s_http_capture, "+IPD")) {
         storage_log_debug("TCP", "Received server response (+IPD)");
         *got_reply = true;
+        s_post_unanswered = false;
         collect_http_reply(s_http_capture, sizeof(s_http_capture));
         storage_log_http(s_http_capture);
 
@@ -1268,6 +1329,7 @@ static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpo
             strstr(s_http_capture, "REJECTED") ||
             strstr(s_http_capture, "Invalid") ||
             strstr(s_http_capture, "invalid")) {
+            s_post_rejected = true;
             storage_log_debug("HTTP", "Server REJECTED the record");
             sync_clock_from_server(s_http_capture, true);
         } else if (strstr(s_http_capture, "200 OK") ||
@@ -1305,6 +1367,19 @@ static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpo
 }
 
 /* The modem's own HTTP commands: the ESP32's fallback when a TCP post gets no answer */
+/* The modem's HTTP commands give only the body unless asked for the headers, where Date is */
+static void sync_clock_after_modem_http(bool rejected)
+{
+    char ts[16];
+    if (!intermcu_parse_server_time(s_http_capture, ts, sizeof(ts))) {
+        s_http_capture[0] = '\0';
+        clear_rx();
+        send_raw("AT+HTTPHEAD\r\n");
+        wait_response("+HTTPHEAD:", 3000, s_http_capture, sizeof(s_http_capture));
+    }
+    sync_clock_from_server(s_http_capture, rejected);
+}
+
 static bool __attribute__((noinline)) http_post_modem_stack(const http_endpoint_t *endpoint, const char *payload)
 {
     const char *content_type = (endpoint->format == FORMAT_JSON) ? "application/json" : "application/x-www-form-urlencoded";
@@ -1359,6 +1434,7 @@ static bool __attribute__((noinline)) http_post_modem_stack(const http_endpoint_
     }
 
     clear_rx();
+    s_post_unanswered = true;
     send_raw("AT+HTTPACTION=1\r\n");
     if (!wait_response("+HTTPACTION:", 25000, s_http_capture, sizeof(s_http_capture))) {
         storage_log_debug("HTTP", "AT+HTTPACTION: no result in 25s");
@@ -1377,6 +1453,10 @@ static bool __attribute__((noinline)) http_post_modem_stack(const http_endpoint_
     }
     snprintf(log_msg, sizeof(log_msg), "Modem HTTP status %d, body %d bytes", status, length);
     storage_log_debug("HTTP", log_msg);
+    /* 6xx and 7xx are the modem's own errors, not the server's answer */
+    if (status >= 100 && status <= 599) {
+        s_post_unanswered = false;
+    }
     if (status < 200 || status > 202) {
         goto done;
     }
@@ -1392,12 +1472,13 @@ static bool __attribute__((noinline)) http_post_modem_stack(const http_endpoint_
     if (strstr(s_http_capture, "Rejected") || strstr(s_http_capture, "rejected") ||
         strstr(s_http_capture, "REJECTED") || strstr(s_http_capture, "Invalid") ||
         strstr(s_http_capture, "invalid")) {
-        storage_log_debug("HTTP", "Server REJECTED the record");
-        sync_clock_from_server(s_http_capture, true);
+        s_post_rejected = true;
+            storage_log_debug("HTTP", "Server REJECTED the record");
+        sync_clock_after_modem_http(true);
     } else {
         success = true;
         storage_log_debug("HTTP", "HTTP POST Verified OK through modem HTTP commands");
-        sync_clock_from_server(s_http_capture, false);
+        sync_clock_after_modem_http(false);
     }
 
 done:
@@ -1407,6 +1488,51 @@ done:
     return success;
 }
 
+/* The name comes first, so a server can move to a new IP with no firmware change. The IP is there
+ * for when the name can't be looked up. */
+const char *sim7600_route_name(int route)
+{
+    switch (route) {
+    case 0:  return "NAME";
+    case 1:  return "IP";
+    default: return "MODEM_HTTP";
+    }
+}
+
+static bool post_by_route(const http_endpoint_t *endpoint, const char *payload, int route,
+                          char *date_hdr_out, size_t date_hdr_size, bool *got_reply)
+{
+    char msg[64];
+    bool ok;
+    snprintf(msg, sizeof(msg), "Sending by %s (%s)", sim7600_route_name(route),
+             (route == 1) ? endpoint->ip : endpoint->domain);
+    storage_log_debug("HTTP", msg);
+
+    if (route == 0) {
+        ok = http_post_tcp(endpoint, endpoint->domain, payload, date_hdr_out, date_hdr_size, got_reply);
+    } else if (route == 1) {
+        ok = http_post_tcp(endpoint, endpoint->ip, payload, date_hdr_out, date_hdr_size, got_reply);
+    } else {
+        ok = http_post_modem_stack(endpoint, payload);
+    }
+    snprintf(msg, sizeof(msg), "%s by %s", ok ? "Delivered" : "Not delivered", sim7600_route_name(route));
+    storage_log_debug("HTTP", msg);
+    return ok;
+}
+
+/* One send by one route: the caller decides how many it gets */
+bool sim7600_http_post_once(const http_endpoint_t *endpoint, const char *payload, int route)
+{
+    if (!endpoint || !payload) return false;
+
+    ensure_bearer();
+
+    bool got_reply = false;
+    s_post_unanswered = false;
+    s_post_rejected = false;
+    return post_by_route(endpoint, payload, route, NULL, 0, &got_reply);
+}
+
 bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, char *date_hdr_out, size_t date_hdr_size)
 {
     if (!endpoint || !payload) return false;
@@ -1414,15 +1540,16 @@ bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, cha
     ensure_bearer();
 
     bool got_reply = false;
-    /* TWS6 order: IP, then domain. If the server answered "no", asking again another way
-     * won't change that. */
-    bool success = http_post_tcp(endpoint, endpoint->ip, payload, date_hdr_out, date_hdr_size, &got_reply);
-    if (!success && !got_reply) {
-        delay_ms(1000);
-        success = http_post_tcp(endpoint, endpoint->domain, payload, date_hdr_out, date_hdr_size, &got_reply);
-    }
-    if (!success && !got_reply) {
-        success = http_post_modem_stack(endpoint, payload);
+    s_post_unanswered = false;
+    s_post_rejected = false;
+    /* If the server answered "no", asking again another way won't change that, and if it may have
+     * the record, the next slot sends it. */
+    bool success = false;
+    for (int route = 0; route < 3 && !success && !got_reply && !s_post_unanswered; route++) {
+        if (route > 0) {
+            delay_ms(1000);
+        }
+        success = post_by_route(endpoint, payload, route, date_hdr_out, date_hdr_size, &got_reply);
     }
 
     if (!success && !got_reply) {
@@ -2159,21 +2286,11 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
                  telem->present_time + 8, telem->present_time + 10);
     }
 
-    /* Format slot time in ISO: YYYY-MM-DDTHH:MM */
-    char slot_iso[24] = "2026-01-01T00:00";
-    if (strlen(telem->slot_time) >= 12) {
-        snprintf(slot_iso, sizeof(slot_iso), "%.4s-%.2s-%.2sT%.2s:%.2s",
-                 telem->slot_time, telem->slot_time + 4, telem->slot_time + 6,
-                 telem->slot_time + 8, telem->slot_time + 10);
-    }
-
-    /* Just after an LPC845 restart it has no last slot (year 2000): use the newest stored record,
-     * "NN,YYYY-MM-DD,HH:MM,..." */
-    if (strncmp(slot_iso, "20", 2) != 0 || slot_iso[2] == '0') {
-        const flash_log_page_t *rec = flash_log_newest_record();
-        if (rec && strlen(rec->record) >= 19 && rec->record[2] == ',' && rec->record[13] == ',') {
-            snprintf(slot_iso, sizeof(slot_iso), "%.10sT%.5s", rec->record + 3, rec->record + 14);
-        }
+    /* ESP32 flow: the last field is the last record the server got, not the slot in progress */
+    char slot_iso[24] = "0000-00-00T00:00";
+    const char *ll = flash_nvram_get_last_logged(); /* "DD-MM-YYYY HH:MM" */
+    if (strlen(ll) >= 16 && ll[2] == '-' && ll[5] == '-') {
+        snprintf(slot_iso, sizeof(slot_iso), "%.4s-%.2s-%.2sT%.5s", ll + 6, ll + 3, ll, ll + 11);
     }
 
     char calib_date[12] = "0000-00-00";
@@ -2260,9 +2377,9 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
             fmt_fixed(s_rf15, sizeof(s_rf15), telemetry->rf_15m_mm, 4, 1);
             fmt_fixed(s_cum, sizeof(s_cum), telemetry->rf_cum_mm, 4, 1);
             snprintf(reply, sizeof(reply),
-                "AIO STN:%s\nTIME:%s\nBAT:%sV\nSIG:%ddBm\nRAIN 15M:%smm\nCUM:%smm",
+                "AIO STN:%s\nTIME:%s\nBAT:%sV\nSIG:%ddBm\nRAIN 15M:%smm\nCUM:%smm\nLAST:%s",
                 flash_nvram_get_station_id(), telemetry->present_time, s_bat,
-                s_modem_status.csq_dbm, s_rf15, s_cum);
+                s_modem_status.csq_dbm, s_rf15, s_cum, flash_nvram_get_last_logged());
 
             const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
             sim7600_send_sms(target, reply);

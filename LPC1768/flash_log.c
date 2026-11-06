@@ -12,6 +12,11 @@
 #define TYPE_RECORD     1
 #define TYPE_PENDING    2
 #define TYPE_SENT       3
+#define TYPE_OUTAGE     4   /* slot_id = first record the server did not get */
+#define TYPE_RESUMED    5   /* slot_id = first record it got again */
+#define TYPE_DRAINED    6   /* slot_id = seq up to which nothing is left to resend */
+#define TYPE_STRIKE     7   /* slot_id = queued record the server refused */
+#define MAX_OUTAGE_MARKERS 16
 #define WRITE_TRIES     8
 
 _Static_assert(sizeof(flash_log_page_t) == PAGE_SIZE, "flash log page must be exactly one flash page");
@@ -117,6 +122,11 @@ static bool iap_write_page(uint32_t page, const void *src)
 
 static uint32_t s_next_page = 0;
 static uint32_t s_next_seq = 1;
+static uint32_t s_undelivered_from = 0; /* 0: the newest record reached the server */
+static uint32_t s_newest_outage = 0;    /* First record of the newest outage */
+static uint32_t s_drained_seq = 0;
+
+static const flash_log_page_t *oldest_pending(uint32_t *out_count);
 
 static const flash_log_page_t *page_at(uint32_t page)
 {
@@ -169,6 +179,29 @@ void flash_log_init(void)
     }
     s_next_seq = newest_seq + 1;
     s_next_page = (newest_page + 1) % TOTAL_PAGES;
+
+    uint32_t newest_marker = 0;
+    uint32_t newest_drained = 0;
+    s_undelivered_from = 0;
+    s_newest_outage = 0;
+    s_drained_seq = 0;
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (!page_valid(p)) {
+            continue;
+        }
+        if ((p->type == TYPE_OUTAGE || p->type == TYPE_RESUMED) && p->seq > newest_marker) {
+            newest_marker = p->seq;
+            s_undelivered_from = (p->type == TYPE_OUTAGE) ? (uint32_t)p->slot_id : 0;
+        }
+        if (p->type == TYPE_OUTAGE && (uint32_t)p->slot_id > s_newest_outage) {
+            s_newest_outage = (uint32_t)p->slot_id;
+        }
+        if (p->type == TYPE_DRAINED && p->seq > newest_drained) {
+            newest_drained = p->seq;
+            s_drained_seq = (uint32_t)p->slot_id;
+        }
+    }
 }
 
 /* Page ready to be written: erases the next sector on entering it, skips torn pages */
@@ -237,6 +270,151 @@ const flash_log_page_t *flash_log_next_record(uint32_t after_seq)
     for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
         const flash_log_page_t *p = page_at(i);
         if (page_valid(p) && p->type == TYPE_RECORD && p->seq > after_seq && (!best || p->seq < best->seq)) {
+            best = p;
+        }
+    }
+    return best;
+}
+
+/* Only the start and end of an outage take a page, so normal running costs no record space */
+void flash_log_note_delivery(uint32_t record_seq, bool delivered)
+{
+    if (record_seq == 0) {
+        return;
+    }
+    if (delivered && s_undelivered_from != 0) {
+        if (write_page(TYPE_RESUMED, (int32_t)record_seq, NULL, NULL) != 0) {
+            s_undelivered_from = 0;
+        }
+    } else if (!delivered && s_undelivered_from == 0) {
+        if (write_page(TYPE_OUTAGE, (int32_t)record_seq, NULL, NULL) != 0) {
+            s_undelivered_from = record_seq;
+            s_newest_outage = record_seq;
+        }
+    }
+}
+
+bool flash_log_outage_unsettled(void)
+{
+    return s_undelivered_from == 0 && s_newest_outage > s_drained_seq;
+}
+
+void flash_log_note_drained(void)
+{
+    if (flash_log_outage_unsettled() && oldest_pending(NULL) == NULL) {
+        uint32_t newest = flash_log_newest_seq();
+        if (write_page(TYPE_DRAINED, (int32_t)newest, NULL, NULL) != 0) {
+            s_drained_seq = newest;
+        }
+    }
+}
+
+static bool queued_before(uint32_t record_seq)
+{
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (p->magic == LOG_MAGIC && p->type == TYPE_PENDING && (uint32_t)p->slot_id == record_seq) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The card holding the queue has gone, but flash still has what those outages left unsent. Queues
+ * them here. Only runs when a card has failed, so normal running pays nothing for this. */
+uint32_t flash_log_adopt_undelivered(void)
+{
+    struct { uint32_t ref; uint8_t type; } markers[MAX_OUTAGE_MARKERS]; /* RAM is short: not static */
+    uint32_t count = 0;
+    uint32_t adopted = 0;
+    uint32_t newest = flash_log_newest_seq();
+
+    if (!flash_log_outage_unsettled()) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < TOTAL_PAGES && count < MAX_OUTAGE_MARKERS; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (page_valid(p) && (p->type == TYPE_OUTAGE || p->type == TYPE_RESUMED)) {
+            markers[count].ref = (uint32_t)p->slot_id;
+            markers[count].type = p->type;
+            count++;
+        }
+    }
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (!page_valid(p) || p->type != TYPE_RECORD || p->seq <= s_drained_seq ||
+            p->seq > newest || p->payload[0] == '\0') {
+            continue;
+        }
+        uint32_t best_ref = 0;
+        uint8_t best_type = 0;
+        for (uint32_t m = 0; m < count; m++) {
+            if (markers[m].ref <= p->seq && markers[m].ref >= best_ref) {
+                best_ref = markers[m].ref;
+                best_type = markers[m].type;
+            }
+        }
+        if (best_type == TYPE_OUTAGE && !queued_before(p->seq) &&
+            write_page(TYPE_PENDING, (int32_t)p->seq, NULL, NULL) != 0) {
+            adopted++;
+        }
+    }
+    if (write_page(TYPE_DRAINED, (int32_t)newest, NULL, NULL) != 0) {
+        s_drained_seq = newest;
+    }
+    return adopted;
+}
+
+/* No more than a few pages per bad record, and only when the server says no */
+bool flash_log_note_rejected(uint32_t record_seq, int strikes_allowed)
+{
+    int strikes = 1;
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (page_valid(p) && p->type == TYPE_STRIKE && (uint32_t)p->slot_id == record_seq) {
+            strikes++;
+        }
+    }
+    if (strikes >= strikes_allowed) {
+        flash_log_mark_sent(record_seq);
+        return true;
+    }
+    write_page(TYPE_STRIKE, (int32_t)record_seq, NULL, NULL);
+    return false;
+}
+
+/* How many of the newest records, up to limit, were made with no network, newest first */
+int flash_log_no_network_run(int limit)
+{
+    int run = 0;
+    uint32_t below = 0xFFFFFFFFUL;
+    while (run < limit) {
+        const flash_log_page_t *best = NULL;
+        for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+            const flash_log_page_t *p = page_at(i);
+            if (page_valid(p) && p->type == TYPE_RECORD && p->seq < below && (!best || p->seq > best->seq)) {
+                best = p;
+            }
+        }
+        if (!best || strstr(best->record, ",-113,") == NULL) {
+            break;
+        }
+        run++;
+        below = best->seq;
+    }
+    return run;
+}
+
+const flash_log_page_t *flash_log_last_delivered(void)
+{
+    if (s_undelivered_from == 0) {
+        return flash_log_newest_record();
+    }
+    const flash_log_page_t *best = NULL;
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (page_valid(p) && p->type == TYPE_RECORD && p->seq < s_undelivered_from &&
+            (!best || p->seq > best->seq)) {
             best = p;
         }
     }
@@ -377,4 +555,7 @@ void flash_log_erase_all(void)
     }
     s_next_page = 0;
     s_next_seq = 1;
+    s_undelivered_from = 0;
+    s_newest_outage = 0;
+    s_drained_seq = 0;
 }

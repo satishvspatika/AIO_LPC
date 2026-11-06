@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.8.3"
+#define FIRMWARE_VERSION    "v6.8.5"
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
 #define ENABLE_TEST_SEND    1
@@ -49,6 +49,7 @@
 #define HTTP_LOG_FILENAME       "HTTPLOG.TXT"
 #define SLOT_LOG_FILENAME       "SLOTS.CSV"
 #define LAST_LOGGED_FILENAME    "LASTLOG.DAT"
+#define REJECTED_FILENAME       "REJECTED.TXT"
 #define RAT_MODE_FILENAME       "RATMODE.DAT"
 #define LAST_SLOT_FILENAME      "LASTSLOT.DAT"
 #define FLASH_SYNC_FILENAME     "FLASHSYN.DAT"

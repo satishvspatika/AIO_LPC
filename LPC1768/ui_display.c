@@ -1592,7 +1592,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 if (bl == 0) {
                     snprintf(line2, sizeof(line2), "ALL SYNCED (00) ");
                 } else {
-                    snprintf(line2, sizeof(line2), "PENDING: %-4d PKTS", (int)bl);
+                    snprintf(line2, sizeof(line2), "PENDING %4d PKT", (int)bl);
                 }
                 break;
             }
@@ -2006,6 +2006,8 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 intermcu_reset_cumulative_rain();
                 storage_backlog_clear_all();
                 flash_log_erase_all();
+                storage_state_delete(LAST_LOGGED_FILENAME);
+                flash_nvram_note_last_logged("NO DATA YET");
 
                 vTaskDelay(1500 / portTICK_RATE_MS);
                 lcd_command(0x80);

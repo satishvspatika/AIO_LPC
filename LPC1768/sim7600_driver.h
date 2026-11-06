@@ -17,6 +17,22 @@ typedef struct {
 
 void sim7600_init(void);
 bool sim7600_power_on(void);
+
+/* The last power-on found no usable SIM */
+bool sim7600_sim_missing(void);
+
+/* The last post went out with no answer: don't repeat it until the next slot */
+bool sim7600_post_unanswered(void);
+
+/* The server answered the last post and said no */
+bool sim7600_post_rejected(void);
+
+/* One send by one route: 0 the server's name, 1 its IP, 2 the modem's HTTP commands */
+bool sim7600_http_post_once(const http_endpoint_t *endpoint, const char *payload, int route);
+const char *sim7600_route_name(int route);
+
+/* Asks the modem whether it's still on the network */
+bool sim7600_still_registered(void);
 void sim7600_power_off(void);
 
 /* Modem concurrency lock */

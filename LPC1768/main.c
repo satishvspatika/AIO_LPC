@@ -109,6 +109,9 @@ static void vUi_Task(void *pvParameters)
  * Every slot must end in one of: delivered, saved to backlog, or logged as lost. */
 #define SLOT_MODEM_WAIT_SEC     120 /* How long to wait for SMS/supervisor to free the modem */
 #define SLOT_MODEM_POWER_TRIES  2   /* Modem boot + network registration attempts */
+#define NO_NETWORK_SLOTS_BEFORE_ONE_TRY 4   /* About an hour with no network: one try per slot */
+#define SLOT_SEND_BUDGET_SEC    300 /* No new send starts past this, so bad signal can't drain the battery */
+#define REJECTIONS_ALLOWED      3   /* Separate slots, as a wrong clock can cause one and gets corrected */
 #define SLOT_CLOCK_WAIT_SEC     300 /* Scheduled wake with no valid clock: give up after this */
 
 typedef enum {
@@ -281,6 +284,8 @@ static slot_result_t save_slot_for_retry(const telemetry_data_t *telem, const ch
 {
     slot_result_t result = SLOT_BACKLOG;
 
+    flash_log_note_delivery(s_last_record_seq, false);
+
     if (strlen(payload) >= 384) {
         storage_log_debug("ERROR", "Slot payload exceeds 383 bytes: backlog copy will be truncated");
     }
@@ -345,14 +350,24 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
 
     storage_log_debug("MODEM", "SIM7600 slot transmission starting...");
 
+    /* Worked out from the records, so it survives the power-off between slots with no extra writes */
+    const portTickType budget_end = xTaskGetTickCount() + (SLOT_SEND_BUDGET_SEC * 1000 / portTICK_RATE_MS);
+    #define SLOT_BUDGET_LEFT() ((long)(budget_end - xTaskGetTickCount()) > 0)
+    const int power_tries = (flash_log_no_network_run(NO_NETWORK_SLOTS_BEFORE_ONE_TRY) >= NO_NETWORK_SLOTS_BEFORE_ONE_TRY)
+                            ? 1 : SLOT_MODEM_POWER_TRIES;
+
     bool modem_up = false;
-    for (int attempt = 1; attempt <= SLOT_MODEM_POWER_TRIES && !modem_up; attempt++) {
+    for (int attempt = 1; attempt <= power_tries && !modem_up && SLOT_BUDGET_LEFT(); attempt++) {
         hal_power_heartbeat();
         modem_up = sim7600_power_on();
         if (!modem_up) {
             snprintf(s_slot_line, sizeof(s_slot_line), "Modem power-on/registration failed (try %d/%d)", attempt, SLOT_MODEM_POWER_TRIES);
             storage_log_debug("MODEM", s_slot_line);
-            if (attempt < SLOT_MODEM_POWER_TRIES) {
+            /* A second try can't find a SIM that isn't there. Each slot still checks afresh. */
+            if (sim7600_sim_missing()) {
+                break;
+            }
+            if (attempt < power_tries) {
                 sim7600_power_off();
             }
         }
@@ -375,9 +390,11 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
         storage_log_debug("HTTP", s_slot_line);
         storage_log_debug("HTTP_POST", payload);
 
-        /* Transmit current slot with up to 2 retries (3 attempts total) */
-        char date_hdr[64] = "";
+        /* This slot's record: 3 tries in all, one by each route. The route that worked
+         * then carries the backlog. */
         bool post_ok = false;
+        int good_route = 0;
+        const char *fail_reason = "HTTP_FAILED";
         for (int attempt = 1; attempt <= 3; attempt++) {
             char att_msg[48];
             snprintf(att_msg, sizeof(att_msg), "HTTP Post Attempt %d/3...", attempt);
@@ -385,22 +402,41 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
             *out_attempts = attempt;
             hal_power_heartbeat();
 
-            post_ok = sim7600_http_post(endpoint, payload, date_hdr, sizeof(date_hdr));
+            post_ok = sim7600_http_post_once(endpoint, payload, attempt - 1);
             if (post_ok) {
+                good_route = attempt - 1;
                 storage_log_debug("HTTP", "Transmission succeeded (200 OK)!");
                 break;
             }
+            if (sim7600_post_unanswered()) {
+                storage_log_debug("HTTP", "Sent with no answer: keeping it for the next slot, no repeat now");
+                break;
+            }
+            /* Signal gone since registering, or too long already: it's saved below either way */
+            if (!SLOT_BUDGET_LEFT()) {
+                storage_log_debug("HTTP", "Slot sending time used up: keeping it for the next slot");
+                fail_reason = "TIME_LIMIT";
+                break;
+            }
+            if (!sim7600_post_rejected() && !sim7600_still_registered()) {
+                storage_log_debug("HTTP", "Network lost after registering: keeping it for the next slot");
+                fail_reason = "NET_LOST";
+                break;
+            }
             if (attempt < 3) {
-                storage_log_debug("HTTP", "Attempt failed, waiting 3s before retry...");
+                storage_log_debug("HTTP", "Attempt failed, waiting 3s before the next try...");
                 vTaskDelay(3000 / portTICK_RATE_MS);
             }
         }
 
         if (post_ok) {
             result = SLOT_SENT;
-            *out_reason = "OK";
+            /* In SLOTS.CSV, so a card shows at a glance which route each slot used */
+            static const char *const ok_reasons[] = { "OK_NAME", "OK_IP", "OK_MODEM_HTTP" };
+            *out_reason = ok_reasons[good_route];
 
-            /* Persist Last Logged date/time in Sector 1 Flash NVRAM (survives power off) */
+            /* Last Logged: the flash log holds this for good, LASTLOG.DAT is a readable copy */
+            flash_log_note_delivery(s_last_record_seq, true);
             const char *ts = slot_timestamp(telem);
             char last_log_ts[20] = "";
             if (strlen(ts) >= 12) {
@@ -417,13 +453,13 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                 }
             }
 
-            /* Current slot succeeded: Check and process pending backlogs (max 15, no retries) */
+            /* Current slot succeeded: up to 15 backlog records, one try each */
             uint8_t backlogs_sent = 0;
             uint32_t bk_offset = 0;
             bool bk_failed = false;
 
             /* This slot is archived, so its payload buffer can carry the backlog records */
-            while (backlogs_sent < 15 && storage_backlog_get_next_unsent(0, &bk_offset, payload, 384)) {
+            while (backlogs_sent < 15 && SLOT_BUDGET_LEFT() && storage_backlog_get_next_unsent(0, &bk_offset, payload, 384)) {
                 char bk_msg[64];
                 snprintf(bk_msg, sizeof(bk_msg), "Sending Backlog #%d (offset %u)...", backlogs_sent + 1, (unsigned int)bk_offset);
                 storage_log_debug("BACKLOG", bk_msg);
@@ -432,13 +468,26 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                 /* Carrier NAT needs this gap after a socket closes before opening the next */
                 vTaskDelay(3000 / portTICK_RATE_MS);
 
-                char bk_date_hdr[64] = "";
-                bool bk_ok = sim7600_http_post(endpoint, payload, bk_date_hdr, sizeof(bk_date_hdr));
+                bool bk_ok = sim7600_http_post_once(endpoint, payload, good_route);
 
                 if (bk_ok) {
                     storage_log_debug("BACKLOG", "Backlog delivered OK, marking SENT");
-                    storage_backlog_mark_sent(bk_offset);
+                    /* Unmarked, it would be picked and sent again straight away */
+                    if (!storage_backlog_mark_sent(bk_offset)) {
+                        storage_log_debug("ERROR", "Could not mark backlog record sent: stopping backlog cycle");
+                        bk_failed = true;
+                        break;
+                    }
                     backlogs_sent++;
+                } else if (sim7600_post_rejected()) {
+                    /* This slot's own record was just accepted, so the server is working and it's this record */
+                    if (storage_backlog_note_rejected(bk_offset, REJECTIONS_ALLOWED, payload)) {
+                        storage_log_debug("ERROR", "Backlog record refused 3 times: moved to " REJECTED_FILENAME);
+                    } else {
+                        storage_log_debug("BACKLOG", "Backlog record refused: trying it again next slot");
+                        bk_failed = true;
+                        break;
+                    }
                 } else {
                     storage_log_debug("BACKLOG", "Backlog transmission failed! Aborting backlog cycle.");
                     bk_failed = true;
@@ -447,31 +496,57 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
             }
             storage_backlog_cleanup_if_all_sent();
 
+            /* A card that has failed took its queue with it: flash knows what those outages left */
+            if (flash_log_outage_unsettled() && !storage_sd_is_ok()) {
+                uint32_t adopted = flash_log_adopt_undelivered();
+                for (uint32_t i = 0; i < adopted; i++) {
+                    ui_inc_backlog_count();
+                }
+                snprintf(s_slot_line, sizeof(s_slot_line), "No SD card: %lu unsent records queued from flash", (unsigned long)adopted);
+                storage_log_debug("BACKLOG", s_slot_line);
+            }
+
             /* Then anything queued in flash while there was no SD card, within the same limit */
             uint32_t flash_seq = 0;
-            while (!bk_failed && backlogs_sent < 15 && flash_log_next_pending(&flash_seq, payload, 384)) {
+            while (!bk_failed && backlogs_sent < 15 && SLOT_BUDGET_LEFT() && flash_log_next_pending(&flash_seq, payload, 384)) {
                 hal_power_heartbeat();
                 vTaskDelay(3000 / portTICK_RATE_MS);
 
-                char bk_date_hdr[64] = "";
-                if (sim7600_http_post(endpoint, payload, bk_date_hdr, sizeof(bk_date_hdr))) {
+                if (sim7600_http_post_once(endpoint, payload, good_route)) {
                     storage_log_debug("BACKLOG", "Flash backlog record delivered OK");
                     flash_log_mark_sent(flash_seq);
                     ui_dec_backlog_count();
                     backlogs_sent++;
+                } else if (sim7600_post_rejected()) {
+                    if (flash_log_note_rejected(flash_seq, REJECTIONS_ALLOWED)) {
+                        storage_log_debug("ERROR", "Flash backlog record refused 3 times: set aside, still in the flash log");
+                        storage_append_stamped(REJECTED_FILENAME, payload);
+                        ui_dec_backlog_count();
+                    } else {
+                        storage_log_debug("BACKLOG", "Flash backlog record refused: trying it again next slot");
+                        bk_failed = true;
+                    }
                 } else {
                     storage_log_debug("BACKLOG", "Flash backlog transmission failed, aborting");
                     bk_failed = true;
                 }
             }
+
+            /* All delivered: a card lost from now on has nothing to take with it */
+            if (!bk_failed && SLOT_BUDGET_LEFT() && flash_log_outage_unsettled() && storage_sd_is_ok() &&
+                storage_backlog_get_pending_count() == 0) {
+                flash_log_note_drained();
+            }
         } else {
-            storage_log_debug("HTTP", "All 3 HTTP attempts failed! Saving slot as pending backlog.");
-            *out_reason = "HTTP_FAILED";
+            storage_log_debug("HTTP", "Not delivered: saving slot as pending backlog.");
+            *out_reason = sim7600_post_unanswered() ? "NO_REPLY" : fail_reason;
             result = save_slot_for_retry(telem, payload);
         }
 
         /* The record has gone out, so this can't delay it */
-        gps_auto_step(telem);
+        if (SLOT_BUDGET_LEFT()) {
+            gps_auto_step(telem);
+        }
 
         /* Check and process incoming operator SMS */
         sim7600_check_incoming_sms(telem);
@@ -726,6 +801,13 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
              duration_sec, s_bat, boot_mode, (unsigned int)ui_get_backlog_count());
     storage_log_debug("SLOT_END", s_slot_line);
     storage_log_slot(s_slot_line);
+    {
+        uint32_t link_bytes, link_frames, link_good;
+        intermcu_get_link_stats(&link_bytes, &link_frames, &link_good, NULL, 0);
+        snprintf(s_slot_line, sizeof(s_slot_line), "Status frames this boot: %lu good, %lu damaged",
+                 (unsigned long)link_good, (unsigned long)intermcu_get_bad_frames());
+        storage_log_debug("LINK", s_slot_line);
+    }
 
     /* Only now: a restart mid-slot refills this one rather than losing it */
     save_last_slot(slot_id);
@@ -775,13 +857,23 @@ static void __attribute__((noinline)) log_boot_header(void)
     snprintf(bk_info, sizeof(bk_info), "Free heap after task creation: %u bytes", (unsigned int)xPortGetFreeHeapSize());
     storage_log_debug("BOOT", bk_info);
 
-    /* Last Logged lives on SD; the flash copy from older firmware is only the fallback */
-    char last_logged[24];
-    if (storage_state_load(LAST_LOGGED_FILENAME, last_logged, sizeof(last_logged))) {
-        for (int i = (int)strlen(last_logged) - 1; i >= 0 && (last_logged[i] == ' ' || last_logged[i] == '\r' || last_logged[i] == '\n'); i--) {
-            last_logged[i] = '\0';
-        }
+    /* Last Logged: the newest record the server got. The flash log needs no card; the SD copy is
+     * only for a unit whose flash log has no such record. */
+    const flash_log_page_t *delivered = flash_log_last_delivered();
+    const char *r = delivered ? delivered->record : "";
+    if (strlen(r) >= 19 && r[2] == ',' && r[13] == ',') {
+        /* "NN,YYYY-MM-DD,HH:MM,..." to "DD-MM-YYYY HH:MM" */
+        char last_logged[20];
+        snprintf(last_logged, sizeof(last_logged), "%.2s-%.2s-%.4s %.5s", r + 11, r + 8, r + 3, r + 14);
         flash_nvram_note_last_logged(last_logged);
+    } else {
+        char last_logged[24];
+        if (storage_state_load(LAST_LOGGED_FILENAME, last_logged, sizeof(last_logged))) {
+            for (int i = (int)strlen(last_logged) - 1; i >= 0 && (last_logged[i] == ' ' || last_logged[i] == '\r' || last_logged[i] == '\n'); i--) {
+                last_logged[i] = '\0';
+            }
+            flash_nvram_note_last_logged(last_logged);
+        }
     }
 }
 

@@ -154,6 +154,7 @@ static void check_station_type_change(void)
         storage_backlog_clear_all();
         flash_log_erase_all();
         intermcu_reset_cumulative_rain();
+        flash_nvram_note_last_logged("NO DATA YET");
         snprintf(line, sizeof(line), "Station %s type %d to %d: all data erased, %d SD files",
                  flash_nvram_get_station_id(), last, UNIT_CFG, removed);
         storage_log_debug("FW", line);

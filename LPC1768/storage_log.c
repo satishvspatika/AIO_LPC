@@ -638,12 +638,50 @@ bool storage_backlog_mark_sent(uint32_t entry_offset)
 
     uint8_t sent_flag = 1;
     UINT bw;
-    f_write(&s_backlog_file, &sent_flag, 1, &bw);
-    f_close(&s_backlog_file);
+    FRESULT wr = f_write(&s_backlog_file, &sent_flag, 1, &bw);
+    FRESULT cl = f_close(&s_backlog_file);
     fs_unlock();
+    if (wr != FR_OK || bw != 1 || cl != FR_OK) {
+        return false;
+    }
 
     ui_dec_backlog_count();
     return true;
+}
+
+/* The server refused this record. The count sits in the entry's unused last slot_time byte, so older
+ * files read as no strikes. Once set aside, the record goes to REJECTED.TXT to resend by hand, and
+ * stays in DATA/ and flash. Returns true then. */
+bool storage_backlog_note_rejected(uint32_t entry_offset, int strikes_allowed, const char *payload)
+{
+    const uint32_t strike_at = entry_offset + offsetof(storage_backlog_entry_t, slot_time) +
+                               sizeof(((storage_backlog_entry_t *)0)->slot_time) - 1;
+    bool set_aside = false;
+
+    fs_lock();
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ | FA_WRITE) == FR_OK) {
+        UINT n = 0;
+        uint8_t strikes = 0;
+        if (f_lseek(&s_backlog_file, strike_at) == FR_OK &&
+            f_read(&s_backlog_file, &strikes, 1, &n) == FR_OK && n == 1) {
+            strikes++;
+            if (strikes >= strikes_allowed) {
+                uint8_t aside_flag = 2;
+                set_aside = (f_lseek(&s_backlog_file, entry_offset) == FR_OK &&
+                             f_write(&s_backlog_file, &aside_flag, 1, &n) == FR_OK && n == 1);
+            } else if (f_lseek(&s_backlog_file, strike_at) == FR_OK) {
+                f_write(&s_backlog_file, &strikes, 1, &n);
+            }
+        }
+        f_close(&s_backlog_file);
+    }
+    fs_unlock();
+
+    if (set_aside) {
+        ui_dec_backlog_count();
+        storage_append_stamped(REJECTED_FILENAME, payload);
+    }
+    return set_aside;
 }
 
 void storage_backlog_cleanup_if_all_sent(void)
@@ -689,11 +727,22 @@ void fw_file_close(void)
     fs_unlock();
 }
 
+void storage_state_delete(const char *name)
+{
+    fs_lock();
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    f_unlink(name);
+    fs_unlock();
+}
+
 /* A new station type starts fresh: its records, and what the old type had queued or remembered.
  * Debug logs, SLOTS.CSV and UPDATE.TXT stay, as they say what happened. Returns files removed. */
 int storage_erase_station_data(void)
 {
-    static const char *const state_files[] = { LAST_SLOT_FILENAME, FLASH_SYNC_FILENAME, LAST_LOGGED_FILENAME, BACKLOG_FILENAME };
+    static const char *const state_files[] = { LAST_SLOT_FILENAME, FLASH_SYNC_FILENAME, LAST_LOGGED_FILENAME, BACKLOG_FILENAME, REJECTED_FILENAME };
     int removed = 0;
     DIR dir;
     FILINFO info;

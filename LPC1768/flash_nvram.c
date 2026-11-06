@@ -111,21 +111,7 @@ void flash_nvram_init(void)
         flash_nvram_set_station_id(STATION_ID_DEFAULT);
     }
 
-    /* Load Last Logged timestamp from Sector 1 if present */
-    const char *flash_log = (const char *)(PARAM_SECTOR_ADDR + offsetof(station_nvram_params_t, last_logged));
-    if (flash_log[0] >= '0' && flash_log[0] <= '9') {
-        int log_len = 0;
-        while (log_len < 16 && ((flash_log[log_len] >= '0' && flash_log[log_len] <= '9') ||
-                                flash_log[log_len] == '-' || flash_log[log_len] == ':' ||
-                                flash_log[log_len] == ' ' || flash_log[log_len] == '/')) {
-            log_len++;
-        }
-        if (log_len >= 10) {
-            strncpy(s_active_last_logged, flash_log, log_len);
-            s_active_last_logged[log_len] = '\0';
-            return;
-        }
-    }
+    /* Boot sets Last Logged from the record log. Sector 1 holds only a stale copy from older firmware. */
     strncpy(s_active_last_logged, "NO DATA YET", sizeof(s_active_last_logged) - 1);
 }
 
