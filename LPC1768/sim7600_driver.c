@@ -2277,6 +2277,10 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     const char *network_name = STATUS_SMS_NETWORK_NAME;
     const char *stn_type = (UNIT_CFG == KSNDMC_TWS) ? "TWS" : "TRG";
     const char *stn_id = flash_nvram_get_station_id();
+    /* The status SMS carries the number without its leading zeros: 001923 goes as 1923 */
+    while (stn_id[0] == '0' && stn_id[1] != '\0') {
+        stn_id++;
+    }
 
     /* Format timestamp in ISO: YYYY-MM-DDTHH:MM */
     char time_iso[24] = "2026-01-01T00:00";

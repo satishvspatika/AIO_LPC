@@ -567,6 +567,8 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
  * LPC845 for its stored samples and queues them as backlog records, so the server gets the
  * measured values. They carry the ESP32's gap-filled signal marker. */
 #define SIGNAL_GAP_FILLED       (-104)
+#define SIGNAL_OFF_FILLED_TODAY (-112)  /* ESP32 marker: not measured, this rain day */
+#define SIGNAL_OFF_FILLED_PAST  (-110)  /* ESP32 marker: not measured, closing an earlier rain day */
 #define GAP_MAX_SLOTS           (3 * 96)    /* The LPC845 keeps 3 rain days */
 #define GAP_REPLY_WAIT_MS       3000
 
@@ -609,6 +611,46 @@ static int32_t load_last_slot(void)
 
 static telemetry_data_t s_gap_record; /* Used by vMain_Task only */
 
+static bool parse_record_total(const char *record, char *ts, size_t ts_size, unsigned long *out_tips);
+
+/* GAP_RULE_BEGIN */
+/* A slot nobody measured gets a row only if this unit holds a record from the same rain day, even a
+ * 0 mm one. The start of a rain day with nothing known stays empty. Returns the row's signal marker,
+ * or 0 for no row. */
+static int off_slot_marker(const char *known_close, const char *gap_close, const char *current_close)
+{
+    if (known_close[0] == '\0' || strcmp(known_close, gap_close) != 0) {
+        return 0;
+    }
+    return (strcmp(gap_close, current_close) == 0) ? SIGNAL_OFF_FILLED_TODAY : SIGNAL_OFF_FILLED_PAST;
+}
+
+/* The battery in a record, its last field, as 13.38. 0 if it isn't in that form. */
+static float record_battery(const char *record)
+{
+    const char *q = strrchr(record, ',');
+    if (!q) {
+        return 0.0f;
+    }
+    q++;
+    int whole = 0, digits = 0;
+    while (*q >= '0' && *q <= '9') {
+        whole = whole * 10 + (*q++ - '0');
+        digits++;
+    }
+    int frac = 0, scale = 1;
+    if (*q == '.') {
+        q++;
+        while (*q >= '0' && *q <= '9' && scale < 100) {
+            frac = frac * 10 + (*q++ - '0');
+            scale *= 10;
+        }
+    }
+    return (digits > 0) ? (float)whole + (float)frac / (float)scale : 0.0f;
+}
+/* GAP_RULE_END */
+
+
 static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *telem, int32_t slot_id)
 {
     int32_t last_done = load_last_slot();
@@ -632,9 +674,36 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
     int base_mo = (p[4]-'0')*10 + (p[5]-'0');
     int base_da = (p[6]-'0')*10 + (p[7]-'0');
 
-    int filled = 0, not_held = 0;
+    int filled = 0, off_filled = 0, not_held = 0;
     char request[16];
     char payload[512];
+
+    /* What the newest record says about its rain day: CUM_RF carries on from it */
+    char known_close[12] = "";
+    char current_close[12] = "";
+    float known_cum_mm = 0.0f;
+    float known_bat = 0.0f;
+    const flash_log_page_t *newest = flash_log_newest_record();
+    unsigned long known_tips = 0;
+    char known_ts[16];
+#if (UNIT_CFG == KSNDMC_TWS)
+    /* No rain total in a TWS record: only its time, "NN,YYYY-MM-DD,HH:MM,..." */
+    if (newest && strlen(newest->record) >= 19 && newest->record[2] == ',' && newest->record[13] == ',') {
+        const char *r = newest->record;
+        snprintf(known_ts, sizeof(known_ts), "%.4s%.2s%.2s%.2s%.2s00", r + 3, r + 8, r + 11, r + 14, r + 17);
+        if (intermcu_rain_close_date(known_ts, known_close, sizeof(known_close))) {
+            known_bat = record_battery(r);
+        }
+    }
+    (void)known_tips;
+#else
+    if (newest && parse_record_total(newest->record, known_ts, sizeof(known_ts), &known_tips) &&
+        intermcu_rain_close_date(known_ts, known_close, sizeof(known_close))) {
+        known_cum_mm = (float)known_tips * RF_BUCKET_RESOLUTION;
+        known_bat = record_battery(newest->record);
+    }
+#endif
+    intermcu_rain_close_date(telem->present_time, current_close, sizeof(current_close));
 
     for (int32_t k = missed; k >= 1; k--) {
         int32_t id = slot_id - k;
@@ -664,18 +733,49 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
             storage_log_debug("SLOT", s_slot_line);
             storage_log_slot(s_slot_line);
             filled++;
+            /* Measured: the rows after it carry on from this */
+            intermcu_rain_close_date(request, known_close, sizeof(known_close));
+            known_cum_mm = s_gap_record.rf_cum_mm;
+            known_bat = s_gap_record.bat1_volt;
         } else if (state == -1) {
-            not_held++;
+            /* The LPC845 was off too, so this slot was never measured */
+            char gap_close[12] = "";
+            intermcu_rain_close_date(request, gap_close, sizeof(gap_close));
+            int marker = off_slot_marker(known_close, gap_close, current_close);
+#if (UNIT_CFG == KSNDMC_TWS)
+            /* Temperature, humidity and wind weren't measured, and aren't estimated: the row stays empty */
+            marker = 0;
+#endif
+            if (marker == 0) {
+                not_held++;
+                continue;
+            }
+            strncpy(s_gap_record.slot_time, request, sizeof(s_gap_record.slot_time) - 1);
+            s_gap_record.slot_time[sizeof(s_gap_record.slot_time) - 1] = '\0';
+            s_gap_record.rf_tips_15m = 0;
+            s_gap_record.rf_15m_mm = 0.0f;
+            s_gap_record.rf_cum_mm = known_cum_mm;
+            s_gap_record.bat1_volt = known_bat; /* The signal value is what marks a filled row */
+            format_slot_payload(payload, sizeof(payload), &s_gap_record, marker);
+            s_archive_slot_id = id;
+            archive_slot(&s_gap_record, marker, payload);
+            slot_result_t result = save_slot_for_retry(&s_gap_record, payload);
+            snprintf(s_slot_line, sizeof(s_slot_line), "%.14s,%.14s,%s,OFF_FILLED,0,%d,0,,,%u",
+                     telem->present_time, request, (result == SLOT_LOST) ? "LOST" : "BACKLOG",
+                     marker, (unsigned int)ui_get_backlog_count());
+            storage_log_debug("SLOT", s_slot_line);
+            storage_log_slot(s_slot_line);
+            off_filled++;
         } else {
             storage_log_debug("ERROR", "LPC845 did not answer a stored-sample request, stopping gap fill");
             break;
         }
     }
 
-    snprintf(s_slot_line, sizeof(s_slot_line), "Gap fill done: %d filled, %d not held by LPC845", filled, not_held);
-    storage_log_debug(not_held ? "ERROR" : "GAP", s_slot_line);
+    snprintf(s_slot_line, sizeof(s_slot_line), "Gap fill done: %d measured, %d not measured, %d left empty", filled, off_filled, not_held);
+    storage_log_debug("GAP", s_slot_line);
     if (not_held > 0) {
-        snprintf(s_slot_line, sizeof(s_slot_line), "%.14s,,LOST,NOT_IN_LPC845,0,0,0,,,%d", telem->present_time, not_held);
+        snprintf(s_slot_line, sizeof(s_slot_line), "%.14s,,EMPTY,NO_DATA_FOR_RAIN_DAY,0,0,0,,,%d", telem->present_time, not_held);
         storage_log_slot(s_slot_line);
     }
 }
@@ -762,8 +862,14 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
 
     s_last_slot_id = slot_id;
 
+    /* Queue anything missed in the wait below, so it can't delay this slot's record */
+    portTickType fill_start = xTaskGetTickCount();
+    fill_missed_slots(telem, slot_id);
+    s_archive_slot_id = slot_id;
+    int fill_sec = (int)((xTaskGetTickCount() - fill_start) / configTICK_RATE_HZ);
+
     /* Slot boundary guard: servers reject a record sent under 62s after its slot boundary */
-    int elapsed_sec = (min % 15) * 60 + sec;
+    int elapsed_sec = (min % 15) * 60 + sec + fill_sec;
     if (elapsed_sec < SLOT_HOLD_GUARD_SEC) {
         int wait_sec = SLOT_HOLD_GUARD_SEC - elapsed_sec;
         snprintf(s_slot_line, sizeof(s_slot_line), "Slot boundary reached, holding %ds for sensors", wait_sec);
@@ -771,9 +877,9 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         for (int w = 0; w < wait_sec; w++) {
             vTaskDelay(1000 / portTICK_RATE_MS);
         }
-        /* Re-read fresh telemetry */
-        intermcu_get_telemetry(telem);
     }
+    /* Re-read fresh telemetry */
+    intermcu_get_telemetry(telem);
 
     const char *boot_mode = ui_was_scheduled_boot() ? "SCHEDULED" : "OPERATOR";
     char s_bat[8], s_rf15[8], s_rfday[8];
@@ -783,10 +889,6 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     snprintf(s_slot_line, sizeof(s_slot_line), "time=%.14s slot=%.14s boot=%s bat=%sV rain15=%s rainday=%s",
              telem->present_time, telem->slot_time, boot_mode, s_bat, s_rf15, s_rfday);
     storage_log_debug("SLOT_START", s_slot_line);
-
-    /* Queue anything missed first, so it goes out with this slot's backlog send */
-    fill_missed_slots(telem, slot_id);
-    s_archive_slot_id = slot_id;
 
     portTickType start_tick = xTaskGetTickCount();
     int attempts = 0;
