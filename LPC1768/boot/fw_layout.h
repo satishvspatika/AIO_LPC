@@ -15,6 +15,47 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* LPC845 flash map. It has no room for the same layout, but the same swap and journal code runs on
+ * it, built with FW_TARGET_LPC845. Flash stops at 60 KB here, as it always has on this chip.
+ *
+ *   0x0000  sectors 0-3    bootloader, never changed by an update
+ *   0x1000  sectors 4-7    update journal (a ring of 64 records)
+ *   0x2000  sector 8       swap scratch
+ *   0x2400  sectors 9-32   firmware that runs (slot A)
+ *   0x8400  sectors 33-56  staging (slot B)
+ *   0xE400  sectors 57-59  free
+ *
+ * The LPC1768 sends files to this layout, so it needs these three whichever chip is being built. */
+#define FW845_SLOT_A_BASE   0x00002400UL
+#define FW845_SLOT_SIZE     0x00006000UL
+#define FW845_BOARD_ID      0x00000845UL
+#define FW845_RAM_TOP       0x10004000UL
+#define FW1768_RAM_TOP      0x10008000UL
+
+#ifdef FW_TARGET_LPC845
+
+#define FW_SECTOR_SIZE      0x400UL
+#define FW_SLOT_SECTORS     24UL
+#define FW_SLOT_SIZE        FW845_SLOT_SIZE
+#define FW_SCRATCH_BASE     0x00002000UL
+#define FW_SCRATCH_SECTOR   8UL
+#define FW_SLOT_A_BASE      FW845_SLOT_A_BASE
+#define FW_SLOT_A_SECTOR    9UL
+#define FW_SLOT_B_BASE      0x00008400UL
+#define FW_SLOT_B_SECTOR    33UL
+
+#define FW_JOURNAL_BASE     0x00001000UL
+#define FW_JOURNAL_SECTOR   4UL
+#define FW_JOURNAL_SECTORS  4UL
+#define FW_JOURNAL_SECTOR_SIZE 0x400UL
+#define FW_JOURNAL_PAGE     64UL
+
+#define FW_BOARD_ID         FW845_BOARD_ID
+#define FW_RAM_TOP          FW845_RAM_TOP
+#define FW_COPY_CHUNK       0x400UL
+
+#else /* LPC1768 */
+
 #define FW_SECTOR_SIZE      0x8000UL
 #define FW_SLOT_SECTORS     4UL
 #define FW_SLOT_SIZE        (FW_SLOT_SECTORS * FW_SECTOR_SIZE)
@@ -30,12 +71,18 @@
 #define FW_JOURNAL_SECTORS  4UL
 #define FW_JOURNAL_SECTOR_SIZE 0x1000UL
 #define FW_JOURNAL_PAGE     256UL
+
+#define FW_BOARD_ID         0x00001768UL
+#define FW_RAM_TOP          FW1768_RAM_TOP
+#define FW_COPY_CHUNK       4096UL
+
+#endif /* FW_TARGET_LPC845 */
+
 #define FW_JOURNAL_PAGES    ((FW_JOURNAL_SECTORS * FW_JOURNAL_SECTOR_SIZE) / FW_JOURNAL_PAGE)
 
 /* Every image says what it is. Reserved vector 8 points to this block, and scripts/fw_image.py
  * fills in the length and CRC after linking. */
 #define FW_IMAGE_MAGIC      0x31474D49UL /* 'IMG1' */
-#define FW_BOARD_ID         0x00001768UL
 
 typedef struct {
     uint32_t magic;
@@ -51,7 +98,7 @@ typedef struct {
 /* Flash access, supplied by the bootloader, the application or the tests */
 const uint8_t *fw_hal_ptr(uint32_t addr);
 bool fw_hal_erase(uint32_t sector);
-bool fw_hal_program(uint32_t addr, const void *src, uint32_t len); /* 256 or 4096 bytes, aligned */
+bool fw_hal_program(uint32_t addr, const void *src, uint32_t len); /* A journal page or a copy chunk, aligned */
 
 uint32_t fw_crc32_update(uint32_t crc, const uint8_t *data, uint32_t len);
 

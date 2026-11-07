@@ -8,7 +8,7 @@
 #define LPC845_FW_TYPE 2
 //#define LED_PIN  14U
 
-#define LPC845_VERSION 'b'
+#define LPC845_VERSION 'd'
 
 #define TICKRATE_HZ    (1000)	/* 1000 ticks per second */
 #define TC0_MAX_1S 2000U

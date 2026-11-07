@@ -1,5 +1,6 @@
 /* Runs the bootloader's logic on a simulated flash, cutting power at every flash operation:
- *   cc -std=gnu11 -I.. -o boot_test boot_test.c ../boot_core.c ../fw_journal.c && ./boot_test */
+ *   cc -std=gnu11 -I.. -o boot_test boot_test.c ../boot_core.c ../fw_journal.c && ./boot_test
+ * The same again for the LPC845's layout: add -DFW_TARGET_LPC845 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +10,27 @@
 #include "fw_journal.h"
 #include "boot_core.h"
 
+#ifdef FW_TARGET_LPC845
+#define FLASH_SIZE 0x10000UL
+#define KEEP1_BASE 0x0000UL  /* Bootloader */
+#define KEEP1_SIZE 0x1000UL
+#define KEEP2_BASE 0xE400UL  /* Free flash */
+#define KEEP2_SIZE 0x1C00UL
+#define OLD_IMAGE_LEN 15000UL
+#define NEW_IMAGE_LEN 18000UL
+#define DAMAGE_OFFSET 12000UL
+#define PROGRAM_SIZE_OK(n) ((n) == FW_JOURNAL_PAGE || (n) == FW_COPY_CHUNK)
+#else
 #define FLASH_SIZE 0x80000UL
+#define KEEP1_BASE 0x1000UL  /* Settings */
+#define KEEP1_SIZE 0x1000UL
+#define KEEP2_BASE 0x58000UL /* Record log */
+#define KEEP2_SIZE 0x28000UL
+#define OLD_IMAGE_LEN 105000UL
+#define NEW_IMAGE_LEN 118000UL
+#define DAMAGE_OFFSET 90000UL
+#define PROGRAM_SIZE_OK(n) ((n) == 256 || (n) == 4096)
+#endif
 static uint8_t s_flash[FLASH_SIZE];
 static long s_ops_left = -1;    /* Flash operations until the power cut, -1 for none */
 static long s_ops_done = 0;
@@ -23,9 +44,21 @@ static unsigned rnd(void) { s_rand = s_rand * 1103515245u + 12345u; return (s_ra
 
 static uint32_t sector_base(uint32_t sector)
 {
+#ifdef FW_TARGET_LPC845
+    return sector * 0x400UL;
+#else
     return (sector < 16) ? (sector * 0x1000UL) : (0x10000UL + (sector - 16) * 0x8000UL);
+#endif
 }
-static uint32_t sector_size(uint32_t sector) { return (sector < 16) ? 0x1000UL : 0x8000UL; }
+static uint32_t sector_size(uint32_t sector)
+{
+#ifdef FW_TARGET_LPC845
+    (void)sector;
+    return 0x400UL;
+#else
+    return (sector < 16) ? 0x1000UL : 0x8000UL;
+#endif
+}
 
 const uint8_t *fw_hal_ptr(uint32_t addr) { assert(addr < FLASH_SIZE); return &s_flash[addr]; }
 
@@ -55,7 +88,7 @@ bool fw_hal_erase(uint32_t sector)
 
 bool fw_hal_program(uint32_t addr, const void *src, uint32_t len)
 {
-    assert(len == 256 || len == 4096);
+    assert(PROGRAM_SIZE_OK(len));
     if (s_ops_left == 0) {
         uint32_t n = rnd() % len;
         memcpy(&s_flash[addr], src, n);
@@ -75,7 +108,7 @@ static void make_image(uint8_t *out, uint32_t length, uint8_t seed)
     memset(out, 0xFF, FW_SLOT_SIZE);
     for (uint32_t i = 0; i < length; i++) out[i] = (uint8_t)(seed + i * 7 + (i >> 8));
     uint32_t info_off = 0x200;
-    uint32_t sp = 0x10008000UL, reset = FW_SLOT_A_BASE + 0x301, info_addr = FW_SLOT_A_BASE + info_off;
+    uint32_t sp = FW_RAM_TOP, reset = FW_SLOT_A_BASE + 0x301, info_addr = FW_SLOT_A_BASE + info_off;
     memcpy(out, &sp, 4);
     memcpy(out + 4, &reset, 4);
     memcpy(out + FW_VECTOR_IMAGE_INFO * 4, &info_addr, 4);
@@ -93,13 +126,13 @@ static void make_image(uint8_t *out, uint32_t length, uint8_t seed)
 }
 
 static uint8_t s_old[FW_SLOT_SIZE], s_new[FW_SLOT_SIZE], s_new2[FW_SLOT_SIZE];
-static const uint32_t OLD_LEN = 105000, NEW_LEN = 118000;
+static const uint32_t OLD_LEN = OLD_IMAGE_LEN, NEW_LEN = NEW_IMAGE_LEN;
 
 static void reset_flash(bool stage_new)
 {
     memset(s_flash, 0xFF, sizeof(s_flash));
-    memset(&s_flash[0x1000], 0x5A, 0x1000); /* Settings */
-    memset(&s_flash[0x58000], 0xA5, 0x28000); /* Record log */
+    memset(&s_flash[KEEP1_BASE], 0x5A, KEEP1_SIZE);
+    memset(&s_flash[KEEP2_BASE], 0xA5, KEEP2_SIZE);
     s_fail_programs = 0;
     s_silent_bad = 0;
     memcpy(&s_flash[FW_SLOT_A_BASE], s_old, FW_SLOT_SIZE);
@@ -111,8 +144,8 @@ static bool slot_is(uint32_t base, const uint8_t *img) { return memcmp(&s_flash[
 
 static void check_untouched(void)
 {
-    for (uint32_t i = 0x1000; i < 0x2000; i++) assert(s_flash[i] == 0x5A);
-    for (uint32_t i = 0x58000; i < 0x80000; i++) assert(s_flash[i] == 0xA5);
+    for (uint32_t i = KEEP1_BASE; i < KEEP1_BASE + KEEP1_SIZE; i++) assert(s_flash[i] == 0x5A);
+    for (uint32_t i = KEEP2_BASE; i < KEEP2_BASE + KEEP2_SIZE; i++) assert(s_flash[i] == 0xA5);
 }
 
 /* What the application does on a good boot */
@@ -183,9 +216,9 @@ int main(void)
     /* Image check */
     reset_flash(true);
     assert(fw_image_valid(FW_SLOT_A_BASE) && fw_image_valid(FW_SLOT_B_BASE));
-    s_flash[FW_SLOT_B_BASE + 90000] ^= 0x01;
+    s_flash[FW_SLOT_B_BASE + DAMAGE_OFFSET] ^= 0x01;
     assert(!fw_image_valid(FW_SLOT_B_BASE));
-    s_flash[FW_SLOT_B_BASE + 90000] ^= 0x01;
+    s_flash[FW_SLOT_B_BASE + DAMAGE_OFFSET] ^= 0x01;
     assert(fw_image_valid(FW_SLOT_B_BASE));
     memset(&s_flash[FW_SLOT_B_BASE], 0xFF, FW_SLOT_SIZE);
     assert(!fw_image_valid(FW_SLOT_B_BASE));

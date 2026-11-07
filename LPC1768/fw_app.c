@@ -1,4 +1,6 @@
 #include "fw_app.h"
+#include "fw_ctrl.h"
+#include "hal_power.h"
 #include "boot/fw_layout.h"
 #include "boot/fw_journal.h"
 #include "storage_log.h"
@@ -177,8 +179,100 @@ void fw_app_init(void)
     storage_log_debug("FW", line);
 }
 
+/* ---- The LPC845's side of an update ---- */
+#define CTRL_START_SEC      10  /* The LPC845's watchdog gives firmware on trial at least 3.5 minutes */
+#define CTRL_MIN_FRAMES     5
+#define CTRL_MAX_TRIES      12
+
+void fw_ctrl_tx(const char *frame)
+{
+    hal_power_send_frame(frame);
+}
+
+bool fw_ctrl_wait_reply(char kind, char *reply, size_t size, uint32_t timeout_ms)
+{
+    portTickType start = xTaskGetTickCount();
+    portTickType limit = timeout_ms / portTICK_RATE_MS;
+    /* Anything still sitting there answers an earlier command */
+    while ((xTaskGetTickCount() - start) < limit) {
+        if (intermcu_take_u_reply(reply, size) && reply[2] == kind) {
+            return true;
+        }
+        vTaskDelay(5 / portTICK_RATE_MS);
+    }
+    return false;
+}
+
+static const char *s_ctrl_last_result = NULL;
+static bool s_ctrl_state_known = false;
+
+const char *fw_app_ctrl_last_result(void)
+{
+    return s_ctrl_last_result;
+}
+
+static void ctrl_report(unsigned state, const char *version)
+{
+    const char *what;
+    bool failed = true;
+    switch (state) {
+    case FW_J_CONFIRMED:   what = "845 UPDATE OK"; failed = false; break;
+    case FW_J_ROLLED_BACK: what = "845 FAILED:OLD"; break;
+    case FW_J_RECOVERED:   what = "845 RESTORED"; break;
+    case FW_J_REJECTED:    what = "845 REJECTED"; break;
+    default:               return;
+    }
+    s_ctrl_last_result = what;
+
+    char line[64];
+    snprintf(line, sizeof(line), "%s, now running %s", what, version);
+    storage_log_debug(failed ? "ERROR" : "FW", line);
+    char history[80];
+    snprintf(history, sizeof(history), "Station %s: %s", flash_nvram_get_station_id(), line);
+    storage_append_stamped(FW_HISTORY_FILENAME, history);
+    fw_ctrl_tx("$UK;\n");
+}
+
+/* Once a second, never waiting: this task runs the slots. New LPC845 firmware counts as healthy once
+ * this end has heard good frames from it. An LPC845 with no bootloader never answers, which is fine. */
+static void ctrl_step(uint32_t uptime_sec, uint32_t good_frames)
+{
+    static uint8_t s_tries = 0;
+    static bool s_done = false;
+    char reply[40];
+    fw_ctrl_state_t state;
+
+    if (s_done || uptime_sec < CTRL_START_SEC || good_frames < CTRL_MIN_FRAMES || intermcu_get_845_system() < 0) {
+        return;
+    }
+    if (intermcu_take_u_reply(reply, sizeof(reply)) && fw_ctrl_parse_state(reply, &state)) {
+        if (!s_ctrl_state_known) {
+            char line[48];
+            s_ctrl_state_known = true;
+            snprintf(line, sizeof(line), "LPC845 running %s", state.version);
+            storage_log_debug("FW", line);
+        }
+        if (state.state == FW_J_TRIAL_BOOT) {
+            storage_log_debug("FW", "New LPC845 firmware confirmed healthy");
+            fw_ctrl_tx("$UC;\n");
+            return;
+        }
+        ctrl_report(state.state, state.version);
+        s_done = true;
+        return;
+    }
+    if (s_tries >= CTRL_MAX_TRIES) {
+        s_done = true;
+        return;
+    }
+    s_tries++;
+    fw_ctrl_tx("$UQ;\n");
+}
+
 void fw_app_step(uint32_t uptime_sec, uint32_t good_frames)
 {
+    ctrl_step(uptime_sec, good_frames);
+
     /* A few seconds in, so the clock has arrived and the history gets a real time */
     if (!s_outcome_done && (good_frames >= OUTCOME_MIN_FRAMES || uptime_sec >= OUTCOME_LATEST_SEC)) {
         s_outcome_done = true;

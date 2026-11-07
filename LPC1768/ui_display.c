@@ -7,6 +7,7 @@
 #include "telemetry_formatter.h"
 #include "flash_log.h"
 #include "fw_update.h"
+#include "fw_ctrl.h"
 #include "fw_app.h"
 #include "boot/fw_journal.h"
 #include "user_config.h"
@@ -620,8 +621,8 @@ static void gps_fetch_start(const telemetry_data_t *telemetry)
  * and pressed EN. Shares the SMS task slot, as nothing else should use the modem or card meanwhile. */
 #define FW_MIN_SECONDS_TO_SLOT 180
 
-typedef enum { FW_UI_MENU = 0, FW_UI_BUSY, FW_UI_CONFIRM_TYPE, FW_UI_CONFIRM_MAIN, FW_UI_CONFIRM_REVERT, FW_UI_MESSAGE } fw_ui_state_t;
-typedef enum { FW_OP_CHECK_MAIN = 0, FW_OP_CHECK_CTRL, FW_OP_CHECK_REVERT, FW_OP_CHECK_TYPE, FW_OP_INSTALL_MAIN, FW_OP_DO_REVERT } fw_task_op_t;
+typedef enum { FW_UI_MENU = 0, FW_UI_BUSY, FW_UI_CONFIRM_TYPE, FW_UI_CONFIRM_MAIN, FW_UI_CONFIRM_REVERT, FW_UI_CONFIRM_CTRL, FW_UI_MESSAGE } fw_ui_state_t;
+typedef enum { FW_OP_CHECK_MAIN = 0, FW_OP_CHECK_CTRL, FW_OP_CHECK_REVERT, FW_OP_CHECK_TYPE, FW_OP_INSTALL_MAIN, FW_OP_INSTALL_CTRL, FW_OP_DO_REVERT } fw_task_op_t;
 
 static const char *const s_fw_menu[] = { "MAIN F/W", "CTRL F/W", "REVERT F/W", "CHANGE TYPE" };
 
@@ -688,7 +689,6 @@ static void vFwUpdate_Task(void *pvParameters)
 {
     (void)pvParameters;
     char line[17];
-    uint32_t size;
 
     switch (s_fw_op) {
     case FW_OP_CHECK_MAIN: {
@@ -733,15 +733,45 @@ static void vFwUpdate_Task(void *pvParameters)
         }
         break;
     }
-    case FW_OP_CHECK_CTRL:
-        /* Sending it to the LPC845 needs that chip's bootloader, which is the next stage */
-        if (fw_file_open(FW_CTRL_FILENAME, &size)) {
-            fw_file_close();
-            fw_show(FW_UI_MESSAGE, "SENSOR.HEX FOUND", "NOT READY YET");
-        } else {
+    case FW_OP_CHECK_CTRL: {
+        fw_ctrl_state_t state;
+        fw_result_t r = fw_ctrl_check(FW_CTRL_FILENAME, &s_fw_info, fw_progress);
+        if (r == FW_E_NOT_FOUND) {
             fw_show(FW_UI_MESSAGE, "SENSOR.HEX", "NOT FOUND");
+        } else if (r != FW_OK) {
+            storage_log_debug("ERROR", fw_update_error_text(r));
+            fw_show(FW_UI_MESSAGE, "UPDATE REFUSED", fw_update_error_text(r));
+        } else if (!fw_ctrl_query(&state)) {
+            /* Firmware from before the bootloader: this needs MCU-Link */
+            fw_show(FW_UI_MESSAGE, "845 CAN'T UPDATE", "NO BOOTLOADER");
+        } else if (state.state == FW_J_TRIAL_BOOT) {
+            fw_show(FW_UI_MESSAGE, "845 ON TRIAL", "TRY AGAIN SOON");
+        } else if (s_fw_info.crc32 == state.crc32) {
+            snprintf(line, sizeof(line), "SAME F/W %.7s", s_fw_info.version);
+            fw_show(FW_UI_CONFIRM_CTRL, line, "EN=REDO BACK=NO");
+        } else {
+            snprintf(line, sizeof(line), "%.12s FOUND", s_fw_info.version);
+            fw_show(FW_UI_CONFIRM_CTRL, line, "EN=YES  BACK=NO");
         }
         break;
+    }
+    case FW_OP_INSTALL_CTRL: {
+        fw_result_t r = fw_ctrl_send_image(FW_CTRL_FILENAME, &s_fw_info, fw_progress);
+        if (r == FW_OK) {
+            fw_show(FW_UI_BUSY, "INSTALLING 845", "DO NOT POWER OFF");
+            strncpy(s_status_sms_substep, "DO NOT POWER OFF", sizeof(s_status_sms_substep) - 1);
+            storage_log_debug("FW", "New LPC845 firmware sent and checked, restarting it to install");
+            storage_log_flush();
+            fw_ctrl_restart_lpc845();
+            /* The LPC845 cuts this chip's power as it restarts. If that hasn't happened, restart
+             * anyway, so every case comes back the same way and checks how the update ended. */
+            vTaskDelay(3000 / portTICK_RATE_MS);
+            NVIC_SystemReset();
+        }
+        storage_log_debug("ERROR", fw_update_error_text(r));
+        fw_show(FW_UI_MESSAGE, "UPDATE STOPPED", fw_update_error_text(r));
+        break;
+    }
     case FW_OP_CHECK_REVERT:
         if (fw_update_slot_b_info(&s_fw_info)) {
             snprintf(line, sizeof(line), "BACK TO %.7s", s_fw_info.version);
@@ -817,7 +847,10 @@ static bool fw_safe_to_install(const telemetry_data_t *telemetry)
 static void fw_open(void)
 {
     s_fw_pos = 0;
-    const char *last = fw_app_last_result();
+    const char *last = fw_app_ctrl_last_result();
+    if (!last) {
+        last = fw_app_last_result();
+    }
     if (last) {
         fw_show(FW_UI_MESSAGE, "LAST UPDATE:", last);
     } else {
@@ -868,11 +901,17 @@ static void fw_key(key_code_t key, const telemetry_data_t *telemetry)
         }
         break;
     case FW_UI_CONFIRM_MAIN:
+    case FW_UI_CONFIRM_CTRL:
     case FW_UI_CONFIRM_REVERT:
         if (key == KEY_EN) {
             if (fw_safe_to_install(telemetry)) {
-                bool main_fw = (s_fw_ui == FW_UI_CONFIRM_MAIN);
-                fw_start_task(main_fw ? FW_OP_INSTALL_MAIN : FW_OP_DO_REVERT, main_fw ? "ERASING 0%" : "RESTARTING...");
+                if (s_fw_ui == FW_UI_CONFIRM_MAIN) {
+                    fw_start_task(FW_OP_INSTALL_MAIN, "ERASING 0%");
+                } else if (s_fw_ui == FW_UI_CONFIRM_CTRL) {
+                    fw_start_task(FW_OP_INSTALL_CTRL, "ERASING 0%");
+                } else {
+                    fw_start_task(FW_OP_DO_REVERT, "RESTARTING...");
+                }
             }
         } else if (key == KEY_BACK) {
             s_fw_ui = FW_UI_MENU;

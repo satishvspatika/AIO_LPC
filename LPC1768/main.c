@@ -855,12 +855,66 @@ static void rain_total_restore_step(const telemetry_data_t *telem)
     hal_power_rain_restore(tips);
 }
 
+/* Is the LPC845 sending good status frames right now? It sends one a second. */
+#define LINK_CHECK_SEC 5
+static bool lpc845_link_alive(void)
+{
+    uint32_t bytes, frames, good_before, good_after;
+    intermcu_get_link_stats(&bytes, &frames, &good_before, NULL, 0);
+    vTaskDelay((LINK_CHECK_SEC * 1000) / portTICK_RATE_MS);
+    intermcu_get_link_stats(&bytes, &frames, &good_after, NULL, 0);
+    return good_after != good_before;
+}
+
+#if (UNIT_CFG != KSNDMC_TWS)
+/* CUM_RF never drops within a rain day, whatever went wrong elsewhere. Normally the LPC845's total
+ * is the last record's plus this slot's rain, so this does nothing. */
+static void __attribute__((noinline)) keep_cum_from_dipping(telemetry_data_t *telem)
+{
+    unsigned long tips = 0;
+    char ts[16], stored_close[12], current_close[12];
+    const flash_log_page_t *rec = flash_log_newest_record();
+    if (!rec || !parse_record_total(rec->record, ts, sizeof(ts), &tips) ||
+        !intermcu_rain_close_date(ts, stored_close, sizeof(stored_close)) ||
+        !intermcu_rain_close_date(telem->present_time, current_close, sizeof(current_close)) ||
+        strcmp(stored_close, current_close) != 0) {
+        return; /* Nothing yet this rain day: a new day starts from zero */
+    }
+    float floor_mm = (float)tips * RF_BUCKET_RESOLUTION;
+    /* This slot's rain counts on top, unless the newest record already is this slot */
+    if (strncmp(ts, telem->slot_time, 12) != 0) {
+        floor_mm += telem->rf_15m_mm;
+    }
+    if (telem->rf_cum_mm < floor_mm - 0.01f) {
+        char have[8], keep[8];
+        fmt_fixed(have, sizeof(have), telem->rf_cum_mm, 5, 2);
+        fmt_fixed(keep, sizeof(keep), floor_mm, 5, 2);
+        snprintf(s_slot_line, sizeof(s_slot_line), "CUM_RF would have dropped to %s mm, keeping %s mm", have, keep);
+        storage_log_debug("ERROR", s_slot_line);
+        telem->rf_cum_mm = floor_mm;
+    }
+}
+#endif
+
 /* Runs one slot from start to finish. The UI cannot power down while this is running. */
 static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
 {
     ui_set_slot_busy(true);
 
     s_last_slot_id = slot_id;
+
+    /* With the LPC845 silent (hung, or on a failed firmware trial) there's no rain, battery or
+     * total to report, and a record of zeros would pull CUM_RF down. So nothing is sent or stored.
+     * This slot stays unmarked, so the first good slot afterwards fills it in the usual way. */
+    if (!lpc845_link_alive()) {
+        snprintf(s_slot_line, sizeof(s_slot_line), "No status frames from LPC845: no record for slot %ld", (long)slot_id);
+        storage_log_debug("ERROR", s_slot_line);
+        ui_set_slot_busy(false);
+        if (!ui_is_display_active() && !ui_is_operator_touched()) {
+            ui_enter_sleep();
+        }
+        return;
+    }
 
     /* Queue anything missed in the wait below, so it can't delay this slot's record */
     portTickType fill_start = xTaskGetTickCount();
@@ -880,6 +934,9 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     }
     /* Re-read fresh telemetry */
     intermcu_get_telemetry(telem);
+#if (UNIT_CFG != KSNDMC_TWS)
+    keep_cum_from_dipping(telem);
+#endif
 
     const char *boot_mode = ui_was_scheduled_boot() ? "SCHEDULED" : "OPERATOR";
     char s_bat[8], s_rf15[8], s_rfday[8];

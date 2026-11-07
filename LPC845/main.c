@@ -4,6 +4,7 @@
 #include "pin_mux.h"
 #include "clock_config.h"
 #include "stdio.h"
+#include <string.h>
 #include "globals.h"
 #include "fsl_usart.h"
 #include "fsl_common.h"
@@ -17,6 +18,8 @@
 #include <stdbool.h>
 #include "LPC845.h"
 #include "fsl_sctimer.h"
+#include "fw845_app.h"
+#include "fw845_recv.h"
 
 
 uint32_t deviceAddress = 0x01U;
@@ -377,6 +380,23 @@ void decode_command(void)
 			time_since_reset_interval = 0;
 			break;
 
+		case 'U':{									//New firmware arriving from the LPC1768's SD card
+			char reply[64];
+			bool restart_now = false;
+			time_since_reset_interval = 0;
+			fw845_recv_command(gc_recv_buf, reply, sizeof(reply), &restart_now);
+			wait_tx_idle();
+			strcpy(gc_xmit_buf, reply);
+			xmit_ptr = gc_xmit_buf;
+			pAck_xmit = 1;
+			LPC845_UART0->INTENSET = kUSART_TxReady;
+			if(restart_now){
+				wait_tx_idle();
+				NVIC_SystemReset();	//The bootloader installs it
+			}
+			break;
+		}
+
 		case 'n':									//User active
 			if((chr2 & 4) || (chr2 == '4')){
 				GPIO_PortClear(GPIO, LPC845_PORT, 1u << LCD_PWR_STDN); //turn on 5V
@@ -420,7 +440,9 @@ void decode_command(void)
 void USART0_IRQHandler(void)
 {
 	char c;
-	if(LPC845_UART0->INTENSET & kUSART_TxReady){
+	//A received byte runs this too, so check the transmitter has room: writing while it's full
+	//overwrites a byte still waiting to go out
+	if((LPC845_UART0->INTENSET & kUSART_TxReady) && (LPC845_UART0->STAT & kUSART_TxReady)){
 		if(*xmit_ptr != '\0'){
 			LPC845_UART0->TXDAT = *xmit_ptr;
 			xmit_ptr++;
@@ -1990,6 +2012,8 @@ int main(void)
 	Get_Time();
 	last_rec_min = Present_Date_Time.minute;
 
+	fw845_app_init();
+
 
 	for(i=0;i<2000;i++)
 		for(j=0;j<2000;j++);
@@ -1997,6 +2021,8 @@ int main(void)
 
 	while (1)
 	{
+
+		fw845_app_feed_watchdog();
 
 		//Only a wake-up key while the LPC1768 is powered down. While it is running, COL2 also
 		//goes low on its normal keypad scan, which must not switch the rails.

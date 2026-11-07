@@ -1,7 +1,7 @@
 /* What to do at power-up. Everything here is safe to cut at any instant: each step can be repeated,
  * and a step counts as done only once the journal says so.
  *
- * A swap moves one 32 KB sector at a time through the scratch sector:
+ * A swap moves one sector at a time through the scratch sector:
  *   step 0: scratch <- A[i]     (A and B both intact)
  *   step 1: A[i]    <- B[i]     (the old A[i] is safe in scratch, B[i] intact)
  *   step 2: B[i]    <- scratch  (the new A[i] is in place, scratch intact)
@@ -11,7 +11,7 @@
 #include "fw_journal.h"
 
 #define SWAP_STEPS   (FW_SLOT_SECTORS * 3UL)
-#define COPY_CHUNK   4096UL
+#define COPY_CHUNK   FW_COPY_CHUNK
 #define COPY_TRIES   3
 
 static uint32_t s_crc_table[256];
@@ -52,7 +52,7 @@ bool fw_image_valid(uint32_t slot_base)
     uint32_t sp = read_u32(image);
     uint32_t reset = read_u32(image + 4);
     uint32_t info_addr = read_u32(image + FW_VECTOR_IMAGE_INFO * 4);
-    if (sp < 0x10000000UL || sp > 0x10008000UL ||
+    if (sp < 0x10000000UL || sp > FW_RAM_TOP ||
         reset < FW_SLOT_A_BASE || reset >= (FW_SLOT_A_BASE + FW_SLOT_SIZE) ||
         info_addr < FW_SLOT_A_BASE || info_addr > (FW_SLOT_A_BASE + FW_SLOT_SIZE - sizeof(fw_image_info_t))) {
         return false;

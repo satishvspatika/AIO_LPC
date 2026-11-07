@@ -21,7 +21,8 @@ typedef enum {
     FW_E_WRONG_PROFILE, /* For another station type */
     FW_E_BAD_CRC,
     FW_E_FLASH,         /* Staging could not be written or read back */
-    FW_E_JOURNAL
+    FW_E_JOURNAL,
+    FW_E_LINK           /* The LPC845 stopped answering */
 } fw_result_t;
 
 typedef struct {
@@ -44,6 +45,13 @@ fw_result_t fw_update_stage(const char *name, const fw_file_info_t *checked, fw_
 bool fw_update_slot_b_info(fw_file_info_t *info);
 
 const char *fw_update_error_text(fw_result_t r);
+
+/* The same checks for sensor.hex, which is for the LPC845's flash map instead */
+fw_result_t fw_ctrl_check(const char *name, fw_file_info_t *info, fw_progress_fn progress);
+
+/* Reads the file again, handing the image over in order, in pieces of chunk_bytes (at most 256) */
+typedef bool (*fw_chunk_fn)(uint32_t offset, const uint8_t *data, uint32_t len);
+fw_result_t fw_ctrl_stream(const char *name, const fw_file_info_t *checked, fw_chunk_fn sink, uint32_t chunk_bytes, fw_progress_fn progress);
 
 /* File access, supplied by the application or the tests. Read returns bytes read, or -1. */
 bool fw_file_open(const char *name, uint32_t *out_size);

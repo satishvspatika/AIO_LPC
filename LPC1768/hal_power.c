@@ -103,6 +103,11 @@ void hal_power_rain_restore(unsigned long tips)
     send_intermcu_cmd(cmd);
 }
 
+void hal_power_send_frame(const char *frame)
+{
+    send_intermcu_cmd(frame);
+}
+
 void hal_power_heartbeat(void)
 {
     send_intermcu_cmd("$H;\012");

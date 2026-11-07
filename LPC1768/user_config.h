@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.8.9"
+#define FIRMWARE_VERSION    "v6.9.0"
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
 #define ENABLE_TEST_SEND    1

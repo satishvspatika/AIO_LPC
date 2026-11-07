@@ -8,6 +8,17 @@
 #define INFO_SIZE       sizeof(fw_image_info_t)
 #define INFO_CRC_OFFSET 12
 
+/* Which chip's flash map a file is judged against */
+typedef struct {
+    uint32_t base;
+    uint32_t size;
+    uint32_t board;
+    uint32_t ram_top;
+} fw_target_t;
+static const fw_target_t s_target_main = { FW_SLOT_A_BASE, FW_SLOT_SIZE, FW_BOARD_ID, FW_RAM_TOP };
+static const fw_target_t s_target_ctrl = { FW845_SLOT_A_BASE, FW845_SLOT_SIZE, FW845_BOARD_ID, FW845_RAM_TOP };
+static const fw_target_t *s_target = &s_target_main;
+
 /* ---- CRC-32 (same as zlib), a bit at a time: small, and fast enough for this ---- */
 static uint32_t crc_byte(uint32_t crc, uint8_t b)
 {
@@ -29,6 +40,8 @@ typedef struct {
     uint32_t page_fill;
     bool writing;
     bool flash_failed;
+    fw_chunk_fn sink;       /* Hands the image over, instead of writing it here */
+    uint32_t chunk_bytes;
 } image_state_t;
 
 static uint32_t get_u32(const uint8_t *p)
@@ -59,7 +72,7 @@ static void image_byte(image_state_t *s, uint8_t b)
     if (off < sizeof(s->head)) {
         s->head[off] = b;
         if (off == sizeof(s->head) - 1) {
-            s->info_offset = get_u32(&s->head[FW_VECTOR_IMAGE_INFO * 4]) - FW_SLOT_A_BASE;
+            s->info_offset = get_u32(&s->head[FW_VECTOR_IMAGE_INFO * 4]) - s_target->base;
         }
     }
 
@@ -77,6 +90,15 @@ static void image_byte(image_state_t *s, uint8_t b)
         s->page[s->page_fill++] = b;
         if (s->page_fill == sizeof(s->page)) {
             if (!flush_page(s)) {
+                s->flash_failed = true;
+            }
+        }
+    }
+    if (s->sink) {
+        s->page[s->page_fill++] = b;
+        if (s->page_fill == s->chunk_bytes) {
+            s->page_fill = 0;
+            if (!s->sink(off + 1 - s->chunk_bytes, s->page, s->chunk_bytes)) {
                 s->flash_failed = true;
             }
         }
@@ -128,16 +150,19 @@ static fw_result_t hex_line(hex_state_t *h, image_state_t *s, const char *line, 
     switch (rec[3]) {
     case 0: {
         uint32_t addr = h->base + (((uint32_t)rec[1] << 8) | rec[2]);
-        if (addr < FW_SLOT_A_BASE || (addr + rec[0]) > (FW_SLOT_A_BASE + FW_SLOT_SIZE)) {
+        if (addr < s_target->base || (addr + rec[0]) > (s_target->base + s_target->size)) {
             return FW_E_BAD_ADDRESS;
         }
-        if ((addr - FW_SLOT_A_BASE) != s->next_offset) {
+        if ((addr - s_target->base) != s->next_offset) {
             return FW_E_GAP;
         }
         for (uint32_t i = 0; i < rec[0]; i++) {
             image_byte(s, rec[4 + i]);
+            if (s->flash_failed) {
+                return s->sink ? FW_E_LINK : FW_E_FLASH;
+            }
         }
-        return s->flash_failed ? FW_E_FLASH : FW_OK;
+        return FW_OK;
     }
     case 1:
         h->ended = true;
@@ -221,15 +246,15 @@ static fw_result_t judge_image(const image_state_t *s, uint32_t expected_profile
 {
     uint32_t sp = get_u32(&s->head[0]);
     uint32_t reset = get_u32(&s->head[4]);
-    if (s->next_offset < sizeof(s->head) || sp < 0x10000000UL || sp > 0x10008000UL ||
-        reset < FW_SLOT_A_BASE || reset >= (FW_SLOT_A_BASE + FW_SLOT_SIZE) ||
+    if (s->next_offset < sizeof(s->head) || sp < 0x10000000UL || sp > s_target->ram_top ||
+        reset < s_target->base || reset >= (s_target->base + s_target->size) ||
         s->info_offset < sizeof(s->head) || (s->info_offset + INFO_SIZE) > s->next_offset) {
         return FW_E_NOT_AN_IMAGE;
     }
     if (get_u32(&s->info[0]) != FW_IMAGE_MAGIC) {
         return FW_E_NOT_AN_IMAGE;
     }
-    if (get_u32(&s->info[4]) != FW_BOARD_ID) {
+    if (get_u32(&s->info[4]) != s_target->board) {
         return FW_E_WRONG_BOARD;
     }
     uint32_t length = get_u32(&s->info[8]);
@@ -253,12 +278,49 @@ fw_result_t fw_update_check(const char *name, uint32_t expected_profile, fw_file
     image_state_t s;
     memset(&s, 0, sizeof(s));
     s.crc = 0xFFFFFFFFUL;
+    s_target = &s_target_main;
 
     fw_result_t r = read_file(name, &s, "CHECKING", progress);
     if (r != FW_OK) {
         return r;
     }
     return judge_image(&s, expected_profile, true, info);
+}
+
+fw_result_t fw_ctrl_check(const char *name, fw_file_info_t *info, fw_progress_fn progress)
+{
+    image_state_t s;
+    memset(&s, 0, sizeof(s));
+    s.crc = 0xFFFFFFFFUL;
+    s_target = &s_target_ctrl;
+
+    fw_result_t r = read_file(name, &s, "CHECKING", progress);
+    return (r != FW_OK) ? r : judge_image(&s, 0, false, info);
+}
+
+fw_result_t fw_ctrl_stream(const char *name, const fw_file_info_t *checked, fw_chunk_fn sink, uint32_t chunk_bytes, fw_progress_fn progress)
+{
+    image_state_t s;
+    memset(&s, 0, sizeof(s));
+    s.crc = 0xFFFFFFFFUL;
+    s.sink = sink;
+    s.chunk_bytes = chunk_bytes;
+    s_target = &s_target_ctrl;
+
+    fw_result_t r = read_file(name, &s, "SENDING", progress);
+    if (r != FW_OK) {
+        return r;
+    }
+    if (s.page_fill > 0 && !sink(s.next_offset - s.page_fill, s.page, s.page_fill)) {
+        return FW_E_LINK;
+    }
+    /* The file could have changed since the check */
+    fw_file_info_t sent;
+    r = judge_image(&s, 0, false, &sent);
+    if (r != FW_OK) {
+        return r;
+    }
+    return (sent.crc32 == checked->crc32 && sent.length == checked->length) ? FW_OK : FW_E_BAD_CRC;
 }
 
 /* Reads an image back from a slot, the way the bootloader will */
@@ -271,7 +333,7 @@ static bool slot_info(uint32_t base, fw_file_info_t *out)
     uint32_t sp = get_u32(&s.head[0]);
     uint32_t reset = get_u32(&s.head[4]);
     uint32_t info_addr = get_u32(&s.head[FW_VECTOR_IMAGE_INFO * 4]);
-    if (sp < 0x10000000UL || sp > 0x10008000UL || reset < FW_SLOT_A_BASE || reset >= (FW_SLOT_A_BASE + FW_SLOT_SIZE) ||
+    if (sp < 0x10000000UL || sp > FW_RAM_TOP || reset < FW_SLOT_A_BASE || reset >= (FW_SLOT_A_BASE + FW_SLOT_SIZE) ||
         info_addr < (FW_SLOT_A_BASE + sizeof(s.head)) || info_addr > (FW_SLOT_A_BASE + FW_SLOT_SIZE - INFO_SIZE)) {
         return false;
     }
@@ -323,6 +385,7 @@ fw_result_t fw_update_stage(const char *name, const fw_file_info_t *checked, fw_
     memset(&s, 0, sizeof(s));
     s.crc = 0xFFFFFFFFUL;
     s.writing = true;
+    s_target = &s_target_main;
 
     fw_result_t r = read_file(name, &s, "COPYING", progress);
     if (r != FW_OK) {
@@ -369,6 +432,7 @@ const char *fw_update_error_text(fw_result_t r)
     case FW_E_BAD_CRC:       return "FILE DAMAGED";
     case FW_E_FLASH:         return "FLASH ERROR";
     case FW_E_JOURNAL:       return "FLASH ERROR";
+    case FW_E_LINK:          return "845 NO ANSWER";
     default:                 return "OK";
     }
 }

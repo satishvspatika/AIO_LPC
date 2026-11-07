@@ -14,6 +14,10 @@ static bool s_in_frame = false;
 
 static telemetry_data_t s_latest_telemetry = {0};
 
+/* The newest reply to a firmware update command */
+static char s_u_reply[40];
+static volatile bool s_u_reply_ready = false;
+
 /* Hardware Interrupt Handler for Inter-MCU UART3 (P4.28/P4.29) */
 void UART3_IRQHandler(void)
 {
@@ -97,7 +101,7 @@ uint32_t intermcu_get_bad_frames(void)
 {
     return s_link_bad;
 }
-static char s_link_last_frame[72];
+static char s_link_last_frame[48];
 
 void intermcu_get_link_stats(uint32_t *out_bytes, uint32_t *out_frames, uint32_t *out_good, char *out_last, size_t size)
 {
@@ -582,7 +586,11 @@ void intermcu_process_byte(uint8_t byte)
                 s_in_frame = false;
                 s_link_frames++;
                 strncpy(s_link_last_frame, s_rx_buffer, sizeof(s_link_last_frame) - 1);
-                if (s_rx_buffer[1] == 'G') {
+                if (s_rx_buffer[1] == 'U') {
+                    strncpy(s_u_reply, s_rx_buffer, sizeof(s_u_reply) - 1);
+                    s_u_reply[sizeof(s_u_reply) - 1] = '\0';
+                    s_u_reply_ready = true;
+                } else if (s_rx_buffer[1] == 'G') {
                     parse_g_packet(s_rx_buffer);
                 } else if (s_rx_buffer[1] == 'C') {
                     parse_c_packet(s_rx_buffer);
@@ -596,6 +604,19 @@ void intermcu_process_byte(uint8_t byte)
             s_rx_idx = 0;
         }
     }
+}
+
+bool intermcu_take_u_reply(char *out, size_t size)
+{
+    if (!s_u_reply_ready) {
+        return false;
+    }
+    NVIC_DisableIRQ(UART3_IRQn);
+    strncpy(out, s_u_reply, size - 1);
+    out[size - 1] = '\0';
+    s_u_reply_ready = false;
+    NVIC_EnableIRQ(UART3_IRQn);
+    return true;
 }
 
 bool intermcu_get_telemetry(telemetry_data_t *out_data)

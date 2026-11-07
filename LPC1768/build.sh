@@ -62,6 +62,7 @@ ${CC} ${CFLAGS} "${LPC_DIR}/flash_nvram.c" -o "${OUT_DIR}/flash_nvram.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/flash_log.c" -o "${OUT_DIR}/flash_log.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_app.c" -o "${OUT_DIR}/fw_app.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_update.c" -o "${OUT_DIR}/fw_update.o"
+${CC} ${CFLAGS} "${LPC_DIR}/fw_ctrl.c" -o "${OUT_DIR}/fw_ctrl.o"
 mkdir -p "${OUT_DIR}/boot"
 ${CC} ${CFLAGS} "${LPC_DIR}/boot/fw_journal.c" -o "${OUT_DIR}/boot/fw_journal.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/cr_startup_lpc17.c" -o "${OUT_DIR}/cr_startup_lpc17.o"
@@ -116,6 +117,7 @@ ${CC} \
   "${OUT_DIR}/flash_log.o" \
   "${OUT_DIR}/fw_app.o" \
   "${OUT_DIR}/fw_update.o" \
+  "${OUT_DIR}/fw_ctrl.o" \
   "${OUT_DIR}/boot/fw_journal.o" \
   "${OUT_DIR}/flash_nvram.o" \
   "${OUT_DIR}/fat_sd/diskio.o" \

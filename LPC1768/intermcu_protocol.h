@@ -33,6 +33,9 @@ typedef struct {
 
 void intermcu_protocol_init(void);
 void intermcu_process_byte(uint8_t byte);
+
+/* The LPC845's newest reply to a firmware update command, if one has come since the last call */
+bool intermcu_take_u_reply(char *out, size_t size);
 bool intermcu_get_telemetry(telemetry_data_t *out_data);
 uint32_t intermcu_get_fat_time(void);
 uint32_t intermcu_get_bad_frames(void);
