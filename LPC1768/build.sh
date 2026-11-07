@@ -63,9 +63,19 @@ ${CC} ${CFLAGS} "${LPC_DIR}/flash_log.c" -o "${OUT_DIR}/flash_log.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_app.c" -o "${OUT_DIR}/fw_app.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_update.c" -o "${OUT_DIR}/fw_update.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_ctrl.c" -o "${OUT_DIR}/fw_ctrl.o"
+${CC} ${CFLAGS} "${LPC_DIR}/errlog.c" -o "${OUT_DIR}/errlog.o"
 mkdir -p "${OUT_DIR}/boot"
 ${CC} ${CFLAGS} "${LPC_DIR}/boot/fw_journal.c" -o "${OUT_DIR}/boot/fw_journal.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/cr_startup_lpc17.c" -o "${OUT_DIR}/cr_startup_lpc17.o"
+
+# The kernel is built here so FreeRTOSConfig.h takes effect: the prebuilt library ignored its stack
+# overflow setting. -O1 is what that library used.
+RTOS_DIR="${PROJECT_ROOT}/FreeRTOS_Library"
+RTOS_FLAGS="-c -mcpu=cortex-m3 -mthumb -O1 -g -fcommon -I${RTOS_DIR}/include -I${RTOS_DIR}/portable -I${RTOS_DIR}/demo_code -I${PROJECT_ROOT}/CMSISv1p30_LPC17xx/inc"
+mkdir -p "${OUT_DIR}/rtos"
+for src in tasks list queue portable/port portable/heap_2; do
+    ${CC} ${RTOS_FLAGS} "${RTOS_DIR}/${src}.c" -o "${OUT_DIR}/rtos/$(basename ${src}).o"
+done
 
 # Compile FatFs drivers
 mkdir -p "${OUT_DIR}/fat_sd/option"
@@ -107,6 +117,11 @@ ${CC} \
   -T "${LPC_DIR}/Debug/example01_gnu.ld" \
   -o "${OUT_DIR}/LPC1768_AIO.axf" \
   "${OUT_DIR}/cr_startup_lpc17.o" \
+  "${OUT_DIR}/rtos/tasks.o" \
+  "${OUT_DIR}/rtos/list.o" \
+  "${OUT_DIR}/rtos/queue.o" \
+  "${OUT_DIR}/rtos/port.o" \
+  "${OUT_DIR}/rtos/heap_2.o" \
   "${OUT_DIR}/main.o" \
   "${OUT_DIR}/hal_power.o" \
   "${OUT_DIR}/intermcu_protocol.o" \
@@ -118,6 +133,7 @@ ${CC} \
   "${OUT_DIR}/fw_app.o" \
   "${OUT_DIR}/fw_update.o" \
   "${OUT_DIR}/fw_ctrl.o" \
+  "${OUT_DIR}/errlog.o" \
   "${OUT_DIR}/boot/fw_journal.o" \
   "${OUT_DIR}/flash_nvram.o" \
   "${OUT_DIR}/fat_sd/diskio.o" \

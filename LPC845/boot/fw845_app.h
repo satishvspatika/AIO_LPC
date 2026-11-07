@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-#define FW845_VERSION "845-v1.0"
+#define FW845_VERSION "845-v1.3"
 
 void fw845_app_init(void);
 

@@ -1,4 +1,5 @@
 #include "hal_power.h"
+#include "fw_app.h"
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
 #include <string.h>
@@ -110,6 +111,7 @@ void hal_power_send_frame(const char *frame)
 
 void hal_power_heartbeat(void)
 {
+    wd_checkin();
     send_intermcu_cmd("$H;\012");
 }
 

@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.9.6"
+#define FIRMWARE_VERSION    "v6.9.10"
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
 #define ENABLE_TEST_SEND    0
@@ -50,6 +50,9 @@
 #define SLOT_LOG_FILENAME       "SLOTS.CSV"
 #define LAST_LOGGED_FILENAME    "LASTLOG.DAT"
 #define REJECTED_FILENAME       "REJECTED.TXT"
+#define ERRORS_FILENAME         "ERRORS.TXT"    /* Copy of the flash error log, at most 64 KB */
+#define ERRORS_OLD_FILENAME     "ERRORS.OLD"    /* The previous 64 KB */
+#define ERRORS_SYNC_FILENAME    "ERRSYNC.DAT"
 #define RAT_MODE_FILENAME       "RATMODE.DAT"
 #define LAST_SLOT_FILENAME      "LASTSLOT.DAT"
 #define FLASH_SYNC_FILENAME     "FLASHSYN.DAT"

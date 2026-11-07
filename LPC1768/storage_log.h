@@ -26,6 +26,10 @@ void storage_state_delete(const char *name);
 /* Adds one timestamped line to a file on the card */
 void storage_append_stamped(const char *name, const char *text);
 
+/* One flash error log entry to ERRORS.TXT. At 64 KB the file becomes ERRORS.OLD, replacing the
+ * previous one, so the two together never pass 128 KB. False if there's no usable card. */
+bool storage_errors_append(const char *text, unsigned repeats);
+
 /* Small state files. Saves overwrite in place, so keep each file's text a fixed length. */
 bool storage_state_load(const char *filename, char *out, size_t size);
 bool storage_state_save(const char *filename, const char *text);

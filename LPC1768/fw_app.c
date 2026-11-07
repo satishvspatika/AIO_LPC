@@ -9,6 +9,7 @@
 #include "intermcu_protocol.h"
 #include "user_config.h"
 #include "LPC17xx.h"
+#include "errlog.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <stdio.h>
@@ -294,13 +295,59 @@ void fw_app_step(uint32_t uptime_sec, uint32_t good_frames)
     }
 }
 
+#define WD_RUN_TICKS 60000000UL  /* 60 s: the watchdog runs from the 4 MHz IRC, divided by 4 */
+
+static const char *const s_wd_names[WD_COUNT] = { "Main", "Ui", "Modem" };
+static const uint16_t s_wd_limit_sec[WD_COUNT] = { 360, 60, 180 };
+static xTaskHandle s_wd_tasks[WD_COUNT];
+static volatile portTickType s_wd_seen[WD_COUNT];
+static bool s_wd_running = false;
+
+void wd_register(wd_task_t id, void *task_handle)
+{
+    s_wd_seen[id] = xTaskGetTickCount();
+    s_wd_tasks[id] = (xTaskHandle)task_handle;
+}
+
+void wd_checkin(void)
+{
+    xTaskHandle me = xTaskGetCurrentTaskHandle();
+    for (int i = 0; i < WD_COUNT; i++) {
+        if (s_wd_tasks[i] == me) {
+            s_wd_seen[i] = xTaskGetTickCount();
+        }
+    }
+}
+
 void fw_app_watchdog_step(void)
 {
-    /* It can't be turned off once started, so a confirmed image keeps it fed until the next reset */
-    if (s_confirmed && (LPC_WDT->WDMOD & 1)) {
-        taskENTER_CRITICAL();
-        LPC_WDT->WDFEED = 0xAA;
-        LPC_WDT->WDFEED = 0x55;
-        taskEXIT_CRITICAL();
+    /* New firmware on trial: the bootloader's watchdog, left unfed, restarts it if it hangs */
+    if (s_on_trial && !s_confirmed) {
+        return;
     }
+
+    portTickType now = xTaskGetTickCount();
+    for (int i = 0; i < WD_COUNT; i++) {
+        if (s_wd_tasks[i] && (now - s_wd_seen[i]) > (portTickType)s_wd_limit_sec[i] * configTICK_RATE_HZ) {
+            char msg[48];
+            snprintf(msg, sizeof(msg), "Task %s stopped responding: restarting", s_wd_names[i]);
+            storage_log_debug("ERROR", msg);
+            errlog_step();  /* In flash before the restart */
+            LPC_RTC->GPREG1 = (uint32_t)i;
+            LPC_RTC->GPREG0 = STUCK_MAGIC;
+            NVIC_SystemReset();
+        }
+    }
+
+    /* Can't be turned off once started. The disk task feeds it, so it also catches that task stopping. */
+    taskENTER_CRITICAL();
+    if (!s_wd_running) {
+        LPC_WDT->WDCLKSEL = 0;
+        LPC_WDT->WDTC = WD_RUN_TICKS;
+        LPC_WDT->WDMOD = 3; /* Enable, reset on timeout */
+        s_wd_running = true;
+    }
+    LPC_WDT->WDFEED = 0xAA;
+    LPC_WDT->WDFEED = 0x55;
+    taskEXIT_CRITICAL();
 }

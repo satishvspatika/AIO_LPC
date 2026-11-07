@@ -3,7 +3,7 @@
 addresses, a missing or misplaced end record, or data over the settings, staging or log areas."""
 import sys
 
-FORBIDDEN = [(0x01000, 0x02000, "settings"), (0x38000, 0x80000, "staging and record log")]
+FORBIDDEN = [(0x01000, 0x02000, "settings"), (0x09000, 0x0C000, "error log"), (0x38000, 0x80000, "staging and record log")]
 REQUIRED = [(0x00000, "boot stub"), (0x02000, "bootloader"), (0x0C000, "journal"), (0x18000, "firmware")]
 FORBIDDEN_845 = [(0x01000, 0x02400, "journal and scratch"), (0x08400, 0x10000, "staging")]
 REQUIRED_845 = [(0x00000, "bootloader"), (0x02400, "firmware")]

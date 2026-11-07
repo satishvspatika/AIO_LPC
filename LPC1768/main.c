@@ -7,6 +7,7 @@
 #include "ui_display.h"
 #include "storage_log.h"
 #include "fw_app.h"
+#include "errlog.h"
 #include "flash_nvram.h"
 #include "flash_log.h"
 #include "user_config.h"
@@ -19,6 +20,7 @@
  * A fault must never leave the unit frozen: that would lose every later 15-minute slot. Save
  * where it happened in the RTC registers (they survive a reset), restart, and log it at boot. */
 #define CRASH_MAGIC 0xDEADC0DEUL
+#define STACK_CRASH_MAGIC 0xDEADC0D5UL
 
 __attribute__((used)) void hard_fault_capture(const uint32_t *frame)
 {
@@ -37,6 +39,21 @@ __attribute__((used)) void hard_fault_capture(const uint32_t *frame)
     NVIC_SystemReset();
 }
 
+/* The kernel calls this when a task has overrun its stack. Memory next to it may be damaged, so this
+ * does nothing but note which task and restart. */
+void vApplicationStackOverflowHook(xTaskHandle *pxTask, signed char *pcTaskName)
+{
+    (void)pxTask;
+    __disable_irq();
+    uint32_t name = 0;
+    for (int i = 0; i < 4 && pcTaskName[i] != 0; i++) {
+        name |= (uint32_t)(uint8_t)pcTaskName[i] << (i * 8);
+    }
+    LPC_RTC->GPREG1 = name;
+    LPC_RTC->GPREG0 = STACK_CRASH_MAGIC;
+    NVIC_SystemReset();
+}
+
 /* Replaces the endless loop in the startup file */
 __attribute__((naked)) void HardFault_Handler(void)
 {
@@ -49,12 +66,32 @@ __attribute__((naked)) void HardFault_Handler(void)
     );
 }
 
+static uint32_t s_reset_reason; /* Set first thing in main() */
+
 static void log_previous_crash(void)
 {
+    /* The hardware watchdog leaves no note of its own: the reset reason is all there is */
+    if (s_reset_reason & 0x04) {
+        storage_log_debug("ERROR", "RESTARTED BY THE WATCHDOG: the disk task, which feeds it, had stopped");
+    }
     if (LPC_RTC->GPREG0 == CRASH_MAGIC) {
         char msg[80];
         snprintf(msg, sizeof(msg), "RESTARTED AFTER CRASH: pc=0x%08lX lr=0x%08lX cfsr=0x%08lX",
                  (unsigned long)LPC_RTC->GPREG1, (unsigned long)LPC_RTC->GPREG2, (unsigned long)LPC_RTC->GPREG3);
+        storage_log_debug("ERROR", msg);
+        LPC_RTC->GPREG0 = 0;
+    } else if (LPC_RTC->GPREG0 == STUCK_MAGIC) {
+        static const char *const names[] = { "Main", "Ui", "Modem" };
+        char msg[56];
+        uint32_t t = LPC_RTC->GPREG1;
+        snprintf(msg, sizeof(msg), "RESTARTED: task %s had stopped responding", (t < 3) ? names[t] : "?");
+        storage_log_debug("ERROR", msg);
+        LPC_RTC->GPREG0 = 0;
+    } else if (LPC_RTC->GPREG0 == STACK_CRASH_MAGIC) {
+        char msg[56];
+        uint32_t n = LPC_RTC->GPREG1;
+        snprintf(msg, sizeof(msg), "RESTARTED AFTER STACK OVERFLOW in task %c%c%c%c",
+                 (char)n, (char)(n >> 8), (char)(n >> 16), (char)(n >> 24));
         storage_log_debug("ERROR", msg);
         LPC_RTC->GPREG0 = 0;
     }
@@ -72,6 +109,7 @@ static void vDisk_Task(void *pvParameters)
         storage_log_drain_step();
         if (++tick >= 100) {
             tick = 0;
+            errlog_step();
             fw_app_watchdog_step();
         }
         vTaskDelayUntil(&xLastWakeTime, 10 / portTICK_RATE_MS);
@@ -85,6 +123,7 @@ static void vUi_Task(void *pvParameters)
     uint8_t sec_accum = 0;
 
     for (;;) {
+        wd_checkin();
         if (++sec_accum >= 20) {
             sec_accum = 0;
             intermcu_tick_second();
@@ -121,6 +160,8 @@ typedef enum {
     SLOT_LOST
 } slot_result_t;
 
+static xTaskHandle s_ui_task, s_modem_task, s_main_task, s_disk_task;
+static bool s_restart_loop = false; /* Restarted by a fault 3 times running */
 static volatile int32_t s_last_slot_id = -1;
 static volatile bool s_slot_armed = false;
 static volatile bool s_waiting_for_clock = false;
@@ -953,6 +994,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         snprintf(s_slot_line, sizeof(s_slot_line), "Slot boundary reached, holding %ds for sensors", wait_sec);
         storage_log_debug("SLOT", s_slot_line);
         for (int w = 0; w < wait_sec; w++) {
+            wd_checkin();
             vTaskDelay(1000 / portTICK_RATE_MS);
         }
     }
@@ -990,10 +1032,20 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         snprintf(s_slot_line, sizeof(s_slot_line), "Status frames this boot: %lu good, %lu damaged",
                  (unsigned long)link_good, (unsigned long)intermcu_get_bad_frames());
         storage_log_debug("LINK", s_slot_line);
+
+        /* Lowest free stack each task has reached since boot, in 4-byte words */
+        snprintf(s_slot_line, sizeof(s_slot_line), "Stack free: Ui %u Modem %u Main %u Disk %u, heap free %u",
+                 (unsigned int)uxTaskGetStackHighWaterMark(s_ui_task),
+                 (unsigned int)uxTaskGetStackHighWaterMark(s_modem_task),
+                 (unsigned int)uxTaskGetStackHighWaterMark(s_main_task),
+                 (unsigned int)uxTaskGetStackHighWaterMark(s_disk_task),
+                 (unsigned int)xPortGetFreeHeapSize());
+        storage_log_debug("STACK", s_slot_line);
     }
 
     /* Only now: a restart mid-slot refills this one rather than losing it */
     save_last_slot(slot_id);
+    LPC_RTC->GPREG4 = 0;    /* A slot finished: any run of fault restarts is over */
 
     ui_set_slot_busy(false);
 
@@ -1066,6 +1118,24 @@ static void vMain_Task(void *pvParameters)
 
     log_boot_header();
     fw_app_init();
+
+    if (s_restart_loop) {
+        /* Each in flash before the next, as only one waits at a time: the boot's own restart note first */
+        for (int w = 0; w < 50 && !errlog_idle(); w++) {
+            vTaskDelay(100 / portTICK_RATE_MS);
+        }
+        storage_log_debug("ERROR", "Restarted by a fault 3 times running: powering off until the next slot");
+        for (int w = 0; w < 50 && !errlog_idle(); w++) {
+            vTaskDelay(100 / portTICK_RATE_MS);
+        }
+        vTaskDelay(1000 / portTICK_RATE_MS);    /* And the SD log a moment to write */
+        sim7600_power_off();
+        hal_power_sleep_system();
+        for (;;) {
+            wd_checkin();   /* Until the LPC845 cuts the power */
+            vTaskDelay(1000 / portTICK_RATE_MS);
+        }
+    }
 
     uint32_t heartbeat_sec = 0;
     uint32_t link_log_sec = 0;
@@ -1155,6 +1225,7 @@ static void vModem_Task(void *pvParameters)
     storage_log_debug("MODEM", "Modem Supervisor Task Started");
 
     for (;;) {
+        wd_checkin();
         if (ui_is_boot_mode_known() && (ui_is_display_active() || s_waiting_for_clock)) {
             sim7600_worker_step();
         }
@@ -1168,11 +1239,19 @@ int main(void)
     s_reset_reason = LPC_SC->RSID;
     LPC_SC->RSID = 0x0F;
 
+    /* Faults restarting it again and again would hold the unit on and drain the battery. GPREG4
+     * counts them; a finished slot or a power-on clears it. */
+    uint32_t g0 = LPC_RTC->GPREG0;
+    bool by_fault = (s_reset_reason & 0x04) || g0 == CRASH_MAGIC || g0 == STACK_CRASH_MAGIC || g0 == STUCK_MAGIC;
+    LPC_RTC->GPREG4 = (by_fault && !(s_reset_reason & 0x01)) ? LPC_RTC->GPREG4 + 1 : 0;
+    s_restart_loop = LPC_RTC->GPREG4 >= 3;
+
     /* Fast settling delay */
     for (volatile int d = 0; d < 50000; d++);
 
     hal_power_init();
     flash_nvram_init();
+    errlog_init();
     ui_display_init();
     intermcu_protocol_init();
     storage_log_init();
@@ -1180,10 +1259,13 @@ int main(void)
 
     /* Create FreeRTOS Tasks */
     /* UiTask at Priority 3 guarantees instant keypad scan and screen responsiveness */
-    xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     512, NULL, 3, NULL);
-    xTaskCreate(vModem_Task,  (const signed char *)"ModemTask",  768, NULL, 2, NULL);
-    xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   960, NULL, 1, NULL);
-    xTaskCreate(vDisk_Task,   (const signed char *)"DiskTask",   512, NULL, 1, NULL);
+    xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     512, NULL, 3, &s_ui_task);
+    xTaskCreate(vModem_Task,  (const signed char *)"ModemTask",  512, NULL, 2, &s_modem_task);
+    xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   1088, NULL, 1, &s_main_task);
+    xTaskCreate(vDisk_Task,   (const signed char *)"DiskTask",   512, NULL, 1, &s_disk_task);
+    wd_register(WD_UI, s_ui_task);
+    wd_register(WD_MODEM, s_modem_task);
+    wd_register(WD_MAIN, s_main_task);
 
     /* Start the scheduler */
     vTaskStartScheduler();

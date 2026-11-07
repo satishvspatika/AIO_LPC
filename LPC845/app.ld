@@ -72,6 +72,7 @@ SECTIONS
          . = ALIGN(4) ;
         *(.noinit*)
          . = ALIGN(4) ;
+        _noinit_end = . ;
     } > RamLoc16
 
     /* No code protection, which also keeps a stray value out of this word */

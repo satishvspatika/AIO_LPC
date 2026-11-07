@@ -104,6 +104,68 @@ void SysTick_Handler(void)
 }
 
 
+/* The rain count lives only in RAM. A crash, watchdog or firmware-update restart leaves RAM as it
+ * was, so a copy here, with a check value, carries it across. Power loss or a brown-out doesn't, and
+ * the LPC1768 then returns the total from its records ($T), as before. The rain day it belongs to is
+ * kept too, so it can't carry into the next day. */
+#define RAIN_KEEP_MAGIC 0x52414B31UL
+typedef struct {
+	uint32_t magic;
+	uint32_t slot_tips;
+	uint32_t day_tips;
+	uint32_t day_key;
+	uint32_t restored;
+	uint32_t check;
+} rain_keep_t;
+__attribute__((section(".noinit"))) static rain_keep_t s_rain_keep;
+static uint32_t s_rain_day_key;		//Rain day the total belongs to: 0 = not known
+
+static uint32_t rain_keep_check(const rain_keep_t *k)
+{
+	return ~(k->magic ^ (k->slot_tips * 3U) ^ (k->day_tips * 5U) ^ (k->day_key * 7U) ^ (k->restored * 11U));
+}
+
+/* The rain day a time belongs to, by its closing date: after 08:30 that's tomorrow */
+static uint32_t rain_day_key_now(void)
+{
+	uint8_t dd = Present_Date_Time.date, mm = Present_Date_Time.month, yy = Present_Date_Time.year;
+	if(yy < 24){
+		return 0;	//No believable clock
+	}
+	if((((Present_Date_Time.hour*60) + Present_Date_Time.minute) / REC_INTERVAL) > RAIN_CLOSE_SLOT){
+		Next_Date(&dd, &mm, &yy);
+	}
+	return ((uint32_t)Present_Date_Time.century << 24) | ((uint32_t)yy << 16) | ((uint32_t)mm << 8) | dd;
+}
+
+static void rain_keep_save(void)
+{
+	rain_keep_t k;
+	__disable_irq();
+	k.slot_tips = rf_val;
+	__enable_irq();
+	k.magic = RAIN_KEEP_MAGIC;
+	k.day_tips = rain_day_tips;
+	k.day_key = s_rain_day_key;
+	k.restored = rain_total_restored;
+	k.check = rain_keep_check(&k);
+	__disable_irq();
+	s_rain_keep = k;
+	__enable_irq();
+}
+
+/* At start-up, after the counts were zeroed */
+static void rain_keep_restore(uint32_t reset_bits)
+{
+	rain_keep_t k = s_rain_keep;
+	if((reset_bits & 0x09U) == 0 && k.magic == RAIN_KEEP_MAGIC && k.check == rain_keep_check(&k)){
+		rf_val = (int)k.slot_tips;
+		rain_day_tips = k.day_tips;
+		s_rain_day_key = k.day_key;
+		rain_total_restored = k.restored;
+	}
+}
+
 void store_data()
 {
 	int i,m;
@@ -134,7 +196,8 @@ void store_data()
 		Day_Samples[gi_cur_blk].cc = Present_Date_Time.century;
 		//CUM_RF only restarts on a real change of rain day (08:45), not on the first slot after
 		//a restart: that total may already hold what the LPC1768 returned
-		if(day_started){
+		uint32_t close_key = ((uint32_t)Present_Date_Time.century << 24) | ((uint32_t)close_yy << 16) | ((uint32_t)close_mm << 8) | close_dd;
+		if(day_started || (s_rain_day_key != 0 && s_rain_day_key != close_key)){
 			rain_day_tips = 0;
 			rain_total_restored = 1;	//A new day has nothing to restore
 		}
@@ -159,6 +222,8 @@ void store_data()
 
 	Day_Samples[gi_cur_blk].rf_15min[m] = slot_tips; //15 minute RF data stored in structure
 	rain_day_tips += slot_tips;
+	s_rain_day_key = rain_day_key_now();
+	rain_keep_save();
 	Day_Samples[gi_cur_blk].bat_adc_15min[m] = bat1_adc;
 	//for testing
 	Day_Samples[gi_cur_blk].wd[m] = present_wd;
@@ -227,6 +292,38 @@ int get_cur_blk(){
 
 }
 
+
+/* A crash restarts straight away instead of waiting for the watchdog */
+void HardFault_Handler(void)
+{
+	NVIC_SystemReset();
+}
+
+/* The stack grows down towards the end of RAM's variables. A known pattern at that edge shows if it
+ * ever got there. The rest of the free area is filled too, so a probe can read the deepest use. */
+#define STACK_FILL_WORD		0xA5A5A5A5UL
+#define STACK_GUARD_WORDS	16
+
+extern uint32_t _noinit_end;
+
+static void stack_guard_init(void)
+{
+	uint32_t *p = &_noinit_end;
+	uint32_t *sp = (uint32_t *)__get_MSP();
+	while(p < (sp - 16)){
+		*p++ = STACK_FILL_WORD;
+	}
+}
+
+static void stack_guard_check(void)
+{
+	const volatile uint32_t *p = &_noinit_end;
+	for(int i = 0; i < STACK_GUARD_WORDS; i++){
+		if(p[i] != STACK_FILL_WORD){
+			NVIC_SystemReset();
+		}
+	}
+}
 
 void debounce_rfpin(void)
 {
@@ -363,6 +460,7 @@ void decode_command(void)
 		case 'R':									//Erase Data: restart the rain-day total
 			rain_day_tips = 0;
 			rain_total_restored = 1;
+			s_rain_day_key = rain_day_key_now();
 			break;
 
 		case 'T':									//$T<tips>; total stored before this restart. Adds once only
@@ -373,6 +471,7 @@ void decode_command(void)
 				}
 				rain_day_tips += stored_tips;
 				rain_total_restored = 1;
+				s_rain_day_key = rain_day_key_now();
 			}
 			break;
 
@@ -1974,6 +2073,7 @@ int main(void)
 	wake_reason = 'B';
 	reset_status = SYSCON->SYSRSTSTAT;
 	SYSCON->SYSRSTSTAT = reset_status;	//writing the bits back clears them for the next restart
+	rain_keep_restore(reset_status);
 	pckt_recvd = 0;
 
 	GPIO_PortClear(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);
@@ -2012,6 +2112,7 @@ int main(void)
 	Get_Time();
 	last_rec_min = Present_Date_Time.minute;
 
+	stack_guard_init();
 	fw845_app_init();
 
 
@@ -2095,6 +2196,8 @@ int main(void)
 				sleep_holdoff_100ms--;
 			}
 			Get_Time();
+			stack_guard_check();
+			rain_keep_save();
 			timer3_ovf_100ms = 0;
 		}
 

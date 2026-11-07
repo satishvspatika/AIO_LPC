@@ -126,12 +126,12 @@ static const screen_type_t s_screens[] = {
     SCR_LOCATION,
     SCR_LAST_LOGGED,
     SCR_BACKLOG,
+    SCR_FIELD_CALIB,    /* Last result, read-only: the CALIB key starts a run */
     SCR_SLEEP,          /* Last in the scroll: one UP from the landing page */
-    SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA
 };
-#define NUM_ACTION_SCREENS 3
+#define NUM_ACTION_SCREENS 2
 #else /* BIHAR_TRG */
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
@@ -142,12 +142,12 @@ static const screen_type_t s_screens[] = {
     SCR_LOCATION,
     SCR_LAST_LOGGED,
     SCR_BACKLOG,
+    SCR_FIELD_CALIB,    /* Last result, read-only: the CALIB key starts a run */
     SCR_SLEEP,          /* Last in the scroll: one UP from the landing page */
-    SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA
 };
-#define NUM_ACTION_SCREENS 3
+#define NUM_ACTION_SCREENS 2
 #endif
 #define NUM_SCREENS (sizeof(s_screens) / sizeof(s_screens[0]))
 #define NUM_BROWSE_SCREENS (NUM_SCREENS - NUM_ACTION_SCREENS)
@@ -292,6 +292,14 @@ static void on_sms_progress(const char *step_text)
     }
 }
 
+/* Short-lived jobs: their lowest free stack, before it's gone with the task */
+static void log_job_stack(void)
+{
+    char msg[40];
+    snprintf(msg, sizeof(msg), "Job stack free: %u words", (unsigned int)uxTaskGetStackHighWaterMark(NULL));
+    storage_log_debug("STACK", msg);
+}
+
 static void vStatusSms_Task(void *pvParameters)
 {
     (void)pvParameters;
@@ -328,6 +336,7 @@ static void vStatusSms_Task(void *pvParameters)
         s_status_sms_timer = 60; /* 3 seconds display */
     }
 
+    log_job_stack();
     s_sms_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -499,6 +508,7 @@ static void vTestSend_Task(void *pvParameters)
     }
     s_test_status = sent ? "SENT OK EN=NEXT" : "FAILED EN=RETRY";
     s_test_running = false;
+    log_job_stack();
     s_sms_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -552,7 +562,7 @@ static void test_send_key(key_code_t key)
         } else {
             s_test_running = true;
             strncpy(s_status_sms_substep, "STARTING...", sizeof(s_status_sms_substep) - 1);
-            if (xTaskCreate(vTestSend_Task, (const signed char *)"TestSend", 768, NULL, 2, &s_sms_task_handle) != pdPASS) {
+            if (xTaskCreate(vTestSend_Task, (const signed char *)"TestSend", 896, NULL, 2, &s_sms_task_handle) != pdPASS) {
                 s_sms_task_handle = NULL;
                 s_test_running = false;
                 s_test_status = "NO MEMORY";
@@ -590,6 +600,7 @@ static void vGps_Task(void *pvParameters)
         sim7600_release();
     }
     s_gps_running = false;
+    log_job_stack();
     s_sms_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -612,7 +623,7 @@ static void gps_fetch_start(const telemetry_data_t *telemetry)
     s_gps_status = NULL;
     s_gps_running = true;
     strncpy(s_status_sms_substep, "GPS STARTING... ", sizeof(s_status_sms_substep) - 1);
-    if (xTaskCreate(vGps_Task, (const signed char *)"GpsTask", 768, NULL, 1, &s_sms_task_handle) != pdPASS) {
+    if (xTaskCreate(vGps_Task, (const signed char *)"GpsTask", 896, NULL, 1, &s_sms_task_handle) != pdPASS) {
         s_sms_task_handle = NULL;
         s_gps_running = false;
         s_gps_status = "NO MEMORY";
@@ -803,6 +814,7 @@ static void vFwUpdate_Task(void *pvParameters)
     }
 
     s_fw_running = false;
+    log_job_stack();
     s_sms_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -815,7 +827,7 @@ static void fw_start_task(fw_task_op_t op, const char *first_step)
     snprintf(s_fw_line1, sizeof(s_fw_line1), "FIRMWARE UPDATE");
     strncpy(s_status_sms_substep, first_step, sizeof(s_status_sms_substep) - 1);
     s_status_sms_substep[sizeof(s_status_sms_substep) - 1] = '\0';
-    if (xTaskCreate(vFwUpdate_Task, (const signed char *)"FwTask", 768, NULL, 1, &s_sms_task_handle) != pdPASS) {
+    if (xTaskCreate(vFwUpdate_Task, (const signed char *)"FwTask", 896, NULL, 1, &s_sms_task_handle) != pdPASS) {
         s_sms_task_handle = NULL;
         s_fw_running = false;
         storage_log_debug("ERROR", "Not enough memory to start the firmware update task");
@@ -1519,16 +1531,25 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
         }
     } else {
         switch (scr) {
-            case SCR_STATION_ID:
+            case SCR_STATION_ID: {
                 #if (UNIT_CFG == KSNDMC_TRG)
-                snprintf(line1, sizeof(line1), "KSNDMC - TRG");
+                const char *cfg = "KSNDMC - TRG";
                 #elif (UNIT_CFG == BIHAR_TRG)
-                snprintf(line1, sizeof(line1), "BIHAR - TRG");
+                const char *cfg = "BIHAR - TRG";
                 #else
-                snprintf(line1, sizeof(line1), "KSNDMC - TWS");
+                const char *cfg = "KSNDMC - TWS";
                 #endif
-                snprintf(line2, sizeof(line2), "ID:%-6s %s", station_id_for_display(flash_nvram_get_station_id()), FIRMWARE_VERSION);
+                snprintf(line1, sizeof(line1), "%*s%s", (int)(16 - strlen(cfg)) / 2, "", cfg);
+                /* The whole version always shows, at the right. "ID:" only if the ID leaves room. */
+                const char *id = station_id_for_display(flash_nvram_get_station_id());
+                int room = 16 - (int)strlen(FIRMWARE_VERSION);
+                if ((int)strlen(id) + 4 <= room) {
+                    snprintf(line2, sizeof(line2), "ID:%-*s%s", room - 3, id, FIRMWARE_VERSION);
+                } else {
+                    snprintf(line2, sizeof(line2), "%-*.*s%s", room, room - 1, id, FIRMWARE_VERSION);
+                }
                 break;
+            }
 
             case SCR_DATETIME:
                 if (strlen(telemetry->present_time) >= 14 && strncmp(telemetry->present_time, "20", 2) == 0) {
@@ -1643,7 +1664,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 snprintf(line1, sizeof(line1), "FIELD CALIB     ");
                 {
                     const char *calib_result = flash_nvram_get_calib_result();
-                    snprintf(line2, sizeof(line2), "%-16.16s", calib_result[0] ? calib_result : "PRESS EN");
+                    snprintf(line2, sizeof(line2), "%-16.16s", calib_result[0] ? calib_result : "NO RESULT YET");
                 }
                 break;
 
@@ -1820,6 +1841,17 @@ static void goto_screen(screen_type_t scr)
         }
     }
 }
+
+#ifdef TEST_FAULTS
+static int __attribute__((noinline)) test_eat_stack(int depth)
+{
+    volatile char buf[128];
+    buf[0] = (char)depth;
+    int r = depth ? test_eat_stack(depth - 1) : 0;
+    vTaskDelay(1);
+    return r + buf[0];
+}
+#endif
 
 static void stn_edit_open(void)
 {
@@ -2012,6 +2044,24 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             if (key == KEY_BACK && s_key_test_last == KEY_BACK) {
                 s_ui_mode = UI_MODE_BROWSE;
             }
+#ifdef TEST_FAULTS
+            /* Bench test build only: forces each fault the protections must catch */
+            if (key == KEY_UP) {
+                storage_log_debug("TEST", "Forcing a stack overflow in the UI task");
+                vTaskDelay(500 / portTICK_RATE_MS);
+                test_eat_stack(14);
+            } else if (key == KEY_DOWN) {
+                storage_log_debug("TEST", "Forcing the UI task to stop");
+                for (;;) {
+                    vTaskDelay(1000 / portTICK_RATE_MS);
+                }
+            } else if (key == KEY_RIGHT) {
+                storage_log_debug("TEST", "Forcing every task to stop (interrupts on)");
+                vTaskDelay(500 / portTICK_RATE_MS);
+                for (;;) {
+                }
+            }
+#endif
             s_key_test_last = key;
             return;
         }
@@ -2216,9 +2266,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         } else if (key == KEY_EN) {
             screen_type_t active_scr = s_screens[s_current_screen_idx];
 
-            if (active_scr == SCR_FIELD_CALIB) {
-                calib_start();
-            } else if (active_scr == SCR_ERASE_DATA) {
+            if (active_scr == SCR_ERASE_DATA) {
                 /* Prompt Erase Confirmation */
                 s_ui_mode = UI_MODE_ERASE_CONFIRM;
             } else if (active_scr == SCR_SEND_STATUS) {
@@ -2228,7 +2276,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                     strncpy(s_status_sms_substep, "MODEM POWER ON  ", sizeof(s_status_sms_substep) - 1);
                     /* 768 words: booting the modem from here is the deepest call chain in the
                      * firmware, and 512 overflowed it */
-                    if (xTaskCreate(vStatusSms_Task, (const signed char *)"SmsTask", 768, NULL, 1, &s_sms_task_handle) != pdPASS) {
+                    if (xTaskCreate(vStatusSms_Task, (const signed char *)"SmsTask", 896, NULL, 1, &s_sms_task_handle) != pdPASS) {
                         storage_log_debug("ERROR", "Not enough memory to start status SMS task");
                         s_sms_task_handle = NULL;
                         s_status_sms_state = STATUS_UI_FAILED;

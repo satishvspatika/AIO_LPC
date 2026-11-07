@@ -1,4 +1,5 @@
 #include "storage_log.h"
+#include "errlog.h"
 #include "user_config.h"
 #include "ui_display.h"
 #include "intermcu_protocol.h"
@@ -11,7 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define RING_BUFFER_SIZE 2048
+#define RING_BUFFER_SIZE 1792 /* Trimmed from 2048 to leave the interrupt stack room */
 
 #define BACKLOG_FILENAME "BACKLOG.DAT"
 
@@ -144,7 +145,10 @@ static void format_log_time(char *ts_str, size_t size)
 
 void storage_log_debug(const char *tag, const char *msg)
 {
-    if (!s_debug_dump_enabled || !msg) return;
+    if (!msg) return;
+    /* Errors also go to the flash error log, which keeps them even with the SD log switched off */
+    bool is_error = tag && strcmp(tag, "ERROR") == 0;
+    if (!s_debug_dump_enabled && !is_error) return;
 
     char ts_str[36];
     format_log_time(ts_str, sizeof(ts_str));
@@ -153,6 +157,10 @@ void storage_log_debug(const char *tag, const char *msg)
     char line[256];
     int len = format_log_line(line, sizeof(line), ts_str, tag, msg);
     if (len <= 0) return;
+    if (is_error) {
+        errlog_note(line, msg);
+    }
+    if (!s_debug_dump_enabled) return;
 
     taskENTER_CRITICAL();
 
@@ -820,6 +828,40 @@ void storage_append_stamped(const char *name, const char *text)
         f_close(&s_http_file);
     }
     fs_unlock();
+}
+
+bool storage_errors_append(const char *text, unsigned repeats)
+{
+    bool ok = false;
+    fs_lock();
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    if (f_open(&s_http_file, ERRORS_FILENAME, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
+        if (s_http_file.fsize >= 65536UL) {
+            f_close(&s_http_file);
+            f_unlink(ERRORS_OLD_FILENAME);
+            f_rename(ERRORS_FILENAME, ERRORS_OLD_FILENAME);
+            if (f_open(&s_http_file, ERRORS_FILENAME, FA_OPEN_ALWAYS | FA_WRITE) != FR_OK) {
+                fs_unlock();
+                return false;
+            }
+        }
+        char note[40] = "";
+        if (repeats > 0) {
+            snprintf(note, sizeof(note), "(previous error again %u times) ", repeats);
+        }
+        UINT bw1 = 0, bw2 = 0, bw3 = 0;
+        f_lseek(&s_http_file, s_http_file.fsize);
+        FRESULT r1 = f_write(&s_http_file, note, strlen(note), &bw1);
+        FRESULT r2 = f_write(&s_http_file, text, strlen(text), &bw2);
+        FRESULT r3 = f_write(&s_http_file, "\r\n", 2, &bw3);
+        FRESULT r4 = f_close(&s_http_file);
+        ok = (r1 == FR_OK && r2 == FR_OK && r3 == FR_OK && r4 == FR_OK && bw3 == 2);
+    }
+    fs_unlock();
+    return ok;
 }
 
 void storage_backlog_clear_all(void)

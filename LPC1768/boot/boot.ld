@@ -1,7 +1,7 @@
-/* LPC1768 bootloader: sectors 2-11. Its RAM stops short of the top 32 bytes, which IAP uses. */
+/* LPC1768 bootloader: sectors 2-8, as 9-11 hold the error log. Its RAM stops short of the top 32 bytes, which IAP uses. */
 MEMORY
 {
-  FLASH (rx)  : ORIGIN = 0x00002000, LENGTH = 0xA000
+  FLASH (rx)  : ORIGIN = 0x00002000, LENGTH = 0x7000
   RAM   (rwx) : ORIGIN = 0x10000000, LENGTH = 0x7FE0
 }
 ENTRY(Reset_Handler)
