@@ -92,10 +92,12 @@ typedef enum {
     SCR_SLEEP
 } screen_type_t;
 
-/* Dynamic Carousel per System Configuration:
+/* Screens per System Configuration:
  * 1. KSNDMC_TWS: NO rain gauge / RF fields. Full weather sensors.
  * 2. KSNDMC_TRG: NO weather sensors. ONLY cumulative rain. Field Calib.
  * 3. BIHAR_TRG:  NO weather sensors. BOTH 15M and cumulative rain. Field Calib.
+ * The last ones do something that matters on EN, so they open from MENU only. Power Save stays
+ * in the scroll, as it harms nothing and the next slot wakes the unit.
  */
 #if (UNIT_CFG == KSNDMC_TWS)
 static const screen_type_t s_screens[] = {
@@ -109,10 +111,11 @@ static const screen_type_t s_screens[] = {
     SCR_LOCATION,
     SCR_LAST_LOGGED,
     SCR_BACKLOG,
+    SCR_SLEEP,          /* Last in the scroll: one UP from the landing page */
     SCR_SEND_STATUS,
-    SCR_ERASE_DATA,
-    SCR_SLEEP
+    SCR_ERASE_DATA
 };
+#define NUM_ACTION_SCREENS 2
 #elif (UNIT_CFG == KSNDMC_TRG)
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
@@ -123,11 +126,12 @@ static const screen_type_t s_screens[] = {
     SCR_LOCATION,
     SCR_LAST_LOGGED,
     SCR_BACKLOG,
+    SCR_SLEEP,          /* Last in the scroll: one UP from the landing page */
     SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
-    SCR_ERASE_DATA,
-    SCR_SLEEP
+    SCR_ERASE_DATA
 };
+#define NUM_ACTION_SCREENS 3
 #else /* BIHAR_TRG */
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
@@ -138,13 +142,15 @@ static const screen_type_t s_screens[] = {
     SCR_LOCATION,
     SCR_LAST_LOGGED,
     SCR_BACKLOG,
+    SCR_SLEEP,          /* Last in the scroll: one UP from the landing page */
     SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
-    SCR_ERASE_DATA,
-    SCR_SLEEP
+    SCR_ERASE_DATA
 };
+#define NUM_ACTION_SCREENS 3
 #endif
 #define NUM_SCREENS (sizeof(s_screens) / sizeof(s_screens[0]))
+#define NUM_BROWSE_SCREENS (NUM_SCREENS - NUM_ACTION_SCREENS)
 
 /* UI Operating Modes */
 typedef enum {
@@ -159,12 +165,13 @@ typedef enum {
     UI_MODE_FW_UPDATE
 } ui_mode_t;
 
-/* MENU key: operator shortcuts. Screen items jump to that screen, so actions such as
+/* MENU key: everything that does something. Screen items jump to that screen, so actions such as
  * Send Status and Erase Data keep their own EN confirmation step. */
 typedef enum {
     MENU_GOTO_SCREEN = 0,
     MENU_KEY_TEST,
-    MENU_POWER_SAVE,
+    MENU_SET_STATION,
+    MENU_GPS_UPDATE,
     MENU_TEST_SEND,
     MENU_FW_UPDATE
 } menu_action_t;
@@ -179,24 +186,12 @@ static const menu_item_t s_menu_items[] = {
     #if ENABLE_TEST_SEND
     { "TEST SEND",       MENU_TEST_SEND,   SCR_STATION_ID },
     #endif
-    { "STATION ID",      MENU_GOTO_SCREEN, SCR_STATION_ID },
-    #if (UNIT_CFG == KSNDMC_TWS)
-    { "LIVE READINGS",   MENU_GOTO_SCREEN, SCR_TEMP_HUM },
-    #else
-    { "RAINFALL",        MENU_GOTO_SCREEN, SCR_RAINFALL },
-    #endif
-    { "POWER STATUS",    MENU_GOTO_SCREEN, SCR_BATTERY },
-    { "NETWORK SIGNAL",  MENU_GOTO_SCREEN, SCR_SIGNAL },
-    { "LOCATION",        MENU_GOTO_SCREEN, SCR_LOCATION },
-    { "DATA LOGGING",    MENU_GOTO_SCREEN, SCR_LAST_LOGGED },
     { "SEND STATUS SMS", MENU_GOTO_SCREEN, SCR_SEND_STATUS },
-    #if (UNIT_CFG != KSNDMC_TWS)
-    { "FIELD CALIB",     MENU_GOTO_SCREEN, SCR_FIELD_CALIB },
-    #endif
+    { "GPS UPDATE",      MENU_GPS_UPDATE,  SCR_LOCATION },
+    { "KEY TEST",        MENU_KEY_TEST,    SCR_STATION_ID },
     { "ERASE DATA",      MENU_GOTO_SCREEN, SCR_ERASE_DATA },
     { "FIRMWARE UPDATE", MENU_FW_UPDATE,   SCR_STATION_ID },
-    { "KEY TEST",        MENU_KEY_TEST,    SCR_STATION_ID },
-    { "POWER SAVE",      MENU_POWER_SAVE,  SCR_STATION_ID }
+    { "SET STATION ID",  MENU_SET_STATION, SCR_STATION_ID }
 };
 #define NUM_MENU_ITEMS (sizeof(s_menu_items) / sizeof(s_menu_items[0]))
 
@@ -1628,7 +1623,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                     }
                 } else {
                     snprintf(line1, sizeof(line1), "NO LOCATION YET ");
-                    snprintf(line2, sizeof(line2), "%-16.16s", s_gps_status ? s_gps_status : "PRESS EN TO FIND");
+                    snprintf(line2, sizeof(line2), "%-16.16s", s_gps_status ? s_gps_status : "MENU: GPS UPDATE");
                 }
                 break;
             }
@@ -1815,7 +1810,7 @@ static void sleep_confirm_cancel(void)
     s_force_redraw = true;
 }
 
-/* Jump to a screen in this build's carousel; does nothing if the build doesn't have it */
+/* Jump to a screen in this build's list; does nothing if the build doesn't have it */
 static void goto_screen(screen_type_t scr)
 {
     for (size_t i = 0; i < NUM_SCREENS; i++) {
@@ -1824,6 +1819,28 @@ static void goto_screen(screen_type_t scr)
             return;
         }
     }
+}
+
+static void stn_edit_open(void)
+{
+    s_ui_mode = UI_MODE_EDIT_STN_ID;
+    const char *cur = flash_nvram_get_station_id();
+    memset(s_edit_stn_id, '0', 6);
+    s_edit_stn_id[6] = '\0';
+    if (cur) {
+        size_t len = strlen(cur);
+        if (len > 6) len = 6;
+        /* Right-aligned: a stored "1922" is 001922, not 192200 */
+        for (size_t i = 0; i < len; i++) {
+            if (cur[i] >= '0' && cur[i] <= '9') {
+                s_edit_stn_id[6 - len + i] = cur[i];
+            }
+        }
+    }
+    /* A longer real ID keeps all its digits editable */
+    s_edit_first_pos = (strncmp(s_edit_stn_id, "00", 2) == 0) ? 2 : 0;
+    s_edit_pos = s_edit_first_pos;
+    lcd_command(0x0F); /* Turn ON blinking hardware cursor */
 }
 
 void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_t *modem_stat)
@@ -2154,6 +2171,12 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 s_ui_mode = UI_MODE_BROWSE;
                 if (item->action == MENU_GOTO_SCREEN) {
                     goto_screen(item->screen);
+                } else if (item->action == MENU_SET_STATION) {
+                    goto_screen(SCR_STATION_ID);
+                    stn_edit_open();
+                } else if (item->action == MENU_GPS_UPDATE) {
+                    goto_screen(SCR_LOCATION);
+                    gps_fetch_start(telemetry);
                 } else if (item->action == MENU_KEY_TEST) {
                     s_key_test_last = KEY_NONE;
                     s_mode_timeout_ticks = KEY_TEST_TIMEOUT_TICKS;
@@ -2164,8 +2187,6 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 } else if (item->action == MENU_TEST_SEND) {
                     test_send_open(telemetry);
                 #endif
-                } else {
-                    sleep_confirm_open();
                 }
             }
             return;
@@ -2173,9 +2194,10 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
 
         /* --- Mode: Browse Mode Navigation --- */
         if (key == KEY_DOWN || key == KEY_RIGHT) {
-            s_current_screen_idx = (s_current_screen_idx + 1) % NUM_SCREENS;
+            /* An action screen opened from MENU isn't part of the scroll: this leaves it */
+            s_current_screen_idx = (s_current_screen_idx >= NUM_BROWSE_SCREENS) ? 0 : (s_current_screen_idx + 1) % NUM_BROWSE_SCREENS;
         } else if (key == KEY_UP || key == KEY_LEFT) {
-            s_current_screen_idx = (s_current_screen_idx + NUM_SCREENS - 1) % NUM_SCREENS;
+            s_current_screen_idx = (s_current_screen_idx >= NUM_BROWSE_SCREENS) ? 0 : (s_current_screen_idx + NUM_BROWSE_SCREENS - 1) % NUM_BROWSE_SCREENS;
         } else if (key == KEY_MENU) {
             s_menu_pos = 0;
             s_ui_mode = UI_MODE_MENU;
@@ -2186,37 +2208,19 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 strncpy(s_status_sms_substep, "SEND CANCELLED  ", sizeof(s_status_sms_substep) - 1);
                 s_status_sms_timer = 20; /* 1.0s display */
             }
+            /* From an action screen, BACK returns to the MENU it was opened from */
+            if (s_current_screen_idx >= NUM_BROWSE_SCREENS) {
+                s_ui_mode = UI_MODE_MENU;
+            }
             s_current_screen_idx = 0;
         } else if (key == KEY_EN) {
             screen_type_t active_scr = s_screens[s_current_screen_idx];
 
-            if (active_scr == SCR_STATION_ID) {
-                /* Enter Station ID Edit Mode */
-                s_ui_mode = UI_MODE_EDIT_STN_ID;
-                const char *cur = flash_nvram_get_station_id();
-                memset(s_edit_stn_id, '0', 6);
-                s_edit_stn_id[6] = '\0';
-                if (cur) {
-                    size_t len = strlen(cur);
-                    if (len > 6) len = 6;
-                    /* Right-aligned: a stored "1922" is 001922, not 192200 */
-                    for (size_t i = 0; i < len; i++) {
-                        if (cur[i] >= '0' && cur[i] <= '9') {
-                            s_edit_stn_id[6 - len + i] = cur[i];
-                        }
-                    }
-                }
-                /* A longer real ID keeps all its digits editable */
-                s_edit_first_pos = (strncmp(s_edit_stn_id, "00", 2) == 0) ? 2 : 0;
-                s_edit_pos = s_edit_first_pos;
-                lcd_command(0x0F); /* Turn ON blinking hardware cursor */
-            } else if (active_scr == SCR_FIELD_CALIB) {
+            if (active_scr == SCR_FIELD_CALIB) {
                 calib_start();
             } else if (active_scr == SCR_ERASE_DATA) {
                 /* Prompt Erase Confirmation */
                 s_ui_mode = UI_MODE_ERASE_CONFIRM;
-            } else if (active_scr == SCR_LOCATION) {
-                gps_fetch_start(telemetry);
             } else if (active_scr == SCR_SEND_STATUS) {
                 /* Transmit Status SMS Asynchronously in FreeRTOS Task (keeps UI responsive) */
                 if (s_status_sms_state != STATUS_UI_SENDING && s_sms_task_handle == NULL) {
@@ -2233,7 +2237,6 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                     }
                 }
             } else if (active_scr == SCR_SLEEP) {
-                /* Operator selected Sleep System */
                 storage_log_debug("UI", "Operator confirmed power save -> entering sleep");
                 request_power_save();
                 return;

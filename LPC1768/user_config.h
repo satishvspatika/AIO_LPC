@@ -20,10 +20,10 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.9.4"
+#define FIRMWARE_VERSION    "v6.9.6"
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
-#define ENABLE_TEST_SEND    1
+#define ENABLE_TEST_SEND    0
 #if (UNIT_CFG == KSNDMC_TRG)
 #define TEST_STATION_ID     "1001"
 #elif (UNIT_CFG == BIHAR_TRG)
