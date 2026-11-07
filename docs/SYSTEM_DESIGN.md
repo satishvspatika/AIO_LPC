@@ -1,7 +1,8 @@
 # AIO Telemetry Station: System Design, Memory Map, Data Flow and Test Record
 
-State as of 2026-11-07: LPC1768 firmware **v6.9.10**, LPC845 firmware **845-v1.3**, commit `77aa26b` on branch
-`v6.2.9-untested`. This build is on a 1-2 day bench run that started 2026-11-07 about 15:35.
+State as of 2026-11-07 evening: LPC1768 firmware **v6.9.11** (installed 17:25, not yet committed), LPC845 firmware
+**845-v1.3**, branch `v6.2.9-untested` (last firmware commit: v6.9.10 + 845-v1.3, `77aa26b`). v6.9.10 ran clean from 15:35 to
+17:25 (8 of 8 slots); v6.9.11 is now on the overnight / 1-2 day run.
 
 This document is the single place for how the system is built and why, and for what has been tested. Where something
 has only been built or read in code, and not run on a unit, it says so. Build steps and toolchain setup are in
@@ -126,32 +127,39 @@ source by `build.sh` at `-O1`, the same level as the old prebuilt library. The p
 | 0x09000 | 9-11 | 12 KB | **Error log**: 48 pages of 256 B, a fixed ring |
 | 0x0C000 | 12-15 | 16 KB | Firmware update journal |
 | 0x10000 | 16 | 32 KB | Swap scratch |
-| 0x18000 | 17-20 | 128 KB | **Application (slot A)**. v6.9.10 uses about 118.7 KB, about 12 KB free |
+| 0x18000 | 17-20 | 128 KB | **Application (slot A)**. v6.9.11 uses 118.4 KB (BIHAR_TRG), 118.6 KB (KSNDMC_TRG), 117.4 KB (KSNDMC_TWS); about 12 KB free |
 | 0x38000 | 21-24 | 128 KB | Staging (slot B) for a new image |
 | 0x58000 | 25-29 | 160 KB | **Record log**: 640 pages of 256 B, about 6.5 days of records |
 
 `scripts/fw_check_hex.py` refuses any hex that writes settings (0x1000-0x2000), the error log (0x9000-0xC000), or
 staging and the record log (0x38000-0x80000).
 
-### LPC1768 RAM (32 KB main SRAM, 0x10000000-0x10007FFF)
+### LPC1768 RAM (32 KB main SRAM 0x10000000-0x10007FFF, plus 32 KB AHB SRAM 0x2007C000-0x20083FFF)
 
 | Item | Size |
 |---|---|
-| FreeRTOS heap (`xHeap`, heap_2) | 16 KB. Holds every task stack. 4,128 B free after start-up (v6.9.10) |
+| FreeRTOS heap (`xHeap`, heap_2) | 16 KB, **in AHB SRAM at 0x2007C000 since v6.9.11**. Holds every task stack and queue. 4,128 B free after start-up |
 | Modem receive buffers (`s_rx_buf`, `s_rx_temp`) | 2 KB each |
 | Debug log ring buffer | 1,792 B (trimmed from 2,048 in v6.9.10) |
 | HTTP request and capture buffers | 1 KB each |
 | FatFs work areas | about 1.1 KB |
-| **Free for the interrupt stack** | **764 B** above the variables, below the 32 B the flash routines use |
+| **Free for the interrupt stack** | **about 16.8 KB** (variables end at 0x10003CB4) since v6.9.11; was 764 B in v6.9.10 |
 
 The top 32 B of RAM are reserved for the IAP flash routines. RTC registers GPREG0-4 survive a reset and are used for
 crash notes (GPREG0-1) and the fault restart count (GPREG4).
 
-**AHB SRAM (checked 2026-11-07):** the second 32 KB block (0x2007C000-0x20083FFF, two 16 KB banks) holds nothing:
-`.data_RAM2` and `.bss_RAM2` are 0 bytes in the map. The only code that names it is the USB-stick host driver (only
-runs for drive 1; the firmware mounts only drive 0, the SD card) and an unused UART `getline` helper. **Planned fix
-(v6.9.11):** place the 16 KB heap there with `__attribute__((section(".bss.$RAM2")))` (the start-up code already
-clears that section) and set `WITH_USB_MS 0`. Main RAM free goes from 764 B to about 16.7 KB; heap size unchanged.
+**AHB SRAM (v6.9.11).** Until v6.9.10 the second 32 KB block was unused (`.bss_RAM2` 0 bytes) while main RAM had
+only 764 B left. v6.9.11 moves the heap there:
+- `FreeRTOS_Library/portable/heap_2.c`: `xHeap` has `__attribute__((section(".bss.$RAM2")))`. The start-up code
+  (`cr_startup_lpc17.c`) clears only the main `.bss`, so `prvHeapInit()` now clears the heap itself before first use;
+  it starts from zero after every reset, as before.
+- The USB-stick host driver was the only code that used this RAM (its buffers at 0x2007C000). It only ran for drive 1
+  and the firmware mounts only drive 0 (the SD card); it is now off: `WITH_USB_MS 0` in `fat_sd/diskio.c`, and
+  `fat_sd/ffconf.h` has one drive. Its code is still linked (kept by its interrupt vector) but never called. The unused
+  UART `getline` helper also names 0x2007C000 and is never called.
+- `hard_fault_capture` (`main.c`) saves the crash PC and LR only when the stack pointer is valid; it now accepts the
+  AHB range too, since task stacks live there. Not yet forced on the unit (needs a crash test build).
+- Upper 16 KB of AHB SRAM (0x20080000-0x20083FFF) remains free.
 
 Task stacks (words of 4 bytes), with the lowest free seen on the bench:
 
@@ -259,7 +267,7 @@ MENU (actions): SEND STATUS SMS, GPS UPDATE, KEY TEST, ERASE DATA, FIRMWARE UPDA
 action returns to MENU. The CALIB key starts calibration directly on TRG. DSP opens the power save prompt. SEND HEALTH
 will go second in the menu when built. `TEST SEND` is switched off (`ENABLE_TEST_SEND 0`).
 
-Landing page: config name centred on line 1; line 2 `ID:1923  v6.9.10`, with the version always shown in full.
+Landing page: config name centred on line 1; line 2 `ID:1923  v6.9.11`, with the version always shown in full.
 
 ### 7.4 Time
 
@@ -312,7 +320,7 @@ With no card and no network, the oldest records are overwritten after about 6.5 
 
 | Fault | LPC1768 | LPC845 |
 |---|---|---|
-| Crash (hard fault) | Location saved in RTC registers, restart, logged at boot | Restart at once (845-v1.2) |
+| Crash (hard fault) | Location saved in RTC registers (task stacks in AHB SRAM accepted since v6.9.11), restart, logged at boot | Restart at once (845-v1.2) |
 | Stack overflow | FreeRTOS check on every task switch; task name saved, restart, logged (v6.9.8) | Pattern at the stack's edge checked every 100 ms (845-v1.2) |
 | Task stops responding | Main, UI and Modem check in; a task silent for 360 / 60 / 180 s is logged, then restart (v6.9.9) | Main loop must feed the watchdog |
 | Everything stops | 60 s hardware watchdog, fed only by the disk task | 60 s watchdog once running normally; 5.3 min on a firmware trial |
@@ -375,6 +383,10 @@ All on the bench unit: BIHAR_TRG, station 1923, BSNL SIM, bench power supply (ba
 | v6.9.9T/U | All tasks stopped | Pass: hardware watchdog restart, logged |
 | v6.9.9T/U/10T | Third fault restart in a row | Pass: powered off; message in `ERRORS.TXT` from v6.9.10 |
 | v6.9.9 | Flash error log copied to `ERRORS.TXT` | Pass, with version and time |
+| v6.9.10 | Long run 15:35-17:25 | Pass: 8 of 8 slots first try (71-73 s), no restarts, no new errors; stacks steady (Ui 190, Modem 286, Main 276-286, Disk 346-348 words), heap 4,128 B |
+| v6.9.11 | All three configs build; heap at 0x2007C000; main RAM free about 16.8 KB | Pass (map checked) |
+| v6.9.11 | Install by SD (MAIN F/W) at 17:25 | Pass: trial, confirmed healthy at +30 s |
+| v6.9.11 | First slot 17:30, with 1 tip | Pass: sent first try, 0.5 mm, CUM_RF 9.0 to 9.5; heap 4,128 B; stacks same as v6.9.10; 0 damaged frames. 85 s on-time: slow network (CIPOPEN 6 s, server reply 6 s), not firmware |
 | all | Hosted tests rerun before each commit | Pass |
 
 ### Not tested yet
@@ -384,7 +396,8 @@ All on the bench unit: BIHAR_TRG, station 1923, BSNL SIM, bench power supply (ba
 - Damaged-frame count comparison (no damaged frames occurred)
 - KSNDMC_TRG and KSNDMC_TWS on a unit and server
 - Real battery drain; long outages; full card; power cuts during settings save and firmware swap on the real unit
-- The 1-2 day run of v6.9.10 + 845-v1.3 (in progress)
+- The 1-2 day run of v6.9.11 + 845-v1.3 (in progress since 17:25)
+- Crash capture with the stack in AHB SRAM (needs a forced hard fault in a test build)
 
 ---
 
@@ -396,7 +409,7 @@ All on the bench unit: BIHAR_TRG, station 1923, BSNL SIM, bench power supply (ba
 | Blank LCD seen once | Unexplained |
 | `CIPOPEN` timeouts | To review |
 | Status SMS marked "Flag Invalid" by the server | Accepted for now |
-| RAM | 764 B free for the interrupt stack; heap 4,128 B. Fix planned in v6.9.11: heap moved to the unused AHB SRAM (see LPC1768 RAM) |
+| RAM | Fixed in v6.9.11: heap in AHB SRAM, about 16.8 KB main RAM free (was 764 B). Confirm on the long run |
 | SMS on 2G can take over a minute | Watch (power) |
 | Bihar SMS number | Temporary 9980945474; the ESP32 uses 9741391102 |
 | RTC coin cell | Can't be measured on this board; firmware can only detect a stop. ADC link proposed for the next board |
@@ -405,7 +418,8 @@ All on the bench unit: BIHAR_TRG, station 1923, BSNL SIM, bench power supply (ba
 
 ## 12. Plan
 
-**Done today:** stack, watchdog, error log, LPC845 protection, rain count kept. On the 1-2 day run.
+**Done today:** stack, watchdog, error log, LPC845 protection, rain count kept, RAM relieved (v6.9.11). v6.9.11 on
+the 1-2 day run; commit and tag it proven if clean.
 
 **Next batches**, each tested before the next:
 
