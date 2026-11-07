@@ -241,6 +241,14 @@ static key_code_t s_key_test_last = KEY_NONE;
 
 /* Field Calibration (ESP32 flow): runs up to 5 minutes, exactly 10 tips is a pass */
 #define CALIB_TIMEOUT_TICKS (5 * 60 * 20)
+#define CALIB_READ_RESULT_SEC 60    /* After a finished run: 6 minutes in all before power saving */
+
+/* Power saving after this long with no key. "Modem busy" doesn't extend it: while the LCD is on,
+ * the supervisor takes the modem every couple of seconds. Real jobs have their own flags. */
+#define UI_IDLE_SEC         90
+#define UI_MODEM_FINISH_SEC 60      /* A supervisor step under way when the idle time ends gets this long */
+#define UI_JOB_LIMIT_SEC    (8 * 60)    /* A stuck SMS, GPS or test job is cancelled after this */
+#define UI_JOB_RESET_SEC    60      /* And the unit restarts if the cancel doesn't end it */
 #define CALIB_PASS_TIPS     10
 static uint32_t s_calib_ticks = 0;
 
@@ -1781,6 +1789,7 @@ static void calib_finish(const telemetry_data_t *telemetry)
     lcd_print(line);
     vTaskDelay(3000 / portTICK_RATE_MS);
 
+    s_inactivity_ticks = (UI_IDLE_SEC - CALIB_READ_RESULT_SEC) * 20U;
     s_ui_mode = UI_MODE_BROWSE;
     s_force_redraw = true;
 }
@@ -1910,6 +1919,24 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
 
     key_code_t key = ui_keypad_scan();
 
+    /* These jobs hold the LCD on until they finish, so one that never finishes must not hold it forever */
+    bool job_running = s_status_sms_state == STATUS_UI_SENDING || s_gps_running
+#if ENABLE_TEST_SEND
+                       || s_test_running
+#endif
+                       ;
+    static uint32_t s_job_ticks = 0;
+    if (!job_running) {
+        s_job_ticks = 0;
+    } else if (++s_job_ticks == UI_JOB_LIMIT_SEC * 20U) {
+        storage_log_debug("ERROR", "Modem job still running after 8 minutes: cancelling it");
+        sim7600_request_cancel();
+    } else if (s_job_ticks >= (UI_JOB_LIMIT_SEC + UI_JOB_RESET_SEC) * 20U) {
+        storage_log_debug("ERROR", "Modem job did not stop after cancel: restarting");
+        storage_log_flush();
+        NVIC_SystemReset();
+    }
+
     /* If display is asleep, any keypress wakes it back up */
     if (!s_display_active) {
         if (key != KEY_NONE) {
@@ -1926,17 +1953,13 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         return;
     }
 
-    /* ESP32 timeout: off after 1 minute without a key, or 3 minutes while the modem is working */
     if (key != KEY_NONE) {
         s_operator_touched_key = true;
         s_inactivity_ticks = 0;
-    } else if (s_status_sms_state != STATUS_UI_SENDING && !s_slot_busy && !s_gps_running && !s_fw_running
-#if ENABLE_TEST_SEND
-               && !s_test_running
-#endif
-               ) {
+    } else if (!job_running && !s_slot_busy && !s_fw_running) {
         s_inactivity_ticks++;
-        if (s_inactivity_ticks >= ((sim7600_is_busy() ? 180U : 60U) * 20U)) {
+        if (s_inactivity_ticks >= UI_IDLE_SEC * 20U &&
+            (!sim7600_is_busy() || s_inactivity_ticks >= (UI_IDLE_SEC + UI_MODEM_FINISH_SEC) * 20U)) {
             storage_log_debug("UI", "Inactivity timeout reached -> entering auto-sleep");
             ui_enter_sleep();
             return;
