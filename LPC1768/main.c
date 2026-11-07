@@ -112,7 +112,8 @@ static void vUi_Task(void *pvParameters)
 #define NO_NETWORK_SLOTS_BEFORE_ONE_TRY 4   /* About an hour with no network: one try per slot */
 #define SLOT_SEND_BUDGET_SEC    300 /* No new send starts past this, so bad signal can't drain the battery */
 #define REJECTIONS_ALLOWED      3   /* Separate slots, as a wrong clock can cause one and gets corrected */
-#define SLOT_CLOCK_WAIT_SEC     300 /* Scheduled wake with no valid clock: give up after this */
+#define SLOT_CLOCK_WAIT_SEC     180 /* Scheduled wake with no valid clock: give up after this */
+#define SLOT_CLOCK_NO_NET_SEC   120 /* Sooner if there's no network to get the time from */
 
 typedef enum {
     SLOT_SENT = 0,
@@ -266,6 +267,16 @@ static void sync_flash_records_to_sd(void)
 /* Keeps the record: flash always, and the SD card when there is one */
 static void archive_slot(const telemetry_data_t *telem, int csq_dbm, const char *payload)
 {
+    /* A restart mid-slot runs the slot again. Its record is already kept, so don't store a second
+     * row. It's still sent again: flash can't show whether the first send got through. */
+    const flash_log_page_t *newest = flash_log_newest_record();
+    if (newest && newest->slot_id == s_archive_slot_id) {
+        s_last_record_seq = newest->seq;
+        storage_log_debug("SLOT", "This slot is already stored: sending it again without a second copy");
+        sync_flash_records_to_sd();
+        return;
+    }
+
     char record[FLASH_LOG_RECORD_SIZE];
     format_sd_record(record, sizeof(record), telem, csq_dbm);
 
@@ -855,6 +866,19 @@ static void rain_total_restore_step(const telemetry_data_t *telem)
     hal_power_rain_restore(tips);
 }
 
+/* No clock means no record. A dead RTC with no network would otherwise hold the modem on for the
+ * full wait at every slot. */
+static bool __attribute__((noinline)) clock_wait_is_over(void)
+{
+    uint32_t up_sec = xTaskGetTickCount() / configTICK_RATE_HZ;
+    if (up_sec > SLOT_CLOCK_WAIT_SEC) {
+        return true;
+    }
+    modem_status_t status;
+    sim7600_get_status(&status);
+    return up_sec > SLOT_CLOCK_NO_NET_SEC && !status.is_registered;
+}
+
 /* Is the LPC845 sending good status frames right now? It sends one a second. */
 #define LINK_CHECK_SEC 5
 static bool lpc845_link_alive(void)
@@ -1111,8 +1135,8 @@ static void vMain_Task(void *pvParameters)
                     s_waiting_for_clock = true;
                     storage_log_debug("ERROR", "Scheduled wake but clock is invalid: slot cannot run yet");
                 }
-                if ((xTaskGetTickCount() / configTICK_RATE_HZ) > SLOT_CLOCK_WAIT_SEC) {
-                    storage_log_debug("ERROR", "Clock still invalid after 5 min: SLOT LOST, entering sleep");
+                if (clock_wait_is_over()) {
+                    storage_log_debug("ERROR", "Clock still invalid: SLOT LOST, entering sleep");
                     storage_log_slot("NO_CLOCK,NO_CLOCK,LOST,INVALID_CLOCK,0,-113,0,0.00,SCHEDULED,0");
                     ui_enter_sleep();
                 }

@@ -460,10 +460,25 @@ bool storage_archive_slot(const char *day_file, const char *record)
     /* Data reaches the card at close, so its result counts: with no card-detect pin this is
      * how a pulled card shows up */
     bool ok = false;
-    if (f_open(&s_archive_file, filepath, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
-        f_lseek(&s_archive_file, s_archive_file.fsize);
+    if (f_open(&s_archive_file, filepath, FA_OPEN_ALWAYS | FA_READ | FA_WRITE) == FR_OK) {
         UINT bw = 0, bw_end = 0;
         UINT len = (UINT)strlen(record);
+
+        /* Power lost after writing a row but before noting it was copied brings the same row here
+         * again. Only the newest row can be repeated that way, so only that one is compared. */
+        char last_row[80];
+        if (len + 2 <= sizeof(last_row) && s_archive_file.fsize >= len + 2) {
+            UINT br = 0;
+            f_lseek(&s_archive_file, s_archive_file.fsize - (len + 2));
+            if (f_read(&s_archive_file, last_row, len + 2, &br) == FR_OK && br == len + 2 &&
+                memcmp(last_row, record, len) == 0 && last_row[len] == '\r' && last_row[len + 1] == '\n') {
+                ok = (f_close(&s_archive_file) == FR_OK);
+                fs_unlock();
+                return ok;
+            }
+        }
+
+        f_lseek(&s_archive_file, s_archive_file.fsize);
         FRESULT r1 = f_write(&s_archive_file, record, len, &bw);
         FRESULT r2 = f_write(&s_archive_file, "\r\n", 2, &bw_end);
         FRESULT r3 = f_close(&s_archive_file);
