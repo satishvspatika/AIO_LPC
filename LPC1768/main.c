@@ -902,6 +902,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     ui_set_slot_busy(true);
 
     s_last_slot_id = slot_id;
+    const portTickType slot_begin = xTaskGetTickCount();
 
     /* With the LPC845 silent (hung, or on a failed firmware trial) there's no rain, battery or
      * total to report, and a record of zeros would pull CUM_RF down. So nothing is sent or stored.
@@ -917,13 +918,12 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     }
 
     /* Queue anything missed in the wait below, so it can't delay this slot's record */
-    portTickType fill_start = xTaskGetTickCount();
     fill_missed_slots(telem, slot_id);
     s_archive_slot_id = slot_id;
-    int fill_sec = (int)((xTaskGetTickCount() - fill_start) / configTICK_RATE_HZ);
 
-    /* Slot boundary guard: servers reject a record sent under 62s after its slot boundary */
-    int elapsed_sec = (min % 15) * 60 + sec + fill_sec;
+    /* Slot boundary guard: servers reject a record sent under 62s after its slot boundary.
+     * min and sec were read before the link check and gap fill, so that time counts too. */
+    int elapsed_sec = (min % 15) * 60 + sec + (int)((xTaskGetTickCount() - slot_begin) / configTICK_RATE_HZ);
     if (elapsed_sec < SLOT_HOLD_GUARD_SEC) {
         int wait_sec = SLOT_HOLD_GUARD_SEC - elapsed_sec;
         snprintf(s_slot_line, sizeof(s_slot_line), "Slot boundary reached, holding %ds for sensors", wait_sec);
