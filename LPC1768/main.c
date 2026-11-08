@@ -947,6 +947,36 @@ static bool lpc845_link_alive(void)
     return good_after != good_before;
 }
 
+/* The LPC845 names each slot by its own clock. With that clock lost (RTC reset to 2000, or read as
+ * zeros) the name is invalid, so the slot is named from this clock, already checked by the scheduler,
+ * rounded down to the quarter hour. The rain is still the count the LPC845 closed for the slot. */
+static void __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data_t *telem)
+{
+    const char *st = telem->slot_time;
+    bool valid = strlen(st) >= 12;
+    for (int i = 0; valid && i < 12; i++) {
+        valid = (st[i] >= '0' && st[i] <= '9');
+    }
+    if (valid) {
+        int yr = (st[0]-'0')*1000 + (st[1]-'0')*100 + (st[2]-'0')*10 + (st[3]-'0');
+        int mo = (st[4]-'0')*10 + (st[5]-'0');
+        int da = (st[6]-'0')*10 + (st[7]-'0');
+        valid = yr >= 2024 && mo >= 1 && mo <= 12 && da >= 1 && da <= 31;
+    }
+    if (valid) {
+        return;
+    }
+    const char *p = telem->present_time;
+    int min = (p[10]-'0')*10 + (p[11]-'0');
+    char was[16];
+    strncpy(was, st, sizeof(was) - 1);
+    was[sizeof(was) - 1] = '\0';
+    snprintf(telem->slot_time, sizeof(telem->slot_time), "%.10s%02d00", p, (min / 15) * 15);
+    snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 clock was lost or not yet set (its slot %.14s): slot named %.14s from this clock",
+             was[0] ? was : "none", telem->slot_time);
+    storage_log_debug("ERROR", s_slot_line);
+}
+
 #if (UNIT_CFG != KSNDMC_TWS)
 /* CUM_RF never drops within a rain day, whatever went wrong elsewhere. Normally the LPC845's total
  * is the last record's plus this slot's rain, so this does nothing. */
@@ -1016,6 +1046,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     }
     /* Re-read fresh telemetry */
     intermcu_get_telemetry(telem);
+    name_slot_if_845_clock_lost(telem);
 #if (UNIT_CFG != KSNDMC_TWS)
     keep_cum_from_dipping(telem);
 #endif

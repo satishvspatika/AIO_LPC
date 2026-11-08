@@ -89,7 +89,8 @@ typedef enum {
     SCR_FIELD_CALIB,
     SCR_SEND_STATUS,
     SCR_ERASE_DATA,
-    SCR_SLEEP
+    SCR_SLEEP,
+    SCR_FIRMWARE
 } screen_type_t;
 
 /* Screens per System Configuration:
@@ -102,6 +103,7 @@ typedef enum {
 #if (UNIT_CFG == KSNDMC_TWS)
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
+    SCR_FIRMWARE,       /* Both chips' versions, next to the landing page */
     SCR_DATETIME,
     SCR_TEMP_HUM,
     SCR_WIND,
@@ -119,6 +121,7 @@ static const screen_type_t s_screens[] = {
 #elif (UNIT_CFG == KSNDMC_TRG)
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
+    SCR_FIRMWARE,       /* Both chips' versions, next to the landing page */
     SCR_DATETIME,
     SCR_RAINFALL,       /* Shows ONLY Cumulative Rainfall */
     SCR_BATTERY,
@@ -135,6 +138,7 @@ static const screen_type_t s_screens[] = {
 #else /* BIHAR_TRG */
 static const screen_type_t s_screens[] = {
     SCR_STATION_ID,
+    SCR_FIRMWARE,       /* Both chips' versions, next to the landing page */
     SCR_DATETIME,
     SCR_RAINFALL,       /* Shows BOTH 15M and Cumulative Rainfall */
     SCR_BATTERY,
@@ -1548,6 +1552,15 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 } else {
                     snprintf(line2, sizeof(line2), "%-*.*s%s", room, room - 1, id, FIRMWARE_VERSION);
                 }
+                break;
+            }
+
+            case SCR_FIRMWARE: {
+                /* Named as the MAIN F/W and CTRL F/W updates. The LPC845's version is read about
+                 * 11 s after boot; "----" until then, or if it never answers */
+                const char *v845 = fw_app_845_version();
+                snprintf(line1, sizeof(line1), "MAIN  %-10.10s", FIRMWARE_VERSION);
+                snprintf(line2, sizeof(line2), "CTRL  %-10.10s", (v845 && v845[0]) ? v845 : "----");
                 break;
             }
 

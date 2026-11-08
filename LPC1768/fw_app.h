@@ -35,6 +35,9 @@ const char *fw_app_last_result(void);
 /* What the LPC845's last update did, if that was found on this boot. NULL otherwise. */
 const char *fw_app_ctrl_last_result(void);
 
+/* The LPC845's firmware version as it reported it on this boot ("845-v1.5"), "" until known */
+const char *fw_app_845_version(void);
+
 /* The running image's CRC32, to spot a file that is the same firmware */
 uint32_t fw_app_running_crc(void);
 

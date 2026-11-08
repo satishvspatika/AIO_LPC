@@ -206,6 +206,12 @@ bool fw_ctrl_wait_reply(char kind, char *reply, size_t size, uint32_t timeout_ms
 
 static const char *s_ctrl_last_result = NULL;
 static bool s_ctrl_state_known = false;
+static char s_845_version[sizeof(((fw_ctrl_state_t *)0)->version)] = "";
+
+const char *fw_app_845_version(void)
+{
+    return s_845_version;
+}
 
 const char *fw_app_ctrl_last_result(void)
 {
@@ -226,6 +232,10 @@ static void ctrl_report(unsigned state, const char *version)
     s_ctrl_last_result = what;
 
     char line[64];
+    if (version && version[0]) {
+        strncpy(s_845_version, version, sizeof(s_845_version) - 1);
+        s_845_version[sizeof(s_845_version) - 1] = '\0';
+    }
     snprintf(line, sizeof(line), "%s, now running %s", what, version);
     storage_log_debug(failed ? "ERROR" : "FW", line);
     char history[80];
@@ -250,6 +260,8 @@ static void ctrl_step(uint32_t uptime_sec, uint32_t good_frames)
         if (!s_ctrl_state_known) {
             char line[48];
             s_ctrl_state_known = true;
+            strncpy(s_845_version, state.version, sizeof(s_845_version) - 1);
+            s_845_version[sizeof(s_845_version) - 1] = '\0';
             snprintf(line, sizeof(line), "LPC845 running %s", state.version);
             storage_log_debug("FW", line);
         }

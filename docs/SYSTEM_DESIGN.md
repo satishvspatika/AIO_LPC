@@ -1,8 +1,8 @@
 # AIO Telemetry Station: System Design, Memory Map, Data Flow and Test Record
 
-State as of 2026-11-08 morning: LPC1768 firmware **v6.9.12** (`3b3ec02`, includes v6.9.11), LPC845 firmware
-**845-v1.5** (`446ff19`), branch `v6.2.9-untested`. Two units: BIHAR_TRG 1923 (bench, both versions installed 2026-11-08
-09:00) and KSNDMC_TRG 1922 (v6.9.11 + 845-v1.5, ran every slot overnight 21:45-09:00).
+State as of 2026-11-08 afternoon: LPC1768 firmware **v6.9.13**, LPC845 firmware **845-v1.5** (`446ff19`), branch
+`v6.2.9-untested`. Two units: BIHAR_TRG 1923 (bench, v6.9.12 + 845-v1.5 since 09:00) and KSNDMC_TRG 1922 (v6.9.13 +
+845-v1.5 since 13:10, now on a BSNL SIM).
 
 This document is the single place for how the system is built and why, and for what has been tested. Where something
 has only been built or read in code, and not run on a unit, it says so. Build steps and toolchain setup are in
@@ -128,7 +128,7 @@ source by `build.sh` at `-O1`, the same level as the old prebuilt library. The p
 | 0x09000 | 9-11 | 12 KB | **Error log**: 48 pages of 256 B, a fixed ring |
 | 0x0C000 | 12-15 | 16 KB | Firmware update journal |
 | 0x10000 | 16 | 32 KB | Swap scratch |
-| 0x18000 | 17-20 | 128 KB | **Application (slot A)**. v6.9.12 uses 118,552 B (BIHAR_TRG), 118,728 B (KSNDMC_TRG), 117,504 B (KSNDMC_TWS); about 12 KB free |
+| 0x18000 | 17-20 | 128 KB | **Application (slot A)**. v6.9.13 uses 119,160 B (BIHAR_TRG), 119,332 B (KSNDMC_TRG), 118,108 B (KSNDMC_TWS); about 12 KB free |
 | 0x38000 | 21-24 | 128 KB | Staging (slot B) for a new image |
 | 0x58000 | 25-29 | 160 KB | **Record log**: 640 pages of 256 B, about 6.5 days of records |
 
@@ -236,6 +236,10 @@ status, firmware version and a checksum. Also the replies to the commands below.
    needs a record from the same rain day (CUM_RF carried from it) or from the rain day just before (CUM_RF 0, as the
    total restarts at 08:45 and nothing was counted; v6.9.12). A rain day further on, or no record at all, stays
    empty (`NO_DATA_FOR_RAIN_DAY` in SLOTS.CSV). Rain 0 and the last record's battery in every filled row.
+   If the LPC845's slot time is invalid (its clock lost, or not yet set after a restart), the slot is named from the
+   LPC1768's clock rounded down to the quarter hour, and an ERROR is logged (v6.9.13). Before that only the server
+   payload used the corrected time; SLOTS.CSV, the DATA file and backlog entries kept the LPC845's (e.g.
+   `20000101001500`). The rain is still the count the LPC845 closed, so it may land one slot late, never lost.
 4. **Hold to +62 s.** Servers refuse a record sent less than 62 s after its boundary. The hold counts all the time
    since the slot began (fixed in v6.9.2).
 5. **Never-dip check (TRG).** `CUM_RF` is raised to the newest stored record's total if it would drop.
@@ -271,7 +275,9 @@ MENU (actions): SEND STATUS SMS, GPS UPDATE, KEY TEST, ERASE DATA, FIRMWARE UPDA
 action returns to MENU. The CALIB key starts calibration directly on TRG. DSP opens the power save prompt. SEND HEALTH
 will go second in the menu when built. `TEST SEND` is switched off (`ENABLE_TEST_SEND 0`).
 
-Landing page: config name centred on line 1; line 2 `ID:1923  v6.9.12`, with the version always shown in full.
+Landing page: config name centred on line 1; line 2 `ID:1923  v6.9.13`, with the version always shown in full. The next screen (v6.9.13) shows both chips'
+versions, named as the two updates: `MAIN  v6.9.13` / `CTRL  845-v1.5`. The LPC845's is read about 11 s after boot
+(`----` until then, or if it never answers) and replaced at once after a CTRL F/W update.
 
 ### 7.4 Time
 
@@ -421,6 +427,11 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | v6.9.11 + 845-v1.5 | Overnight 21:45-09:00, probe watching the LPC845 | Pass: every slot sent first try (38 of 38 to 07:00); 43 natural jams cleared, clock never invalid, no safety wakes; stacks and heap steady; no new errors; 08:45 day total to 0 |
 | v6.9.11 | GPS search at 01:00 and 07:00 | 90 s, no fix (indoors); slot takes 101 s instead of about 8 s |
 | v6.9.12 | Gap-fill rule host test (11 cases, month and year ends, two-day gap, no history) | Pass |
+| v6.9.11 | 1922: SIM out 07:15-08:45, then no power 08:47-12:44 | 7 slots kept as -113, 15 filled as -112 (same rain day), all delivered by 13:01 with the 12:45 and 13:00 slots. No-SIM slot 29 s. On the weak battery the LPC1768 never started (no boot line) and the probe got no answer; on the supply it started at once |
+| v6.9.12 | 1922: operator start at 12:44:47, 13 s before a slot | Ran the 12:45 slot and 15 backlogs, then slept 78 s after the slot: 224 s awake, as designed (the idle count pauses during a slot) |
+| v6.9.13 | Slot naming with an invalid LPC845 slot time (host test with the real function) | Pass: `20000101001500` at 21:09:45 named `20261107210000`; empty named from the clock; valid left alone |
+| v6.9.13 | All three configs build; hosted update tests | Pass; variables end at 0x10003CCC (+24 B) |
+| v6.9.13 | Installed on 1922 by SD; versions screen | Pass: `MAIN  v6.9.13` / `CTRL  845-v1.5` |
 | v6.9.12 + 845-v1.5 | BIHAR 1923 off 19:00 to 09:00, both installed by SD at power-up | Pass: 19:15-08:30 sent as -110 with CUM 10, 08:45 as -112 with CUM 0, live from 09:00, backlog done in 4 slots (15 a slot); 845 UPDATE OK |
 
 ### Not tested yet
@@ -429,7 +440,8 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 - GPS job stack margin, and GPS fix at all (no fix seen, even with the antenna)
 - Damaged-frame count comparison (no damaged frames occurred)
 - KSNDMC_TWS on a unit and server
-- v6.9.12 on unit 1922; `rtc_lost845.py safety` (safety wake alone) on a unit
+- `rtc_lost845.py safety` (safety wake alone) on a unit
+- v6.9.13 slot naming on a unit (needs the LPC845 clock lost at a slot)
 - Real battery drain; long outages; full card; power cuts during settings save and firmware swap on the real unit
 - Crash capture with the stack in AHB SRAM (needs a forced hard fault in a test build)
 
@@ -446,7 +458,9 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | RAM | Fixed in v6.9.11: heap in AHB SRAM, about 16.8 KB main RAM free (was 764 B). Confirm on the long run |
 | SMS on 2G can take over a minute | Watch (power) |
 | Bihar SMS number | Temporary 9980945474; the ESP32 uses 9741391102 |
-| BIHAR 1923 sent the 09:00 slot straight after the power-up and updates on 2026-11-08 | Open: an operator boot should wait for the next slot unless switched on exactly on a quarter-hour. Check the power-on time and boot type in SLOTS.CSV; an update restart may look like a scheduled boot. No data lost or duplicated |
+| No low-battery handling | Open: a flat battery tries the modem every slot and can reset in a loop (1922 on 2026-11-08). Skip the modem below a set voltage and keep the records |
+| Log noise | `No '+CMGL:'` every 4 s while idle and `+CIPCLOSE: 0,4 ERROR` on every send: harmless, to quieten |
+| LPC845 version code in `$D` | Still `'d'` in every version; the full version string is what tells them apart |
 | LPC845 I2C0 jams while the modem is on | Recovered by 845-v1.5. Hardware cause (noise or supply dip on the RTC bus) worth a look on the next board |
 | RTC coin cell | Can't be measured on this board; firmware can only detect a stop. ADC link proposed for the next board |
 
@@ -457,8 +471,7 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 **Done:** stack, watchdog, error log, LPC845 protection, rain count kept, RAM relieved (v6.9.11); RTC jam recovery
 (845-v1.5); gap fill for the day after an off period (v6.9.12); KSNDMC_TRG on a second unit.
 
-**Next on the LPC1768:** when the LPC845's slot time is invalid, SLOTS.CSV shows slot 20000000000000 and that slot's
-15-min rain is lost (use the LPC1768's corrected slot time and the live count); log "LPC845 clock was lost".
+**Next:** low-battery handling (skip the modem, keep records), then batch 1.
 
 **Next batches**, each tested before the next:
 
