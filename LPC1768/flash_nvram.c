@@ -1,4 +1,5 @@
 #include "flash_nvram.h"
+#include "flash_log.h"
 #include "user_config.h"
 #include "LPC17xx.h"
 #include <string.h>
@@ -18,9 +19,14 @@ static char s_active_last_logged[20] = "NO DATA YET";
 /* Robust In-Application Programming (IAP) writer for Sector 1 (0x1000)
  * Uses clock fallback (100MHz CCLK -> 398MHz PLL timing used by legacy TWS firmware)
  * and read-back hardware verification with memcmp. */
+/* From main RAM: a caller's stack (in AHB SRAM) can be a source the boot ROM refuses (fw_app.c) */
+static uint32_t s_sector_src[64];
+
 static bool iap_write_sector1(const void *src_buf, size_t len)
 {
     if (!src_buf || len != 256) return false;
+    memcpy(s_sector_src, src_buf, len);
+    src_buf = s_sector_src;
 
     static const uint32_t clocks[] = { 100000, 398000, 12000 };
 
@@ -86,6 +92,38 @@ static bool iap_write_sector1(const void *src_buf, size_t len)
     return false;
 }
 
+static nvram_init_state_t s_settings_state = NVRAM_OK;
+
+nvram_init_state_t flash_nvram_init_state(void)
+{
+    return s_settings_state;
+}
+
+/* The ID as every payload format carries it: KSNDMC_TRG stn_id=, BIHAR_TRG "StnNo":", KSNDMC_TWS stn_no= */
+static bool station_id_from_records(char out[8])
+{
+    static const char *const keys[] = { "stn_id=", "\"StnNo\":\"", "stn_no=" };
+    const flash_log_page_t *rec = flash_log_newest_record();
+    if (!rec) {
+        return false;
+    }
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        const char *at = strstr(rec->payload, keys[k]);
+        if (!at) {
+            continue;
+        }
+        at += strlen(keys[k]);
+        int n = 0;
+        while (n < 6 && at[n] >= '0' && at[n] <= '9') {
+            out[n] = at[n];
+            n++;
+        }
+        out[n] = '\0';
+        return n >= 4;
+    }
+    return false;
+}
+
 void flash_nvram_init(void)
 {
     const char *flash_str = (const char *)PARAM_SECTOR_ADDR;
@@ -105,10 +143,20 @@ void flash_nvram_init(void)
             s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
         }
     } else {
-        /* Blank/uninitialized sector: write default station ID */
-        strncpy(s_active_station_id, STATION_ID_DEFAULT, sizeof(s_active_station_id) - 1);
+        /* Blank: a new unit, or power lost between erasing and rewriting this sector (it has one copy
+         * and no spare sector for a second). The newest stored record still carries the station ID,
+         * so a unit in service keeps its own ID instead of sending as the build default. */
+        char found[8];
+        const char *id = STATION_ID_DEFAULT;
+        if (station_id_from_records(found)) {
+            id = found;
+            s_settings_state = NVRAM_ID_RECOVERED;
+        } else {
+            s_settings_state = (flash_log_newest_record() != NULL) ? NVRAM_ID_LOST : NVRAM_NEW_UNIT;
+        }
+        strncpy(s_active_station_id, id, sizeof(s_active_station_id) - 1);
         s_active_station_id[sizeof(s_active_station_id) - 1] = '\0';
-        flash_nvram_set_station_id(STATION_ID_DEFAULT);
+        flash_nvram_set_station_id(id);
     }
 
     /* Boot sets Last Logged from the record log. Sector 1 holds only a stale copy from older firmware. */

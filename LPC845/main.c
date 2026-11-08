@@ -1245,21 +1245,28 @@ static void rtc_watch_100ms(void)
 	static uint8_t same_ticks = 0;
 	static uint16_t bad_clock_ticks = 0;
 
+	//Judged only on a read that worked this tick (845-v1.6). Failed reads leave an old seconds value:
+	//counted as "stuck" they started the RTC from up to 3 s back, which across a minute change moved
+	//the clock nearly a minute forward, and a set halt bit was written again every 100 ms. Reads
+	//that keep failing are the safety net's job below.
+	bool read_ok = (s_rtc_last_ok_ticks == 0);
 	if(s_rtc_last_ok_ticks < 0xFFFF){
 		s_rtc_last_ok_ticks++;		//cleared by every good read
 	}
-	if(s_rtc_raw_sec != last_raw_sec){
-		last_raw_sec = s_rtc_raw_sec;
-		same_ticks = 0;
-	}
-	else if(same_ticks < 255){
-		same_ticks++;
-	}
-	if((s_rtc_raw_sec & 0x80) || (same_ticks >= RTC_STUCK_TICKS)){
-		rtc_kick();
-		rtc_kicks++;
-		same_ticks = 0;
-		last_raw_sec = 0xFF;
+	if(read_ok){
+		if(s_rtc_raw_sec != last_raw_sec){
+			last_raw_sec = s_rtc_raw_sec;
+			same_ticks = 0;
+		}
+		else if(same_ticks < 255){
+			same_ticks++;
+		}
+		if((s_rtc_raw_sec & 0x80) || (same_ticks >= RTC_STUCK_TICKS)){
+			rtc_kick();
+			rtc_kicks++;
+			same_ticks = 0;
+			last_raw_sec = 0xFF;
+		}
 	}
 
 	//Safety-net wake: only while the clock is invalid and the LPC1768 is off

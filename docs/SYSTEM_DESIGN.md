@@ -139,7 +139,7 @@ staging and the record log (0x38000-0x80000).
 
 | Item | Size |
 |---|---|
-| FreeRTOS heap (`xHeap`, heap_2) | 16 KB, **in AHB SRAM at 0x2007C000 since v6.9.11**. Holds every task stack and queue. 4,128 B free after start-up |
+| FreeRTOS heap (`xHeap`, heap_2) | **20 KB since v6.9.15** (16 KB from v6.9.11), in AHB SRAM at 0x2007C000. Holds every task stack and queue. 4,128 B free after start-up on v6.9.14; about 6.9 KB expected on v6.9.15 (modem stack 832 words); a job task (896 words) needs about 3.7 KB |
 | Modem receive buffers (`s_rx_buf`, `s_rx_temp`) | 2 KB each |
 | Debug log ring buffer | 1,792 B (trimmed from 2,048 in v6.9.10) |
 | HTTP request and capture buffers | 1 KB each |
@@ -160,7 +160,18 @@ only 764 B left. v6.9.11 moves the heap there:
   UART `getline` helper also names 0x2007C000 and is never called.
 - `hard_fault_capture` (`main.c`) saves the crash PC and LR only when the stack pointer is valid; it now accepts the
   AHB range too, since task stacks live there. Not yet forced on the unit (needs a crash test build).
-- Upper 16 KB of AHB SRAM (0x20080000-0x20083FFF) remains free.
+- From v6.9.15 the heap is 20 KB (to 0x20080FFF); 0x20081000-0x20083FFF (12 KB) remains free.
+- **Flash writes must take their data from main RAM (v6.9.18).** The boot ROM's copy-to-flash refused a source at or
+  across 0x20080000 (the second AHB block). With the 20 KB heap of v6.9.15-v6.9.17, the update task (created when an
+  update starts) gets its stack at 0x2007F538-0x20080338, so its first frames, holding the 256-byte page and the
+  journal record, are above that address: v6.9.15 showed "UPDATE STOPPED FLASH ERROR" on 1922 (2026-11-08 evening),
+  and revert, which writes a journal record from the same task, would fail the same way. Under v6.9.14 the whole
+  stack was below 0x20080000 (0x2007F040-0x2007FE40), which is why the update to v6.9.15 worked. v6.9.18 copies the
+  data into a static main-RAM buffer in every flash write (`fw_hal_program`, flash log, error log, settings) and logs
+  the IAP status code when staging fails. Read back on 1922 through the probe: the staged v6.9.17 image was complete
+  and valid; the frames put the page buffer wholly above 0x20080000 (writes worked) and the journal record across it
+  (0x2007FFE0-0x20080104, the write that failed), so the boot ROM refuses a source that crosses the boundary. Units on v6.9.15-v6.9.17 run normally otherwise (their other flash writes
+  come from tasks made at start-up, low in the heap), but need the probe on the LPC1768 to leave that version.
 
 Task stacks (words of 4 bytes), with the lowest free seen on the bench:
 
@@ -351,7 +362,10 @@ With no card and no network, the oldest records are overwritten after about 6.5 
 | LPC845 silent | No record made (no zeros); slot filled later | |
 | `CUM_RF` would drop | Held at the stored total (TRG) | Day total can't carry past 08:45 after a restart |
 | Restart mid-slot | Slot runs again without a second stored copy; sent again (the server may see a repeat) | |
-| Bad clock | Gives up after 3 min (2 with no network) | Jammed I2C reset, stopped RTC restarted, wake after 15 min with no valid time (845-v1.5) |
+| Bad clock | Gives up after 3 min (2 with no network) | Jammed I2C reset, stopped RTC restarted, wake after 15 min with no valid time (845-v1.5). Stuck/halted judged only from good reads (845-v1.6) |
+| Modem hung | Between the two power-on tries the 3.8V rail is held off 3 s, so the modem really restarts (v6.9.14; before, it was switched straight back on) | |
+| `$f7` lost | Sent again at 10, 20 and 30 s if still powered, unless a slot is due (then restart and run it). The UI task checks in while waiting (v6.9.14) | |
+| Impossible values | 15-min rain over 100 mm logged as ERROR; value sent as read (v6.9.14). No battery range check: the battery may be 12 V or 3.3-3.7 V under the new power design, so its limits come later as a per-unit setting with the low-voltage cut-off | |
 | No SIM / no network | Record saved to backlog; 1 try a slot after about an hour | |
 | Stuck job (SMS, GPS, test) | Cancelled at 8 min, restart if that fails | |
 
@@ -432,6 +446,26 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | v6.9.13 | Slot naming with an invalid LPC845 slot time (host test with the real function) | Pass: `20000101001500` at 21:09:45 named `20261107210000`; empty named from the clock; valid left alone |
 | v6.9.13 | All three configs build; hosted update tests | Pass; variables end at 0x10003CCC (+24 B) |
 | v6.9.13 | Installed on 1922 by SD; versions screen | Pass: `MAIN  v6.9.13` / `CTRL  845-v1.5` |
+| v6.9.14 + 845-v1.6 | Built and host-tested only (not on a unit yet): slot naming from the start-of-slot clock (4 cases incl. a slot run past the next boundary); all three configs build (117,524 / 117,696 / 116,316 B after dropping the battery range check, about 1.5 KB smaller as `send_raw` is no longer copied into every caller); hosted update tests; static stack the same as v6.9.13 | Pass |
+| v6.9.14 + 845-v1.6 | Installed on 1922 by SD (2026-11-08 ~16:00): versions screen MAIN v6.9.14, CTRL 845-v1.6 | Pass |
+| 845-v1.6 | `rtc_lost845.py jam` on 1922, unit awake: 3 forced I2C0 failures each recovered within 2 s, time never read as zeros, `kicks=0` (no clock restart from failed reads) | Pass |
+| 845-v1.6 + v6.9.14 | `rtc_lost845.py safety` on 1922 (first run on a unit): clock set to 2000-01-01 while asleep, safety wake 1 s later (LCD off), clock back to network time 35 s after the wake, unit back asleep; day tips kept | Pass |
+| v6.9.14 | 16:15 slot after the tests: on 16:15:00, off 16:16:25; three I2C jams during the modem-on time recovered | Pass |
+| v6.9.14 | 1922, 16:04-16:46: update and 845 update OK; log quiet (no CIPCLOSE or SMS-poll lines); safety wake at 16:07 ran the current slot (16:00, named from this clock), found it already stored, sent it again without a second row; day file rows 00-32 with no gap or repeat | Pass |
+| v6.9.15 | Built and host-tested only (not on a unit yet): station ID parser on all three payload formats and bad inputs; all three configs build (117,984 / 118,156 / 116,776 B); hosted update tests; heap 20 KB (`.bss_RAM2` 0x5000 in the map); static stack with the real limits: modem 456 B spare (was about -820 B at 512 words), status SMS 744, main 1016 | Pass |
+| v6.9.16 | Built and host-tested only (not on a unit yet): learned radio mode (net_policy test: 10 site scenarios, file formats), voice-only registration wait, no-SIM stop; all three configs build (119,952 / 120,124 / 118,748 B of 131,072); hosted update tests; modem stack 400 B spare | Pass |
+| v6.9.17 | Built and host-tested only (not on a unit yet): operator-tied learning and the 2G-to-4G rescue (net_policy test: 2G switched off, SIM swap same/other operator, unreadable IMSI, file round trips); all three configs build (120,440 / 120,612 / 119,236 B); hosted update tests; modem stack 368 B spare | Pass |
+| v6.9.15 | Staging v6.9.17 on 1922: "UPDATE STOPPED FLASH ERROR" (update task stack across 0x20080000) | **Fail**, fixed in v6.9.18 |
+| v6.9.18 | Built and host-tested only: every flash write from a main-RAM buffer (all four at 0x1000xxxx in the map); IAP status logged on a failed staging; all three configs build (120,732 / 120,900 / 119,528 B); hosted update tests | Pass |
+| v6.9.18 | 1922: written to slot A by MCU-Link on the LPC1768 (sectors 17-20 only; journal, settings, records untouched), read back identical; 18:30 slot sent | Pass |
+| v6.9.18 | 1922: update from v6.9.18 itself (SAME F/W, REDO): PENDING written to journal page 8 (the write that failed on v6.9.15), 12 swap steps, trial boot, CONFIRMED, "UPDATE OK, now running v6.9.18" | Pass |
+| v6.9.18 | BIHAR 1923: written to slot A by MCU-Link from v6.9.16 (journal REPORTED, nothing in progress; settings 001923 untouched), read back identical | Pass |
+| v6.9.16 | BIHAR 18:15/18:30, first slots on learned mode: in 4G-only mode its modem reported registration by +CGREG (not +CEREG), so the slot was counted as 2G and 4G as missing (`P2 ... M02`); 18:15 also waited 17 s on +CREG (voice only) before 2G | **Fail** (misclassified), fixed in v6.9.19 |
+| v6.9.19 | Built and host-tested only: registered mode taken from the mode the modem was held to (4G-only = 4G whichever of CEREG/CGREG/CREG answers); all three configs build (120,892 / 121,060 / 119,688 B); hosted tests | Pass |
+| v6.9.18 | 1922 19:00 slot: 4G in 1 s, data refused once ("no network service"), radio restart and re-attach, sent at +89 s (about 20 s lost to the network); then the scheduled GPS search ran 90 s with no fix: slot 3 min | Network and GPS, not the radio mode logic |
+| v6.9.20 | Built and host-tested only (not on a unit yet): automatic GPS off; data recovery stays on the SIM's operator (fresh attach on the same APN, then only that operator's APNs; the full list only for an unknown SIM: worst case under a minute instead of 3); 4G "registration denied" (+CEREG: 0,3) switches to 2G at once; sleep waits for a new firmware's confirmation (at most 2 min); all three configs build (121,400 / 121,568 / 120,204 B); hosted tests | Pass |
+| v6.9.19 | BIHAR: installed from SD by v6.9.18 (18:51), so its update path works; 18:45-19:15 registered on LTE in about 1 s, `RATMODE.DAT` back to `P4 ... R01` | Pass |
+| v6.9.20 | Installed from SD on both units (1922 from v6.9.18, BIHAR from v6.9.19), "UPDATE OK, now running v6.9.20" reported by the user | Pass |
 | v6.9.12 + 845-v1.5 | BIHAR 1923 off 19:00 to 09:00, both installed by SD at power-up | Pass: 19:15-08:30 sent as -110 with CUM 10, 08:45 as -112 with CUM 0, live from 09:00, backlog done in 4 slots (15 a slot); 845 UPDATE OK |
 
 ### Not tested yet
@@ -451,16 +485,19 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 
 | Item | Status |
 |---|---|
-| GPS never gets a fix | Open. Every search is a cold start of 90 s |
-| Blank LCD seen once | Unexplained |
-| `CIPOPEN` timeouts | To review |
-| Status SMS marked "Flag Invalid" by the server | Accepted for now |
+| GPS never gets a fix | Deferred (user, 2026-11-08). Every search is a cold start of 90 s. **Automatic searches off from v6.9.20** (`GPS_AUTO_SEARCH 0`): they added about 93 s to the 01:00/07:00/13:00/19:00 slots (19:00 on 1922 took 3 min). The GPS menu still searches |
+| Blank LCD seen once | Closed: the 12 V battery was not connected (user, 2026-11-08) |
+| BSNL 4G at 1922 since 17:45, 2026-11-08 | Registration denied once (+CEREG: 0,3), then 4G registers but refuses data ("no network service") until a radio restart; recovered each time in about 20 s. Network side. v6.9.20: denial goes straight to 2G; recovery re-attaches on bsnlnet instead of trying Airtel/Jio APNs |
+| Sleep during a new firmware's first 30 s | An unconfirmed trial boot counts against it (3 and the old firmware returns). v6.9.20 holds sleep until confirmed, at most 2 min (1922 18:50: power save pressed in the same second as the confirmation) |
+| `CIPOPEN` timeouts | Not seen since: 45 opens on 1922 on 2026-11-08, none failed; the one slow case (6 s, v6.9.11) was the network. Watch |
+| Status SMS marked "Flag Invalid" by the server | Ignored (user, 2026-11-08) |
 | RAM | Fixed in v6.9.11: heap in AHB SRAM, about 16.8 KB main RAM free (was 764 B). Confirm on the long run |
 | SMS on 2G can take over a minute | Watch (power) |
 | Bihar SMS number | Temporary 9980945474; the ESP32 uses 9741391102 |
 | No low-battery handling | Open: a flat battery tries the modem every slot and can reset in a loop (1922 on 2026-11-08). Skip the modem below a set voltage and keep the records |
-| Log noise | `No '+CMGL:'` every 4 s while idle and `+CIPCLOSE: 0,4 ERROR` on every send: harmless, to quieten |
-| LPC845 version code in `$D` | Still `'d'` in every version; the full version string is what tells them apart |
+| Log noise | Fixed in v6.9.14: the SMS poll and socket closes are no longer logged unless a message arrives |
+| Modem task stack | **Fixed in v6.9.15.** v6.9.10 cut it from 768 to 512 words, but `bench/stack_callgraph.py` kept the old limits, so the "200 B spare" reported since was against 768 words: at 512 the worst path (an SMS command reply that fails, restarts a silent modem and syncs the clock) was about 820 B short. 74 words free was measured on 1922 in the safety-wake slot (2026-11-08 16:07). Now 832 words (456 B spare in the worst case), heap 20 KB; the script's limits match the firmware |
+| LPC845 clock set back across a boundary | A server correction of 90 s or more across xx:00/15/30/45 runs that boundary twice: the stored 15-min sample keeps only the second part (CUM_RF stays right). Rare; not fixed |
 | LPC845 I2C0 jams while the modem is on | Recovered by 845-v1.5. Hardware cause (noise or supply dip on the RTC bus) worth a look on the next board |
 | RTC coin cell | Can't be measured on this board; firmware can only detect a stop. ADC link proposed for the next board |
 
@@ -471,7 +508,26 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 **Done:** stack, watchdog, error log, LPC845 protection, rain count kept, RAM relieved (v6.9.11); RTC jam recovery
 (845-v1.5); gap fill for the day after an off period (v6.9.12); KSNDMC_TRG on a second unit.
 
-**Next:** low-battery handling (skip the modem, keep records), then batch 1.
+**Batch 1 status (v6.9.14 + 845-v1.6, 2026-11-08):** modem lockup (rail held off between tries), `$f7` lost
+(re-sent), data sanity (logged), log noise, RTC watch on stale reads: done; on 1922 since 2026-11-08 16:00.
+SD lockup: already covered (every card wait has a time limit; a hang is caught by the 60 s watchdog, card loss
+tested in v6.9.4). Dead LPC845 link: already logged as ERROR and the slot filled later; no change. Bad-clock wait:
+passed on 1922 (`rtc_lost845.py safety`). Low-battery handling: on hold.
+
+**Batch 2 code review (v6.9.15, 2026-11-08):** every write that a power cut can interrupt, read before any power
+is pulled. Found and fixed: (1) `FLASHSYN.DAT` was saved once after a catch-up of up to 96 records, so a cut part way
+through wrote every record already copied to the card again (only the newest repeat is recognised); it is now saved
+after each record. (2) The settings sector (station ID, unit type, calibration, GPS position) has one copy, erased and
+rewritten on each save, with no spare sector for a second; a cut in between left it blank and the unit came back as
+the build default ID (`001061` for a BIHAR build), sending under the wrong station without a word. A blank sector now
+takes the ID from the newest stored record's payload and logs ERROR; only a unit with no records uses the default.
+The GPS position save runs during an unattended slot with the modem on, the likeliest time for a weak-battery
+brownout. Checked and safe: state files (fixed length, overwritten in place), day files (newest row repeat
+recognised), backlog file (entries appear only once their size is written at close; a cut between a send and
+marking it sent sends it once more), ERRORS.TXT rotation, the record log and error log in flash (CRC on every page,
+torn pages skipped, a half-erased sector erased again), the LPC845 rain total after a battery disconnect (returned
+from the newest record; only rain while unpowered and in the unfinished slot is missing). Still to do on the unit:
+the power-cut tests themselves.
 
 **Next batches**, each tested before the next:
 
@@ -479,7 +535,21 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
    dead LPC845 link report and fill, bad-clock test.
 2. Power cycling: power cuts during every kind of write, card loss, full card.
 3. Power and network flow: SIM check first (a no-SIM slot to about 20-30 s), recovery by failure type (CFUN, rescan,
-   stop early on denied), roaming (clear blocked networks, try 4G once a day), then adaptive wake (measure first).
+   stop early on denied), roaming (clear blocked networks), 4G every slot: today it starts on the mode that last worked (4G by default) and
+   switches after 5 polls, so a unit that once fell back to 2G stayed there. **Done in v6.9.16 (learned per site,
+   `net_policy.c`, host test `LPC1768/tests/net_policy_test.c`):** 4G is searched first for about twice its learned
+   registration time (6-20 s; 16 s with no history). Where 2G is what delivers, 4G gets a 6 s look, or none once 4G
+   has been missing 4 times or registered without data twice; a full 20 s 4G check runs every 16 power-ons, spaced to
+   32 and 64 while those checks fail, and back to 16 once 4G works. A slot that registers on 4G but whose data fails
+   twice running moves the unit to 2G first; 2G failing the same way moves it back. An outage on both teaches
+   nothing. CREG alone (voice/SMS) waits up to 8 s more for data registration (CEREG/CGREG). The mode registered on is the mode the modem
+   was held to (v6.9.19): BIHAR's modem reports LTE registration by CGREG. A SIM reported "not
+   inserted" 3 times stops the power-on at once (was about 30 s). State in `RATMODE.DAT`, 30 fixed characters, e.g.
+   `P4 C00 R01 M00 F00 G00 X0 L0 N40471`; older files are read. **v6.9.17:** the learning belongs to one operator
+   (IMSI MCC+MNC, the `N` field): a SIM from another operator starts afresh, another SIM from the same operator
+   keeps it; and with 4G skipped, no 2G after 15 s switches to 4G in the same power-on (2G switched off, or a 4G-only
+   SIM such as Jio), so a unit can't sit on a mode that has gone until the next full check. Simulated per day: good 4G 1.0 s of 4G search per slot,
+   2G-only 0.8 s, 4G-without-data 0.1 s with 4 first sends delayed a slot, then adaptive wake (measure first).
 
 **Then:** KSNDMC_TRG on the bench (after the long run), then KSNDMC_TWS last (needs sensors); health report twice a
 day (01:00 and 13:00) with SEND HEALTH; OTA through the health server with a signature check; production settings

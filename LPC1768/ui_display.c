@@ -803,7 +803,12 @@ static void vFwUpdate_Task(void *pvParameters)
         if (r == FW_OK) {
             fw_restart_for_install("New firmware staged and checked, restarting to install");
         }
-        storage_log_debug("ERROR", fw_update_error_text(r));
+        {
+            char why[72];
+            snprintf(why, sizeof(why), "Update stopped: %s (result %d, flash status %lu)", fw_update_error_text(r), (int)r,
+                     (unsigned long)fw_hal_last_status);
+            storage_log_debug("ERROR", why);
+        }
         fw_show(FW_UI_MESSAGE, "UPDATE STOPPED", fw_update_error_text(r));
         break;
     }
@@ -1382,9 +1387,10 @@ void ui_enter_sleep(void)
         return;
     }
 
-    /* Never power down over a 15-minute slot, or with GPS searching */
-    if (s_slot_busy || s_gps_running || s_fw_running || slot_scheduler_is_due()) {
-        storage_log_debug("PWR", "Sleep refused: 15-minute slot is due or running");
+    /* Never power down over a 15-minute slot, with GPS searching, or before new firmware is confirmed */
+    if (s_slot_busy || s_gps_running || s_fw_running || slot_scheduler_is_due() || fw_app_trial_unconfirmed()) {
+        storage_log_debug("PWR", fw_app_trial_unconfirmed() ? "Sleep refused: new firmware not yet confirmed"
+                                                            : "Sleep refused: 15-minute slot is due or running");
         s_inactivity_ticks = 0;
         return;
     }
@@ -1465,12 +1471,33 @@ void ui_enter_sleep(void)
      * On bench power (debugger probe supplying 3.3V), LPC1768 sits in this low-power loop.
      * When LPC845 restores power rails ('U' or 'G') on DSP key or 15-minute slot,
      * LPC1768 triggers NVIC_SystemReset(), rebooting cleanly into active operation! */
+    /* Still running 10 s after $f7 means the LPC845 missed it (a lost frame): send it again, up to
+     * 3 times. Otherwise this chip would stay powered until the next slot. Harmless on bench power,
+     * where the probe keeps this chip running anyway. */
+    uint32_t since_f7_ms = 0;
+    int f7_resends = 0;
     while (s_system_asleep) {
         vTaskDelay(200 / portTICK_RATE_MS);
+        wd_checkin();   /* Waiting here is not a hang: no false "stopped responding" restart */
         if (intermcu_is_rails_active()) {
             s_system_asleep = false;
             storage_log_debug("PWR", "LPC845 awakened rails -> resetting LPC1768");
             NVIC_SystemReset();
+        }
+        since_f7_ms += 200;
+        if (since_f7_ms >= 10000 && f7_resends < 3 && slot_scheduler_is_due()) {
+            /* A slot came due while still powered: run it instead of cutting power under it */
+            storage_log_debug("PWR", "Still powered after $f7 and a slot is due: restarting to run it");
+            storage_log_flush();
+            NVIC_SystemReset();
+        }
+        if (since_f7_ms >= 10000 && f7_resends < 3) {
+            since_f7_ms = 0;
+            f7_resends++;
+            storage_log_debug("PWR", f7_resends < 3 ? "Still powered 10s after $f7: sending it again"
+                                                    : "Still powered 10s after $f7: sending it a last time");
+            storage_log_flush();
+            hal_power_sleep_system();
         }
     }
 }
@@ -1757,11 +1784,13 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
 /* Operator asked for power save: if a slot is running, power down once it has finished */
 static void request_power_save(void)
 {
-    if (s_slot_busy || slot_scheduler_is_due()) {
-        storage_log_debug("PWR", "Power save deferred until 15-minute slot finishes");
+    if (s_slot_busy || slot_scheduler_is_due() || fw_app_trial_unconfirmed()) {
+        bool trial = fw_app_trial_unconfirmed() && !s_slot_busy && !slot_scheduler_is_due();
+        storage_log_debug("PWR", trial ? "Power save deferred until the new firmware is confirmed"
+                                       : "Power save deferred until 15-minute slot finishes");
         s_sleep_deferred = true;
         lcd_command(0x80);
-        lcd_print("SENDING DATA... ");
+        lcd_print(trial ? "CHECKING NEW F/W" : "SENDING DATA... ");
         lcd_command(0xC0);
         lcd_print("SLEEP WHEN DONE ");
         vTaskDelay(1500 / portTICK_RATE_MS);
@@ -1916,7 +1945,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
     }
 
     /* Operator-requested power save, deferred while a slot was running */
-    if (s_sleep_deferred && !s_slot_busy && !slot_scheduler_is_due()) {
+    if (s_sleep_deferred && !s_slot_busy && !slot_scheduler_is_due() && !fw_app_trial_unconfirmed()) {
         s_sleep_deferred = false;
         ui_enter_sleep();
         return;

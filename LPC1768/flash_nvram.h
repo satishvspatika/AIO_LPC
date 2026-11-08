@@ -25,6 +25,14 @@ typedef struct __attribute__((packed)) {
 } station_nvram_params_t;
 
 void flash_nvram_init(void);
+/* What flash_nvram_init found, to log once the card is up */
+typedef enum {
+    NVRAM_OK,            /* Settings present */
+    NVRAM_NEW_UNIT,      /* Blank and no records: the build default ID is expected */
+    NVRAM_ID_RECOVERED,  /* Blank, ID taken from the newest stored record */
+    NVRAM_ID_LOST        /* Blank, records present but no ID in them: running as the build default */
+} nvram_init_state_t;
+nvram_init_state_t flash_nvram_init_state(void);
 const char *flash_nvram_get_station_id(void);
 bool flash_nvram_set_station_id(const char *new_id);
 const char *flash_nvram_get_last_logged(void);

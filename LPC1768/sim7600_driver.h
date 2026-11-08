@@ -17,6 +17,8 @@ typedef struct {
 
 void sim7600_init(void);
 bool sim7600_power_on(void);
+/* After a slot: lets the radio mode learning (net_policy.c) know whether the mode it used delivered */
+void sim7600_note_slot_delivery(bool delivered, bool network_fault);
 
 /* The last power-on found no usable SIM */
 bool sim7600_sim_missing(void);

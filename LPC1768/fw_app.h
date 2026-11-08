@@ -41,4 +41,10 @@ const char *fw_app_845_version(void);
 /* The running image's CRC32, to spot a file that is the same firmware */
 uint32_t fw_app_running_crc(void);
 
+/* Status of the last flash command that failed (UM10360 IAP code), 0 if none */
+extern uint32_t fw_hal_last_status;
+
+/* True from an update restart until the new firmware is confirmed healthy (about 30 s) */
+bool fw_app_trial_unconfirmed(void);
+
 #endif /* FW_APP_H */

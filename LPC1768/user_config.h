@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.9.13"
+#define FIRMWARE_VERSION    "v6.9.20"
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
 #define ENABLE_TEST_SEND    0
@@ -53,6 +53,11 @@
 #define ERRORS_FILENAME         "ERRORS.TXT"    /* Copy of the flash error log, at most 64 KB */
 #define ERRORS_OLD_FILENAME     "ERRORS.OLD"    /* The previous 64 KB */
 #define ERRORS_SYNC_FILENAME    "ERRSYNC.DAT"
+/* Automatic GPS searches in slots (01:00, 07:00, 13:00, 19:00 with no position). Off from v6.9.20: the GPS
+ * has never got a fix on these boards, and each search kept the modem on 90 s more (about 6 minutes a
+ * day). Searching from the GPS menu still works. Set to 1 once the GPS gets fixes. */
+#define GPS_AUTO_SEARCH         0
+
 #define RAT_MODE_FILENAME       "RATMODE.DAT"
 #define LAST_SLOT_FILENAME      "LASTSLOT.DAT"
 #define FLASH_SYNC_FILENAME     "FLASHSYN.DAT"

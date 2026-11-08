@@ -50,7 +50,8 @@ def depth(n,path=()):
     r=(frames.get(n,0)+best[0],[n]+best[1])
     memo[n]=r
     return r
-limits={'vFwUpdate_Task':768,'vGps_Task':768,'vTestSend_Task':768,'vStatusSms_Task':768,'vMain_Task':960,'vModem_Task':768,'vUi_Task':512,'vDisk_Task':512,'vKbd_Task':160}
+# Words, as given to xTaskCreate (main.c, ui_display.c): keep in step with the firmware
+limits={'vFwUpdate_Task':896,'vGps_Task':896,'vTestSend_Task':896,'vStatusSms_Task':896,'vMain_Task':1088,'vModem_Task':832,'vUi_Task':512,'vDisk_Task':512,'vKbd_Task':160}
 print('%-18s %6s %6s %6s'%('task','need','have','spare'))
 for t,w in limits.items():
     memo.clear(); d=depth(t)

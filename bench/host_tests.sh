@@ -9,3 +9,4 @@ cc $F -o $O/ut update_test.c ../../fw_update.c ../boot_core.c ../fw_journal.c
 $O/ut $R/LPC1768/Debug/fw_bihar.hex 1 | tail -1
 $O/ut ${OUT:-/tmp/aio_bench}/b699/KSNDMC_TRG/LPC1768/Debug/fw_ksn_trg.hex 0 | tail -1
 $O/ut ${OUT:-/tmp/aio_bench}/b699/KSNDMC_TWS/LPC1768/Debug/fw_ksn_tws.hex 2 | tail -1
+cc $F -I$R/LPC1768 -o $O/npt $R/LPC1768/tests/net_policy_test.c $R/LPC1768/net_policy.c && $O/npt | tail -1

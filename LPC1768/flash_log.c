@@ -100,8 +100,14 @@ static bool iap_erase_sector(uint32_t index)
     return false;
 }
 
+/* The flash write takes its data from main RAM: a caller's stack (in AHB SRAM) can be a source the boot
+ * ROM refuses (see fw_app.c, s_iap_src) */
+static uint32_t s_page_src[PAGE_SIZE / 4];
+
 static bool iap_write_page(uint32_t page, const void *src)
 {
+    memcpy(s_page_src, src, PAGE_SIZE);
+    src = s_page_src;
     uint32_t sector = FIRST_SECTOR + page / PAGES_PER_SECTOR;
     for (size_t c = 0; c < sizeof(s_cclk_khz) / sizeof(s_cclk_khz[0]); c++) {
         if (!iap_prepare(sector)) {

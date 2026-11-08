@@ -13,6 +13,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include <stdio.h>
+#include <string.h>
 
 /* Reserved vector 8 points here. scripts/fw_image.py fills in length and crc32 after linking. */
 __attribute__((used))
@@ -28,6 +29,7 @@ const fw_image_info_t g_fw_image_info = {
 #define IAP_LOCATION    0x1FFF1FF1UL
 #define CONFIRM_AFTER_SEC    30
 #define CONFIRM_MIN_FRAMES   5
+#define TRIAL_HOLD_MAX_SEC   120  /* Sleep waits for confirmation at most this long after start */
 
 typedef void (*iap_entry_t)(unsigned long[], unsigned long[]);
 static const iap_entry_t iap_call = (iap_entry_t)IAP_LOCATION;
@@ -47,14 +49,26 @@ const uint8_t *fw_hal_ptr(uint32_t addr)
     return (const uint8_t *)addr;
 }
 
+/* Status of the last flash command that failed (0 = none yet), for the log: 4 = source not mapped,
+ * 9 = sector not prepared, and so on (UM10360 IAP status codes) */
+uint32_t fw_hal_last_status = 0;
+
 /* Interrupts stay off during flash commands: code can't run from flash meanwhile */
 static bool iap_run(void)
 {
     __disable_irq();
     iap_call(s_cmd, s_res);
     __enable_irq();
+    if (s_res[0] != 0) {
+        fw_hal_last_status = s_res[0];
+    }
     return s_res[0] == 0;
 }
+
+/* The chip's flash write takes its data from main RAM here. Task stacks are in the heap in AHB SRAM,
+ * and from v6.9.15 (20 KB heap) a task made later sits across or above 0x20080000, a source the boot
+ * ROM refused: v6.9.15 could not stage an update ("UPDATE STOPPED FLASH ERROR", 1922, 2026-11-08). */
+static uint32_t s_iap_src[64];
 
 static uint32_t sector_of(uint32_t addr)
 {
@@ -88,6 +102,11 @@ bool fw_hal_erase(uint32_t sector)
 
 bool fw_hal_program(uint32_t addr, const void *src, uint32_t len)
 {
+    if (len > sizeof(s_iap_src)) {
+        return false;
+    }
+    memcpy(s_iap_src, src, len);
+    src = s_iap_src;
     for (unsigned c = 0; c < sizeof(s_cclk_khz) / sizeof(s_cclk_khz[0]); c++) {
         if (!iap_prepare(sector_of(addr))) {
             continue;
@@ -280,6 +299,15 @@ static void ctrl_step(uint32_t uptime_sec, uint32_t good_frames)
     }
     s_tries++;
     fw_ctrl_tx("$UQ;\n");
+}
+
+/* New firmware not yet confirmed: power must stay on until it is (about 30 s after start), or the boot
+ * counts as a failed trial and three of those in a row put the old firmware back */
+bool fw_app_trial_unconfirmed(void)
+{
+    /* Never longer than 2 minutes: if confirming can't happen (no LPC845 frames, journal write
+     * failing), holding power on would only run the battery down */
+    return s_on_trial && !s_confirmed && (xTaskGetTickCount() / configTICK_RATE_HZ) < TRIAL_HOLD_MAX_SEC;
 }
 
 void fw_app_step(uint32_t uptime_sec, uint32_t good_frames)

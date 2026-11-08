@@ -71,8 +71,13 @@ static bool iap_erase(uint32_t sector)
     return false;
 }
 
+/* From main RAM: a caller's stack (in AHB SRAM) can be a source the boot ROM refuses (fw_app.c) */
+static uint32_t s_page_src[PAGE_SIZE / 4];
+
 static bool iap_write(uint32_t page, const void *src)
 {
+    memcpy(s_page_src, src, PAGE_SIZE);
+    src = s_page_src;
     uint32_t sector = ERRLOG_FIRST_SECTOR + page / PAGES_PER_SECTOR;
     for (size_t c = 0; c < sizeof(s_cclk_khz) / sizeof(s_cclk_khz[0]); c++) {
         if (!iap_prepare(sector)) {

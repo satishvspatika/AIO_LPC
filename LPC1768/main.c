@@ -149,6 +149,7 @@ static void vUi_Task(void *pvParameters)
  * Every slot must end in one of: delivered, saved to backlog, or logged as lost. */
 #define SLOT_MODEM_WAIT_SEC     120 /* How long to wait for SMS/supervisor to free the modem */
 #define SLOT_MODEM_POWER_TRIES  2   /* Modem boot + network registration attempts */
+#define MODEM_RAIL_OFF_SEC      3   /* 3.8V rail held off between those, so a hung modem really restarts */
 #define NO_NETWORK_SLOTS_BEFORE_ONE_TRY 4   /* About an hour with no network: one try per slot */
 #define SLOT_SEND_BUDGET_SEC    300 /* No new send starts past this, so bad signal can't drain the battery */
 #define REJECTIONS_ALLOWED      3   /* Separate slots, as a wrong clock can cause one and gets corrected */
@@ -288,12 +289,15 @@ static void sync_flash_records_to_sd(void)
             break;
         }
         synced = rec->seq;
+        /* Noted after every record: a power cut or restart part way through a catch-up then repeats
+         * only the newest row, which storage_archive_slot recognises. Noted once at the end, every
+         * row copied before the cut would be written to the card a second time. */
+        snprintf(line, sizeof(line), "%010lu\r\n", (unsigned long)synced);
+        storage_state_save(FLASH_SYNC_FILENAME, line);
         hal_power_heartbeat();
     }
 
     if (synced != start) {
-        snprintf(line, sizeof(line), "%010lu\r\n", (unsigned long)synced);
-        storage_state_save(FLASH_SYNC_FILENAME, line);
         snprintf(s_slot_line, sizeof(s_slot_line), "SD card updated from flash up to record %lu", (unsigned long)synced);
         storage_log_debug("SDC", s_slot_line);
     }
@@ -357,6 +361,7 @@ static slot_result_t save_slot_for_retry(const telemetry_data_t *telem, const ch
 
 /* Power: GPS only runs in a slot's own modem time, and at set slots, so nothing needs storing to
  * count tries. No position: 01:00, 07:00, 13:00 and 19:00. Position saved: one check at 13:00. */
+#if GPS_AUTO_SEARCH
 static void __attribute__((noinline)) gps_auto_step(const telemetry_data_t *telem)
 {
     int slot_of_day = (int)(s_archive_slot_id % 96);
@@ -373,6 +378,7 @@ static void __attribute__((noinline)) gps_auto_step(const telemetry_data_t *tele
     hal_power_heartbeat();
     sim7600_gps_update(today);
 }
+#endif
 
 static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out_attempts, int *out_csq, const char **out_reason)
 {
@@ -422,6 +428,12 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
             }
             if (attempt < power_tries) {
                 sim7600_power_off();
+                /* A hung modem only restarts if its 3.8V rail is really off for a while: switched
+                 * straight back on, the supply barely dips */
+                for (int w = 0; w < MODEM_RAIL_OFF_SEC; w++) {
+                    wd_checkin();
+                    vTaskDelay(1000 / portTICK_RATE_MS);
+                }
             }
         }
     }
@@ -481,6 +493,10 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                 vTaskDelay(3000 / portTICK_RATE_MS);
             }
         }
+
+        /* Teaches the radio mode choice: a send lost to the network counts against the mode it used, a
+         * server refusal doesn't */
+        sim7600_note_slot_delivery(post_ok, !post_ok && !sim7600_post_rejected());
 
         if (post_ok) {
             result = SLOT_SENT;
@@ -597,9 +613,11 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
         }
 
         /* The record has gone out, so this can't delay it */
+#if GPS_AUTO_SEARCH
         if (SLOT_BUDGET_LEFT()) {
             gps_auto_step(telem);
         }
+#endif
 
         /* Check and process incoming operator SMS */
         sim7600_check_incoming_sms(telem);
@@ -948,9 +966,10 @@ static bool lpc845_link_alive(void)
 }
 
 /* The LPC845 names each slot by its own clock. With that clock lost (RTC reset to 2000, or read as
- * zeros) the name is invalid, so the slot is named from this clock, already checked by the scheduler,
- * rounded down to the quarter hour. The rain is still the count the LPC845 closed for the slot. */
-static void __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data_t *telem)
+ * zeros) the name is invalid, so the slot gets this clock's name for it (taken when the slot began:
+ * the gap fill and hold that follow could run past the next boundary). The rain is still the count
+ * the LPC845 closed for the slot. */
+static void __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data_t *telem, const char *own_name)
 {
     const char *st = telem->slot_time;
     bool valid = strlen(st) >= 12;
@@ -966,15 +985,32 @@ static void __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data
     if (valid) {
         return;
     }
-    const char *p = telem->present_time;
-    int min = (p[10]-'0')*10 + (p[11]-'0');
     char was[16];
     strncpy(was, st, sizeof(was) - 1);
     was[sizeof(was) - 1] = '\0';
-    snprintf(telem->slot_time, sizeof(telem->slot_time), "%.10s%02d00", p, (min / 15) * 15);
+    snprintf(telem->slot_time, sizeof(telem->slot_time), "%.14s", own_name);
     snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 clock was lost or not yet set (its slot %.14s): slot named %.14s from this clock",
              was[0] ? was : "none", telem->slot_time);
     storage_log_debug("ERROR", s_slot_line);
+}
+
+/* A value no gauge or battery can give points at a fault (a damaged frame that passed its check, a
+ * broken divider). It is logged so it shows in ERRORS.TXT, and sent as read: nothing is invented. */
+#define SANE_RAIN_15M_MAX_MM  100.0f  /* 200 tips in 15 minutes */
+/* No battery range check yet: the battery (12 V now, possibly 3.3-3.7 V) waits for the new power
+ * design, and its limits will come with the low-voltage cut-off as a per-unit setting. */
+static void __attribute__((noinline)) note_values_out_of_range(const telemetry_data_t *telem)
+{
+    char v[8];
+#if (UNIT_CFG != KSNDMC_TWS)
+    if (telem->rf_15m_mm > SANE_RAIN_15M_MAX_MM) {
+        fmt_fixed(v, sizeof(v), telem->rf_15m_mm, 5, 2);
+        snprintf(s_slot_line, sizeof(s_slot_line), "15-min rain %s mm is beyond any real rain: check the gauge and LPC845", v);
+        storage_log_debug("ERROR", s_slot_line);
+    }
+#else
+    (void)telem; (void)v;
+#endif
 }
 
 #if (UNIT_CFG != KSNDMC_TWS)
@@ -1015,6 +1051,10 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     s_last_slot_id = slot_id;
     const portTickType slot_begin = xTaskGetTickCount();
 
+    /* This clock's name for the slot, from the time the scheduler just checked */
+    char own_name[16];
+    snprintf(own_name, sizeof(own_name), "%.10s%02d00", telem->present_time, ((min % 60) / 15) * 15);
+
     /* With the LPC845 silent (hung, or on a failed firmware trial) there's no rain, battery or
      * total to report, and a record of zeros would pull CUM_RF down. So nothing is sent or stored.
      * This slot stays unmarked, so the first good slot afterwards fills it in the usual way. */
@@ -1046,10 +1086,11 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     }
     /* Re-read fresh telemetry */
     intermcu_get_telemetry(telem);
-    name_slot_if_845_clock_lost(telem);
+    name_slot_if_845_clock_lost(telem, own_name);
 #if (UNIT_CFG != KSNDMC_TWS)
     keep_cum_from_dipping(telem);
 #endif
+    note_values_out_of_range(telem);
 
     const char *boot_mode = ui_was_scheduled_boot() ? "SCHEDULED" : "OPERATOR";
     char s_bat[8], s_rf15[8], s_rfday[8];
@@ -1126,6 +1167,15 @@ static void __attribute__((noinline)) log_boot_header(void)
              (s_reset_reason & 0x08) ? " BROWNOUT" : "",
              (s_reset_reason == 0) ? " SOFTWARE" : "");
     storage_log_debug("BOOT", boot_info);
+    if (flash_nvram_init_state() == NVRAM_ID_RECOVERED) {
+        snprintf(boot_info, sizeof(boot_info), "Settings sector was blank (power lost while saving?): station ID %s taken from the newest record",
+                 flash_nvram_get_station_id());
+        storage_log_debug("ERROR", boot_info);
+    } else if (flash_nvram_init_state() == NVRAM_ID_LOST) {
+        snprintf(boot_info, sizeof(boot_info), "Settings sector was blank and no record holds a station ID: running as %s, set the ID",
+                 flash_nvram_get_station_id());
+        storage_log_debug("ERROR", boot_info);
+    }
     log_previous_crash();
 
     uint32_t bk_count = storage_backlog_get_pending_count();
@@ -1307,7 +1357,9 @@ int main(void)
     /* Create FreeRTOS Tasks */
     /* UiTask at Priority 3 guarantees instant keypad scan and screen responsiveness */
     xTaskCreate(vUi_Task,     (const signed char *)"UiTask",     512, NULL, 3, &s_ui_task);
-    xTaskCreate(vModem_Task,  (const signed char *)"ModemTask",  512, NULL, 2, &s_modem_task);
+    /* 832 words: an SMS command reply that fails, restarts a silent modem and syncs the clock needs
+     * about 2.9 KB here (static analysis), more than the 512 words it had from v6.9.10 */
+    xTaskCreate(vModem_Task,  (const signed char *)"ModemTask",  832, NULL, 2, &s_modem_task);
     xTaskCreate(vMain_Task,   (const signed char *)"MainTask",   1088, NULL, 1, &s_main_task);
     xTaskCreate(vDisk_Task,   (const signed char *)"DiskTask",   512, NULL, 1, &s_disk_task);
     wd_register(WD_UI, s_ui_task);

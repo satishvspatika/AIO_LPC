@@ -52,3 +52,9 @@ LPC845/main.o
 
 # LPC845 objects from the GCC build
 LPC845/build_gcc/
+
+# Regenerated on every build
+LPC1768/Debug/LPC1768_AIO.bin.sdname
+LPC1768/Debug/journal_blank.bin
+LPC1768/Debug/journal_blank.hex
+LPC845/LPC845_TWS.map

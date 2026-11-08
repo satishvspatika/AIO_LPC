@@ -14,6 +14,35 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "net_policy.h"
+
+#define NET_VOICE_ONLY_WAIT_SEC 8   /* CREG registered: this long for data registration before going on */
+
+static net_policy_t s_net;      /* Radio mode learning, kept in RATMODE.DAT between power-ons */
+static int s_net_mode = 0;      /* Mode this power-on registered on: NET_4G, NET_2G or 0 */
+
+static void save_net_policy(void)
+{
+    char text[NET_POLICY_TEXT_LEN + 8];
+    net_policy_format(&s_net, text, sizeof(text));
+    storage_state_save(RAT_MODE_FILENAME, text);
+}
+
+void sim7600_note_slot_delivery(bool delivered, bool network_fault)
+{
+    if (s_net_mode == 0) {
+        return;
+    }
+    net_policy_t before = s_net;
+    net_policy_delivery(&s_net, s_net_mode, delivered, network_fault);
+    if (memcmp(&before, &s_net, sizeof(s_net)) != 0) {
+        save_net_policy();
+        if (before.primary != s_net.primary) {
+            storage_log_debug("MODEM", s_net.primary == NET_2G ? "4G registers but can't send here: 2G first from now"
+                                                               : "Back to 4G first");
+        }
+    }
+}
 
 #define UART_MODEM      LPC_UART2
 #define PIN_SIM_SEL     0       /* P0.0: SIM select (Output LOW = Holder J1A) */
@@ -167,9 +196,15 @@ void sim7600_init(void)
     UART_TxCmd(UART_MODEM, ENABLE);
 }
 
-static void send_raw(const char *cmd)
+/* Routine commands whose replies tell nothing (an empty SMS list every few seconds, closing a socket
+ * that is already closed) are kept out of the log, so it shows what matters */
+static bool s_log_quiet = false;
+
+static void __attribute__((noinline)) send_raw(const char *cmd)
 {
-    storage_log_debug("MODEM_TX", cmd);
+    if (!s_log_quiet) {
+        storage_log_debug("MODEM_TX", cmd);
+    }
     UART_Send(UART_MODEM, (uint8_t *)cmd, strlen(cmd), BLOCKING);
 }
 
@@ -228,7 +263,9 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
                     strncpy(out_capture, s_rx_temp, capture_size - 1);
                     out_capture[capture_size - 1] = '\0';
                 }
-                storage_log_debug("MODEM_RX", s_rx_temp);
+                if (!s_log_quiet) {
+                    storage_log_debug("MODEM_RX", s_rx_temp);
+                }
                 s_rx_tail = head;
                 return true;
             }
@@ -241,7 +278,9 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
                     strncpy(out_capture, s_rx_temp, capture_size - 1);
                     out_capture[capture_size - 1] = '\0';
                 }
-                storage_log_debug("MODEM_ERR", s_rx_temp);
+                if (!s_log_quiet) {
+                    storage_log_debug("MODEM_ERR", s_rx_temp);
+                }
                 s_rx_tail = head;
                 return false;
             }
@@ -259,8 +298,22 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
     }
     s_rx_temp[idx] = '\0';
     snprintf(timeout_msg, sizeof(timeout_msg), "No '%s' in %ums. Got: %.60s", expected, (unsigned int)timeout_ms, s_rx_temp);
-    storage_log_debug("MODEM_TIMEOUT", timeout_msg);
+    if (!s_log_quiet) {
+        storage_log_debug("MODEM_TIMEOUT", timeout_msg);
+    }
     return false;
+}
+
+/* Socket 0 is closed before every connect and after every send, open or not: "+CIPCLOSE: 0,4 ERROR"
+ * (not open) is the usual answer and means nothing */
+static void close_socket_quiet(uint32_t wait_ms)
+{
+    s_log_quiet = true;
+    send_raw("AT+CIPCLOSE=0\r\n");
+    if (wait_ms > 0) {
+        wait_response("OK", wait_ms, NULL, 0);
+    }
+    s_log_quiet = false;
 }
 
 static void parse_cops_operator(const char *cops_resp, char *out_carrier, size_t max_len)
@@ -387,6 +440,10 @@ static void sim7600_ntp_sync_step(void)
 }
 
 /* APN from the SIM (ESP32 get_network rules). An unknown SIM gets airtelgprs.com. */
+/* The SIM's operator, from its ICCID/IMSI: data recovery tries only that operator's APNs */
+typedef enum { APN_OP_UNKNOWN = 0, APN_OP_BSNL, APN_OP_AIRTEL, APN_OP_JIO, APN_OP_VI } apn_op_t;
+static apn_op_t s_apn_op = APN_OP_UNKNOWN;
+
 static const char *select_apn(const char *iccid, const char *imsi)
 {
     static const char *const bsnl_iccid[] = {"89917", "89913", "89915"};
@@ -402,21 +459,27 @@ static const char *select_apn(const char *iccid, const char *imsi)
         bsnl = bsnl || (strncmp(imsi, bsnl_imsi[i], 5) == 0);
     }
 
+    s_apn_op = APN_OP_UNKNOWN;
     if (bsnl) {
         apn = "bsnlnet";
         carrier = "BSNL";
+        s_apn_op = APN_OP_BSNL;
     } else if (strncmp(iccid, "899116", 6) == 0 || strncmp(iccid, "899110", 6) == 0 || strncmp(iccid, "899145", 6) == 0) {
         /* Airtel IoT/M2M SIMs */
         apn = "airteliot.com";
         carrier = "Airtel";
+        s_apn_op = APN_OP_AIRTEL;
     } else if (strncmp(imsi, "40586", 5) == 0 || strncmp(imsi, "40587", 5) == 0) {
         apn = "jionet";
         carrier = "Jio";
+        s_apn_op = APN_OP_JIO;
     } else if (strncmp(imsi, "40411", 5) == 0 || strncmp(imsi, "40420", 5) == 0) {
         apn = "www";
         carrier = "Vi";
+        s_apn_op = APN_OP_VI;
     } else if (strncmp(imsi, "40445", 5) == 0 || strncmp(imsi, "40552", 5) == 0) {
         carrier = "Airtel";
+        s_apn_op = APN_OP_AIRTEL;
     }
 
     if (carrier[0]) {
@@ -439,6 +502,7 @@ bool sim7600_power_on(void)
     }
 
     report_progress("MODEM POWER ON ");
+    s_net_mode = 0;   /* Set again only if this power-on registers */
 
     /* 1. Turn ON 3.8V rail via LPC845 sentry command ($n2;) */
     hal_power_modem_on();
@@ -509,13 +573,24 @@ bool sim7600_power_on(void)
     report_progress("CHECKING SIM... ");
     char capture[256];
     bool sim_ready = false;
+    int not_inserted = 0;
     for (int i = 0; i < 15; i++) {
         if (sim7600_is_cancel_requested()) return false;
         clear_rx();
         send_raw("AT+CPIN?\r\n");
-        if (wait_response("+CPIN: READY", 1000, NULL, 0)) {
+        capture[0] = '\0';
+        if (wait_response("+CPIN: READY", 1000, capture, sizeof(capture))) {
             sim_ready = true;
             break;
+        }
+        /* A definite "not inserted" three times running (the SIM is read in the first second or two):
+         * no radio restart or longer wait will find it, so stop now instead of after about 30 s */
+        not_inserted = strstr(capture, "not inserted") ? not_inserted + 1 : 0;
+        if (not_inserted >= 3) {
+            s_sim_missing = true;
+            storage_log_debug("ERROR", "No SIM inserted: not trying to register");
+            report_progress("NO SIM CARD     ");
+            return false;
         }
         delay_ms(1000);
     }
@@ -597,62 +672,105 @@ bool sim7600_power_on(void)
     send_raw("AT+CSOCKSETPN=1\r\n");
     wait_response("OK", 1000, NULL, 0);
 
-    /* 7. Radio Mode Selection (ESP32 flow): start on the mode that last worked (4G by default),
-     * then try the other after 5 polls. The last mode is kept on SD; this chip powers off. */
-    char rat_saved[8] = "";
-    int rat_mode = 38;
-    if (storage_state_load(RAT_MODE_FILENAME, rat_saved, sizeof(rat_saved)) && atoi(rat_saved) == 13) {
-        rat_mode = 13;
+    /* 7. Radio mode, learned per site (net_policy.c): 4G first, for about twice its usual registration
+     * time; where 2G is what works, a short 4G look or none, with a full 4G search every 16th power-on.
+     * The state is RATMODE.DAT on SD (fixed length); with no card it starts from the defaults. */
+    char rat_saved[NET_POLICY_TEXT_LEN + 8] = "";
+    storage_state_load(RAT_MODE_FILENAME, rat_saved, sizeof(rat_saved));
+    net_policy_parse(&s_net, rat_saved);
+    char old_op[6];
+    memcpy(old_op, s_net.op, sizeof(old_op));
+    if (net_policy_set_operator(&s_net, imsi)) {
+        snprintf(capture, sizeof(capture), "SIM operator changed (%s to %.5s): radio mode learning starts again", old_op, imsi);
+        storage_log_debug("MODEM", capture);
     }
-    int rat_at_boot = rat_mode;
+    const net_plan_t plan = net_policy_plan(&s_net);
+    bool searched_4g = plan.search_4g;
+    portTickType mode_switch_tick = 0;
+    int rat_mode = plan.search_4g ? 38 : 13;
     char rat_cmd[20];
     snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
     send_raw(rat_cmd);
     wait_response("OK", 1000, NULL, 0);
+    snprintf(capture, sizeof(capture), plan.search_4g ? "Searching 4G for up to %us%s" : "4G no use here lately: straight to 2G",
+             (unsigned)plan.wait_4g_sec, plan.full_probe ? " (full 4G check)" : "");
+    storage_log_debug("MODEM", capture);
 
-    /* 8. Registration Polling (check LTE CEREG, GPRS CGREG, and GSM CREG) */
+    /* 8. Registration. Data needs 4G (CEREG) or packet (CGREG) registration: CREG alone is voice and
+     * SMS only, and a send then fails after a long wait (1922, 13:15 on 2026-11-08). So with CREG
+     * alone it waits a few seconds more for data, then goes on anyway (SMS still works). */
     report_progress("SEARCHING NET...");
     bool registered = false;
+    int reg_mode = 0;
+    uint8_t sec_to_4g = 0;
+    const portTickType search_begin = xTaskGetTickCount();
+    portTickType voice_only_since = 0;
+    /* The mode is the one the modem was held to when it registered: in 4G-only mode it can only be on
+     * 4G, whichever of CEREG/CGREG/CREG reports it first (BIHAR's modem answers CGREG on LTE) */
+    #define MODE_NOW() ((rat_mode == 38) ? NET_4G : NET_2G)
     for (int i = 0; i < 25; i++) {
         if (sim7600_is_cancel_requested()) return false;
+        uint32_t searched_sec = (uint32_t)((xTaskGetTickCount() - search_begin) / configTICK_RATE_HZ);
 
-        if (i == 5) {
-            rat_mode = (rat_mode == 38) ? 13 : 38;
+        /* 4G skipped as no use here, but 2G isn't answering either (switched off, or another operator's
+         * SIM): 4G gets the rest of this search rather than waiting hours for the next full check */
+        if (rat_mode == 13 && !searched_4g && searched_sec >= NET_2G_ONLY_WAIT_SEC) {
+            rat_mode = 38;
+            searched_4g = true;
+            mode_switch_tick = xTaskGetTickCount();
             snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
-            storage_log_debug("MODEM", "No registration after 5 polls, switching radio mode");
+            snprintf(capture, sizeof(capture), "No 2G after %lus: trying 4G", (unsigned long)searched_sec);
+            storage_log_debug("MODEM", capture);
+            send_raw(rat_cmd);
+            wait_response("OK", 1000, NULL, 0);
+        } else if (rat_mode == 38 && plan.search_4g && searched_sec >= plan.wait_4g_sec) {
+            rat_mode = 13;
+            snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
+            snprintf(capture, sizeof(capture), "No 4G after %lus: trying 2G", (unsigned long)searched_sec);
+            storage_log_debug("MODEM", capture);
             send_raw(rat_cmd);
             wait_response("OK", 1000, NULL, 0);
         }
 
-        /* Check LTE CEREG */
         clear_rx();
         send_raw("AT+CEREG?\r\n");
-        if (wait_response("+CEREG: ", 800, capture, sizeof(capture))) {
-            if (strstr(capture, ",1") || strstr(capture, ",5")) {
-                registered = true;
-                storage_log_debug("MODEM", "Registered on LTE (+CEREG: 1/5)");
-                break;
-            }
+        bool cereg_answered = wait_response("+CEREG: ", 800, capture, sizeof(capture));
+        if (cereg_answered && rat_mode == 38 && strstr(capture, "+CEREG: 0,3")) {
+            /* The network refused 4G registration (1922, 17:45): waiting out the 4G time can't help */
+            rat_mode = 13;
+            snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
+            storage_log_debug("MODEM", "4G registration denied by the network: trying 2G now");
+            send_raw(rat_cmd);
+            wait_response("OK", 1000, NULL, 0);
+            continue;
+        }
+        if (cereg_answered && (strstr(capture, ",1") || strstr(capture, ",5"))) {
+            registered = true;
+            reg_mode = NET_4G;
+            sec_to_4g = (uint8_t)(((xTaskGetTickCount() - (mode_switch_tick ? mode_switch_tick : search_begin)) / configTICK_RATE_HZ) + 1);
+            storage_log_debug("MODEM", "Registered on LTE (+CEREG: 1/5)");
+            break;
         }
 
-        /* Check GPRS CGREG */
         clear_rx();
         send_raw("AT+CGREG?\r\n");
-        if (wait_response("+CGREG: ", 800, capture, sizeof(capture))) {
-            if (strstr(capture, ",1") || strstr(capture, ",5")) {
-                registered = true;
-                storage_log_debug("MODEM", "Registered on GPRS (+CGREG: 1/5)");
-                break;
-            }
+        if (wait_response("+CGREG: ", 800, capture, sizeof(capture)) && (strstr(capture, ",1") || strstr(capture, ",5"))) {
+            registered = true;
+            reg_mode = MODE_NOW();
+            storage_log_debug("MODEM", rat_mode == 38 ? "Registered on LTE (+CGREG: 1/5 in 4G-only mode)" : "Registered on GPRS (+CGREG: 1/5)");
+            break;
         }
 
-        /* Check GSM CREG */
         clear_rx();
         send_raw("AT+CREG?\r\n");
-        if (wait_response("+CREG: ", 800, capture, sizeof(capture))) {
-            if (strstr(capture, ",1") || strstr(capture, ",5")) {
+        if (wait_response("+CREG: ", 800, capture, sizeof(capture)) && (strstr(capture, ",1") || strstr(capture, ",5"))) {
+            if (voice_only_since == 0) {
+                voice_only_since = xTaskGetTickCount();
+                storage_log_debug("MODEM", "Registered for voice/SMS only (+CREG): waiting for data registration");
+            } else if ((xTaskGetTickCount() - voice_only_since) / configTICK_RATE_HZ >= NET_VOICE_ONLY_WAIT_SEC) {
                 registered = true;
-                storage_log_debug("MODEM", "Registered on GSM (+CREG: 1/5)");
+                reg_mode = MODE_NOW();
+                storage_log_debug("MODEM", "Registered (+CREG: 1/5) without data registration");
                 break;
             }
         }
@@ -660,16 +778,19 @@ bool sim7600_power_on(void)
         delay_ms(1000);
     }
 
+    #undef MODE_NOW
+    if (reg_mode == NET_4G && sec_to_4g == 0) {
+        sec_to_4g = (uint8_t)(((xTaskGetTickCount() - (mode_switch_tick ? mode_switch_tick : search_begin)) / configTICK_RATE_HZ) + 1);
+    }
     if (registered) {
         report_progress("NET REGISTERED  ");
-        if (rat_mode != rat_at_boot) {
-            snprintf(rat_saved, sizeof(rat_saved), "%02d\r\n", rat_mode);
-            storage_state_save(RAT_MODE_FILENAME, rat_saved);
-        }
     } else {
         report_progress("NO NETWORK      ");
         storage_log_debug("MODEM", "Network registration timeout!");
     }
+    s_net_mode = reg_mode;
+    net_policy_registered(&s_net, searched_4g, reg_mode, sec_to_4g);
+    save_net_policy();
 
     /* 9. Read Signal Quality (AT+CSQ) */
     report_progress("READING CSQ...  ");
@@ -725,8 +846,7 @@ void sim7600_power_off(void)
     storage_log_debug("MODEM", "Powering down SIM7600 cellular engine...");
 
     clear_rx();
-    send_raw("AT+CIPCLOSE=0\r\n");
-    wait_response("OK", 500, NULL, 0);
+    close_socket_quiet(500);
 
     clear_rx();
     send_raw("AT+NETCLOSE\r\n");
@@ -1069,13 +1189,21 @@ static bool __attribute__((noinline)) reattach_on_apn(const char *apn)
     return false;
 }
 
-/* ESP32 flow: the SIM's APN first, then the fallback list, then a CGATT reset. The list stops
- * after about 3 minutes so a bad SIM can't use up the slot. If all fail, the send still runs. */
+/* The SIM's APN; then a fresh attach on that same APN (what cleared "no network service" on 1922 after
+ * BSNL 4G denied it, 2026-11-08); then only that operator's other APNs. Another operator's APN can't
+ * work on a known SIM, and each try restarts the radio, so the full list is kept for a SIM whose
+ * operator isn't known. Then a CGATT reset. The whole search stops after about 3 minutes. */
 #define BEARER_SEARCH_MAX_TICKS (180000 / portTICK_RATE_MS)
 
 static void __attribute__((noinline)) ensure_bearer(void)
 {
-    static const char *const fallback_apns[] = {"airteliot.com", "airtelgprs.com", "bsnlnet", "jionet", "bsnlm2m"};
+    static const char *const all_apns[] = {"airteliot.com", "airtelgprs.com", "bsnlnet", "jionet", "bsnlm2m", NULL};
+    static const char *const bsnl_apns[] = {"bsnlnet", "bsnlm2m", NULL};
+    static const char *const airtel_apns[] = {"airteliot.com", "airtelgprs.com", NULL};
+    static const char *const one_apn[] = {NULL};     /* Jio, Vi: their own APN only */
+    const char *const *fallback_apns = (s_apn_op == APN_OP_UNKNOWN) ? all_apns :
+                                       (s_apn_op == APN_OP_BSNL) ? bsnl_apns :
+                                       (s_apn_op == APN_OP_AIRTEL) ? airtel_apns : one_apn;
 
     if (s_bearer_ready) {
         return;
@@ -1085,8 +1213,12 @@ static void __attribute__((noinline)) ensure_bearer(void)
     portTickType start = xTaskGetTickCount();
 
     s_bearer_ready = primary[0] && activate_apn(primary);
+    if (!s_bearer_ready && primary[0]) {
+        storage_log_debug("APN", "Fresh attach on the same APN");
+        s_bearer_ready = reattach_on_apn(primary) && activate_apn(primary);
+    }
 
-    for (size_t i = 0; i < sizeof(fallback_apns) / sizeof(fallback_apns[0]) && !s_bearer_ready; i++) {
+    for (size_t i = 0; fallback_apns[i] && !s_bearer_ready; i++) {
         if (strcmp(fallback_apns[i], primary) == 0 || (xTaskGetTickCount() - start) > BEARER_SEARCH_MAX_TICKS) {
             continue;
         }
@@ -1239,8 +1371,7 @@ static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpo
     }
 
     /* Step 3: Close any stale socket 0 connection */
-    send_raw("AT+CIPCLOSE=0\r\n");
-    wait_response("OK", 1000, NULL, 0);
+    close_socket_quiet(1000);
     delay_ms(100);
 
     /* Step 4: Open Layer-4 direct TCP socket to endpoint */
@@ -1285,7 +1416,7 @@ static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpo
     send_raw(send_cmd);
     if (!wait_response(">", 5000, NULL, 0)) {
         storage_log_debug("TCP", "CIPSEND failed: No '>' prompt!");
-        send_raw("AT+CIPCLOSE=0\r\n");
+        close_socket_quiet(0);
         return false;
     }
 
@@ -1360,8 +1491,7 @@ static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpo
     }
 
     /* Step 8: Close TCP socket */
-    send_raw("AT+CIPCLOSE=0\r\n");
-    wait_response("OK", 1000, NULL, 0);
+    close_socket_quiet(1000);
 
     return success;
 }
@@ -1587,8 +1717,7 @@ static void __attribute__((noinline)) diag_get(const char *host, int port, const
     const char *result = "COULD NOT CONNECT";
 
     clear_rx();
-    send_raw("AT+CIPCLOSE=0\r\n");
-    wait_response("OK", 1000, NULL, 0);
+    close_socket_quiet(1000);
 
     snprintf(line, sizeof(line), "AT+CIPOPEN=0,\"TCP\",\"%s\",%d\r\n", host, port);
     clear_rx();
@@ -1614,8 +1743,7 @@ static void __attribute__((noinline)) diag_get(const char *host, int port, const
         }
     }
     clear_rx();
-    send_raw("AT+CIPCLOSE=0\r\n");
-    wait_response("OK", 1000, NULL, 0);
+    close_socket_quiet(1000);
 
     snprintf(line, sizeof(line), "GET %s:%d%s -> %s", host, port, path, result);
     storage_log_debug("DIAG", line);
@@ -1676,8 +1804,7 @@ static bool __attribute__((noinline)) diag_post_rxget(const http_endpoint_t *end
         }
     }
     clear_rx();
-    send_raw("AT+CIPCLOSE=0\r\n");
-    wait_response("OK", 1000, NULL, 0);
+    close_socket_quiet(1000);
     clear_rx();
     send_raw("AT+NETCLOSE\r\n");
     wait_response("+NETCLOSE", 3000, NULL, 0);
@@ -2349,9 +2476,14 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
 
 void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
 {
+    /* Polled every few seconds with the LCD on: wait for the end of the list, and log only a message */
     clear_rx();
+    s_log_quiet = true;
     send_raw("AT+CMGL=\"REC UNREAD\"\r\n");
-    if (wait_response("+CMGL:", 2000, s_sms_capture, sizeof(s_sms_capture))) {
+    bool listed = wait_response("OK", 2000, s_sms_capture, sizeof(s_sms_capture));
+    s_log_quiet = false;
+    if (listed && strstr(s_sms_capture, "+CMGL: ") != NULL) {
+        storage_log_debug("SMS", s_sms_capture);
         char sender_phone[32] = "";
         char *p = strstr(s_sms_capture, "+CMGL: ");
         if (p) {
