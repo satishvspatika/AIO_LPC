@@ -60,6 +60,7 @@
  * management pages of http://www.FreeRTOS.org for more information.
  */
 #include <stdlib.h>
+#include <string.h>
 
 /* Defining MPU_WRAPPERS_INCLUDED_FROM_API_FILE prevents task.h from redefining
 all the API functions to use the MPU wrappers.  That should only be done when
@@ -81,7 +82,7 @@ static union xRTOS_HEAP
 		volatile unsigned long ulDummy;
 	#endif
 	unsigned char ucHeap[ configTOTAL_HEAP_SIZE ];
-} xHeap;
+} xHeap __attribute__((section(".bss.$RAM2")));  /* AHB SRAM (0x2007C000): frees 16 KB of main RAM. Start-up does not clear it: prvHeapInit() does */
 
 /* Define the linked list structure.  This is used to link free blocks in order
 of their size. */
@@ -133,6 +134,8 @@ size_t xBlockSize;																	\
 #define prvHeapInit()																\
 {																					\
 xBlockLink *pxFirstFreeBlock;														\
+	/* The heap is in AHB SRAM, which start-up does not clear: start from zero as before. */	\
+	memset( xHeap.ucHeap, 0, sizeof( xHeap.ucHeap ) );	\
 																					\
 	/* xStart is used to hold a pointer to the first item in the list of free */	\
 	/* blocks.  The void cast is used to prevent compiler warnings. */				\

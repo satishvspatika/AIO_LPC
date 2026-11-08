@@ -27,8 +27,9 @@ __attribute__((used)) void hard_fault_capture(const uint32_t *frame)
     uint32_t pc = 0, lr = 0;
     uint32_t addr = (uint32_t)frame;
 
-    /* The stack pointer itself may be what went wrong */
-    if (addr >= 0x10000000UL && addr <= (0x10008000UL - 32UL)) {
+    /* The stack pointer itself may be what went wrong. Task stacks are in the heap, in AHB SRAM. */
+    if ((addr >= 0x10000000UL && addr <= (0x10008000UL - 32UL)) ||
+        (addr >= 0x2007C000UL && addr <= (0x20084000UL - 32UL))) {
         lr = frame[5];
         pc = frame[6];
     }
@@ -667,12 +668,26 @@ static bool parse_record_total(const char *record, char *ts, size_t ts_size, uns
 
 /* GAP_RULE_BEGIN */
 /* A slot nobody measured gets a row only if this unit holds a record from the same rain day, even a
- * 0 mm one. The start of a rain day with nothing known stays empty. Returns the row's signal marker,
- * or 0 for no row. */
-static int off_slot_marker(const char *known_close, const char *gap_close, const char *current_close)
+ * 0 mm one, or from the rain day just before it. In the next rain day the total starts again at 0, and
+ * with the unit off no tip was counted, so CUM_RF is 0 (*new_day set). A rain day further on, or one
+ * with nothing known, stays empty. Returns the row's signal marker, or 0 for no row. */
+static int off_slot_marker(const char *known_close, const char *gap_close, const char *current_close,
+                           bool *new_day)
 {
-    if (known_close[0] == '\0' || strcmp(known_close, gap_close) != 0) {
+    *new_day = false;
+    if (known_close[0] == '\0') {
         return 0;
+    }
+    if (strcmp(known_close, gap_close) != 0) {
+        /* The rain day after known_close is the one 08:45 on known_close falls in */
+        char probe[16];
+        char next_close[12] = "";
+        snprintf(probe, sizeof(probe), "%.8s084500", known_close);
+        if (!intermcu_rain_close_date(probe, next_close, sizeof(next_close)) ||
+            strcmp(next_close, gap_close) != 0) {
+            return 0;
+        }
+        *new_day = true;
     }
     return (strcmp(gap_close, current_close) == 0) ? SIGNAL_OFF_FILLED_TODAY : SIGNAL_OFF_FILLED_PAST;
 }
@@ -793,7 +808,8 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
             /* The LPC845 was off too, so this slot was never measured */
             char gap_close[12] = "";
             intermcu_rain_close_date(request, gap_close, sizeof(gap_close));
-            int marker = off_slot_marker(known_close, gap_close, current_close);
+            bool new_day = false;
+            int marker = off_slot_marker(known_close, gap_close, current_close, &new_day);
 #if (UNIT_CFG == KSNDMC_TWS)
             /* Temperature, humidity and wind weren't measured, and aren't estimated: the row stays empty */
             marker = 0;
@@ -806,7 +822,7 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
             s_gap_record.slot_time[sizeof(s_gap_record.slot_time) - 1] = '\0';
             s_gap_record.rf_tips_15m = 0;
             s_gap_record.rf_15m_mm = 0.0f;
-            s_gap_record.rf_cum_mm = known_cum_mm;
+            s_gap_record.rf_cum_mm = new_day ? 0.0f : known_cum_mm;
             s_gap_record.bat1_volt = known_bat; /* The signal value is what marks a filled row */
             format_slot_payload(payload, sizeof(payload), &s_gap_record, marker);
             s_archive_slot_id = id;

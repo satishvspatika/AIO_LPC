@@ -120,7 +120,7 @@
 /*---------------------------------------------------------------------------/
 / Physical Drive Configurations
 /----------------------------------------------------------------------------*/
-#define WITH_USB_MS
+/* No USB stick (see diskio.c): one drive, the SD card */
 #ifdef WITH_USB_MS
 #define _DRIVES		2
 /* Number of volumes (logical drives) to be used. */

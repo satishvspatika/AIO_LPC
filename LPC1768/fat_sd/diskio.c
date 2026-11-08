@@ -11,7 +11,7 @@
 #include "spi_sd_lpc17xx.h"
 
 // in makefile #define WITH_USB_MS   1
-#define WITH_USB_MS   1
+#define WITH_USB_MS   0   /* No USB stick: the host driver used AHB SRAM, which now holds the heap */
 
 #if ( WITH_USB_MS == 1 )
 #include "usbhost_ms.h"
