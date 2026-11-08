@@ -1109,6 +1109,23 @@ void read_th_val(void)
 //   result = I2C_MasterReadBlocking(base, xfer->data, xfer->dataSize, xfer->flags);
 //   result = I2C_MasterWriteBlocking(base, xfer->data, xfer->dataSize, xfer->flags);
 
+static volatile uint8_t s_rtc_raw_sec = 0;	//last raw seconds register, halt bit included
+static volatile uint16_t s_rtc_last_ok_ticks = 0;	//100 ms ticks since the last good RTC read
+volatile uint32_t rtc_kicks = 0;			//times a stopped RTC was started again (read by probe)
+volatile uint32_t bad_clock_wakes = 0;		//safety-net wakes with an invalid clock (read by probe)
+volatile uint32_t rtc_i2c_resets = 0;		//times I2C0 was reset after a failed RTC transfer (read by probe)
+
+/* Seen on the bench (2026-11-07): I2C0 jams with a START requested that never completes
+ * (MSTCTL=2, MSTPENDING=0) while both bus lines are high. Every RTC transfer then fails and, before
+ * 845-v1.5, the zeros left in the buffer became the time (2000-00-00), so no slot boundary came
+ * until this chip restarted. Turning the I2C0 master off and setting it up again clears it. */
+static void rtc_i2c_recover(void)
+{
+	rtc_i2c_resets++;
+	I2C_MASTER->CFG = 0;
+	I2C0_init();
+}
+
 void init_ext_rtc(void){
 	int i, j;
 
@@ -1148,7 +1165,7 @@ void init_ext_rtc(void){
 }
 
 
-void Get_Cur_Date_Time(xDateTime_def *DateTime)
+int Get_Cur_Date_Time(xDateTime_def *DateTime)
 {
 	int i;
 
@@ -1161,8 +1178,10 @@ void Get_Cur_Date_Time(xDateTime_def *DateTime)
 	XITC_I2C_IDT.dataSize = 1;		// start address and data for register 0
 	XITC_I2C_IDT.direction = kI2C_Write;
 
-	I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT);
-
+	if(I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT) != kStatus_Success){
+		rtc_i2c_recover();
+		return 0;
+	}
 
 	XITC_I2C_IDT.slaveAddress = IDT_DEV_ADDR;
 	XITC_I2C_IDT.flags = 0;
@@ -1170,8 +1189,12 @@ void Get_Cur_Date_Time(xDateTime_def *DateTime)
 	XITC_I2C_IDT.dataSize = 8;		// start address and data for register 0
 	XITC_I2C_IDT.direction = kI2C_Read;
 
-
-	I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT);
+	//A failed read leaves zeros in the buffer: they must never become the time (845-v1.5)
+	if(I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT) != kStatus_Success){
+		rtc_i2c_recover();
+		return 0;
+	}
+	s_rtc_last_ok_ticks = 0;
 
 	DateTime->year		= (i2c_clkval[7]/16)*10+(i2c_clkval[7]%16);
 	DateTime->month	= (i2c_clkval[6]/16)*10+(i2c_clkval[6]%16);
@@ -1182,8 +1205,80 @@ void Get_Cur_Date_Time(xDateTime_def *DateTime)
 
 	DateTime->minute	= (i2c_clkval[2]/16)*10+(i2c_clkval[2]%16);
 
+	s_rtc_raw_sec = i2c_clkval[1];	//kept with the halt bit (bit 7) for rtc_watch_100ms
 	i2c_clkval[1]	&= 0x7F;	// remove unwanted bits
 	DateTime->sec	= (i2c_clkval[1]/16)*10+(i2c_clkval[1]%16);
+	return 1;
+}
+
+/* RTC watch (845-v1.5). A DS1338 without a working coin cell can lose its time on a supply dip
+ * while this chip keeps running. It then sits stopped (halt bit set) at 00:00:00: the minute never
+ * changes, no slot boundary comes, and the station goes silent until someone presses DSP.
+ *  1. A stopped RTC (halt bit set, or seconds not moving for 3 s) is started again at once, so
+ *     the minute moves and the next boundary wakes the LPC1768, which sets the time from the
+ *     tower or the server. The same as what already happens after a power-on.
+ *  2. While the clock is invalid (year below 24, or no good read for 60 s) and the LPC1768 has been off for 15 minutes,
+ *     wake it as a scheduled wake anyway, so a clock that can't be started is still reported
+ *     and set. A valid clock never takes this path. */
+#define RTC_STUCK_TICKS        30U		//3 s of 100 ms ticks
+#define BAD_CLOCK_WAKE_TICKS   9000U	//15 minutes of 100 ms ticks
+#define RTC_NO_READ_TICKS      600U		//60 s without one good RTC read: the time can't be trusted
+
+static void rtc_kick(void)
+{
+	uint8_t buf[2];
+	buf[0] = 0;							//register 0: seconds and halt bit
+	buf[1] = s_rtc_raw_sec & 0x7F;		//same seconds, halt bit clear: oscillator runs
+	XITC_I2C_IDT.slaveAddress = IDT_DEV_ADDR;
+	XITC_I2C_IDT.flags = 0;
+	XITC_I2C_IDT.data = &buf[0];
+	XITC_I2C_IDT.dataSize = 2;
+	XITC_I2C_IDT.direction = kI2C_Write;
+	if(I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT) != kStatus_Success){
+		rtc_i2c_recover();
+	}
+}
+
+static void rtc_watch_100ms(void)
+{
+	static uint8_t last_raw_sec = 0xFF;
+	static uint8_t same_ticks = 0;
+	static uint16_t bad_clock_ticks = 0;
+
+	if(s_rtc_last_ok_ticks < 0xFFFF){
+		s_rtc_last_ok_ticks++;		//cleared by every good read
+	}
+	if(s_rtc_raw_sec != last_raw_sec){
+		last_raw_sec = s_rtc_raw_sec;
+		same_ticks = 0;
+	}
+	else if(same_ticks < 255){
+		same_ticks++;
+	}
+	if((s_rtc_raw_sec & 0x80) || (same_ticks >= RTC_STUCK_TICKS)){
+		rtc_kick();
+		rtc_kicks++;
+		same_ticks = 0;
+		last_raw_sec = 0xFF;
+	}
+
+	//Safety-net wake: only while the clock is invalid and the LPC1768 is off
+	bool clock_bad = (Present_Date_Time.year < 24) || (s_rtc_last_ok_ticks >= RTC_NO_READ_TICKS);
+	if(clock_bad && GPIO_PinRead(GPIO, LPC845_PORT, LPC1768_PWR_STDN)){
+		if(++bad_clock_ticks >= BAD_CLOCK_WAKE_TICKS){
+			bad_clock_ticks = 0;
+			bad_clock_wakes++;
+			time_since_reset_interval = 0;
+			GPIO_PortSet(GPIO, LPC845_PORT, 1u << LCD_PWR_STDN);	//unattended: LCD stays off
+			wake_reason = 'S';
+			GPIO_PortClear(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);
+			GPIO_PortClear(GPIO, LPC845_PORT, 1u << SIM7600_PWR_STDN);
+			row2_input_configuration();
+		}
+	}
+	else{
+		bad_clock_ticks = 0;
+	}
 }
 
 
@@ -1198,7 +1293,9 @@ void Get_Time()
 
 	Next_Date(&next_date.date, &next_date.month, &next_date.year);
 
-	Get_Cur_Date_Time(&rtc_read_date);
+	if(!Get_Cur_Date_Time(&rtc_read_date)){
+		return;		//keep the last good time; I2C0 was reset for the next read
+	}
 
 
 	if((Present_Date_Time.date == rtc_read_date.date) && (Present_Date_Time.month == rtc_read_date.month) && (Present_Date_Time.year == rtc_read_date.year)){
@@ -1223,7 +1320,9 @@ void Get_Time()
 		for(i=0;i<500;i++)
 			for(j=0;j<600;j++);
 
-		Get_Cur_Date_Time(&rtc_read_date_copy);
+		if(!Get_Cur_Date_Time(&rtc_read_date_copy)){
+			return;
+		}
 
 		if((rtc_read_date_copy.date == rtc_read_date.date) && (rtc_read_date_copy.month == rtc_read_date.month) && (rtc_read_date_copy.year == rtc_read_date.year)){
 			Present_Date_Time.date = rtc_read_date_copy.date;
@@ -1326,9 +1425,17 @@ void Set_Time()
 	XITC_I2C_IDT.dataSize = 9;		// start address and data for register 0
 	XITC_I2C_IDT.direction = kI2C_Write;
 
-
-	I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT);
-
+	if(I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT) != kStatus_Success){
+		rtc_i2c_recover();				//the time from the LPC1768 must not be lost: one more try
+		XITC_I2C_IDT.slaveAddress = IDT_DEV_ADDR;
+		XITC_I2C_IDT.flags = 0;
+		XITC_I2C_IDT.data = &i2c_clkval[0];
+		XITC_I2C_IDT.dataSize = 9;
+		XITC_I2C_IDT.direction = kI2C_Write;
+		if(I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT) != kStatus_Success){
+			rtc_i2c_recover();
+		}
+	}
 }
 
 
@@ -2196,6 +2303,7 @@ int main(void)
 				sleep_holdoff_100ms--;
 			}
 			Get_Time();
+			rtc_watch_100ms();
 			stack_guard_check();
 			rain_keep_save();
 			timer3_ovf_100ms = 0;

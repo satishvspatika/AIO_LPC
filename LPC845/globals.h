@@ -324,6 +324,6 @@ void init_counter_ws(void);
 
 void Next_Date(uint8_t *Nd, uint8_t *Nm, uint8_t *Ny);
 void Get_Time();
-void Get_Cur_Date_Time(xDateTime_def *DateTime);
+int Get_Cur_Date_Time(xDateTime_def *DateTime);
 
 

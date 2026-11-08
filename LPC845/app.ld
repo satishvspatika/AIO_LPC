@@ -67,13 +67,16 @@ SECTIONS
         PROVIDE(end = .);
     } > RamLoc16
 
-    .noinit (NOLOAD):
+    /* Fixed address from 845-v1.5, so the rain count kept here is found by every later version
+     * after an update restart. Variables (.data + .bss) must stay below it. */
+    .noinit 0x10002800 (NOLOAD):
     {
          . = ALIGN(4) ;
         *(.noinit*)
          . = ALIGN(4) ;
         _noinit_end = . ;
     } > RamLoc16
+    ASSERT(_ebss <= 0x10002800, "LPC845 variables overlap the kept rain count at 0x10002800")
 
     /* No code protection, which also keeps a stray value out of this word */
     /DISCARD/ : { *(.crp) }
