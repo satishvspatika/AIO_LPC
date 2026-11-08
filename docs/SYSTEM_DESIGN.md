@@ -1,8 +1,8 @@
 # AIO Telemetry Station: System Design, Memory Map, Data Flow and Test Record
 
-State as of 2026-11-07 evening: LPC1768 firmware **v6.9.11** (installed 17:25, not yet committed), LPC845 firmware
-**845-v1.3**, branch `v6.2.9-untested` (last firmware commit: v6.9.10 + 845-v1.3, `77aa26b`). v6.9.10 ran clean from 15:35 to
-17:25 (8 of 8 slots); v6.9.11 is now on the overnight / 1-2 day run.
+State as of 2026-11-08 morning: LPC1768 firmware **v6.9.12** (`3b3ec02`, includes v6.9.11), LPC845 firmware
+**845-v1.5** (`446ff19`), branch `v6.2.9-untested`. Two units: BIHAR_TRG 1923 (bench, both versions installed 2026-11-08
+09:00) and KSNDMC_TRG 1922 (v6.9.11 + 845-v1.5, ran every slot overnight 21:45-09:00).
 
 This document is the single place for how the system is built and why, and for what has been tested. Where something
 has only been built or read in code, and not run on a unit, it says so. Build steps and toolchain setup are in
@@ -70,14 +70,15 @@ Chosen at build time with `UNIT_CFG` in `LPC1768/user_config.h`.
 
 | Config | Server | Payload | SD update file | Notes |
 |---|---|---|---|---|
-| `KSNDMC_TRG` (0) | `rtdas.ksndmc.net` / 117.216.42.181:80 `/trg_gprs/update_data_sit_v3` | form fields, cumulative rain | `fw_ksn_trg.hex` | Test station 1001 |
+| `KSNDMC_TRG` (0) | `rtdas.ksndmc.net` / 117.216.42.181:80 `/trg_gprs/update_data_sit_v3` | form fields, cumulative rain | `fw_ksn_trg.hex` | Second unit 1922 (Airtel IoT SIM), test station 1001 |
 | `BIHAR_TRG` (1) | `rtdasbmsk.spatika.net` / 164.100.130.199:8085 `/Home/UpdateTRGData` | JSON, 15-min and cumulative rain | `fw_bihar.hex` | Bench station 1923, test station 1003 |
 | `KSNDMC_TWS` (2) | `rtdas.ksndmc.net` / 117.216.42.181:80 `/tws_gprs/update_tws_data_v3` | form fields, temp, humidity, wind | `fw_ksn_tws.hex` | No rain total; no fill of slots not measured. Test station 1002 |
 
 The LPC845 firmware (`sensor.hex`) is the same for all three.
 
-Only **BIHAR_TRG** has been run on the bench (BSNL SIM). KSNDMC_TRG and KSNDMC_TWS are built and pass the SD file
-check for each release, but have not been run against their servers.
+**BIHAR_TRG** runs on bench unit 1923 (BSNL SIM). **KSNDMC_TRG** runs on unit 1922 (Airtel IoT SIM) since 2026-11-07
+18:04, sending to the KSNDMC server. KSNDMC_TWS is built and passes the SD file check for each release, but has not
+been run on a unit.
 
 ---
 
@@ -127,7 +128,7 @@ source by `build.sh` at `-O1`, the same level as the old prebuilt library. The p
 | 0x09000 | 9-11 | 12 KB | **Error log**: 48 pages of 256 B, a fixed ring |
 | 0x0C000 | 12-15 | 16 KB | Firmware update journal |
 | 0x10000 | 16 | 32 KB | Swap scratch |
-| 0x18000 | 17-20 | 128 KB | **Application (slot A)**. v6.9.11 uses 118.4 KB (BIHAR_TRG), 118.6 KB (KSNDMC_TRG), 117.4 KB (KSNDMC_TWS); about 12 KB free |
+| 0x18000 | 17-20 | 128 KB | **Application (slot A)**. v6.9.12 uses 118,552 B (BIHAR_TRG), 118,728 B (KSNDMC_TRG), 117,504 B (KSNDMC_TWS); about 12 KB free |
 | 0x38000 | 21-24 | 128 KB | Staging (slot B) for a new image |
 | 0x58000 | 25-29 | 160 KB | **Record log**: 640 pages of 256 B, about 6.5 days of records |
 
@@ -179,7 +180,7 @@ Task stacks (words of 4 bytes), with the lowest free seen on the bench:
 | 0x0000 | 0-3 | Bootloader (2.2 KB of 4 KB) |
 | 0x1000 | 4-7 | Update journal (64-byte records, 64 pages) |
 | 0x2000 | 8 | Swap scratch |
-| 0x2400 | 9-32 | **Application (slot A)**, 24 KB. 845-v1.3 uses about 18.8 KB |
+| 0x2400 | 9-32 | **Application (slot A)**, 24 KB. 845-v1.5 uses 19,516 B |
 | 0x8400 | 33-56 | Staging (slot B) |
 | 0xE400 | | Free to 60 KB |
 
@@ -190,8 +191,8 @@ Image info at slot base + 0xC0; vector 8 points to it (patched by `scripts/fw_im
 
 | Range | Contents |
 |---|---|
-| 0x10000000-0x100024FC | Application variables (data + bss), including 3 rain days of samples |
-| 0x100024FC-0x10002514 | `.noinit`: the kept rain count (magic, slot tips, day tips, rain day, restored flag, check value) |
+| 0x10000000-0x10002510 | Application variables (data + bss), including 3 rain days of samples (845-v1.5) |
+| 0x10002800-0x10002818 | `.noinit`: the kept rain count (magic, slot tips, day tips, rain day, restored flag, check value). **Fixed address from 845-v1.5**, so every later version finds it after an update restart; the linker stops the build if variables reach it. Before v1.5 it followed the variables and moved when they grew (v1.3 to v1.4 lost the count; `$T` restored it) |
 | Above that to 0x10003FE0 | Stack, filled with 0xA5A5A5A5 at start-up; deepest use seen about 1.1 KB of 6.9 KB |
 | 0x10003FE0-0x10003FFF | Reserved for IAP flash routines |
 
@@ -231,7 +232,10 @@ status, firmware version and a checksum. Also the replies to the commands below.
 2. **+0 to +5 s.** The LPC1768 boots and checks that LPC845 frames are arriving (5 s). With no frames it stores and
    sends nothing, so a record of zeros can't be made; the slot is filled later.
 3. **Missed-slot fill.** Slots missed while off are rebuilt from the LPC845's stored samples (signal -104) or, if the
-   LPC845 was off too, filled as not measured (-112 this rain day, -110 an earlier one) on TRG only.
+   LPC845 was off too, filled as not measured (-112 this rain day, -110 an earlier one) on TRG only. A filled row
+   needs a record from the same rain day (CUM_RF carried from it) or from the rain day just before (CUM_RF 0, as the
+   total restarts at 08:45 and nothing was counted; v6.9.12). A rain day further on, or no record at all, stays
+   empty (`NO_DATA_FOR_RAIN_DAY` in SLOTS.CSV). Rain 0 and the last record's battery in every filled row.
 4. **Hold to +62 s.** Servers refuse a record sent less than 62 s after its boundary. The hold counts all the time
    since the slot began (fixed in v6.9.2).
 5. **Never-dip check (TRG).** `CUM_RF` is raised to the newest stored record's total if it would drop.
@@ -267,7 +271,7 @@ MENU (actions): SEND STATUS SMS, GPS UPDATE, KEY TEST, ERASE DATA, FIRMWARE UPDA
 action returns to MENU. The CALIB key starts calibration directly on TRG. DSP opens the power save prompt. SEND HEALTH
 will go second in the menu when built. `TEST SEND` is switched off (`ENABLE_TEST_SEND 0`).
 
-Landing page: config name centred on line 1; line 2 `ID:1923  v6.9.11`, with the version always shown in full.
+Landing page: config name centred on line 1; line 2 `ID:1923  v6.9.12`, with the version always shown in full.
 
 ### 7.4 Time
 
@@ -275,6 +279,17 @@ The server's `Date:` header is checked on every delivered record and the RTC cor
 (45 s after a refused record). Tower time (`CCLK`) is used only if the RTC has no valid time; GPS also corrects it on
 a good fix. With no valid clock a scheduled wake gives up after 3 minutes, or 2 with no network (v6.9.4). The bench
 unit's clock reads 6-8 s behind the server and the Mac.
+
+**LPC845 RTC watch (845-v1.5).** The LPC845 reads the DS1338 (I2C0, PIO0_10/11) every 100 ms. On 2026-11-07 unit
+1922 stopped sending after 19:15: the I2C0 master jammed (STAT 0x800, start requested, nothing pending, both bus lines
+high) while the modem was on. 845-v1.3 ignored the driver's errors, so the time read as zeros (2000-00-00), the minute
+never changed and no slot wake came. Since v1.5:
+- Both transfers of every read are checked. On failure I2C0 is reset (CFG 0, then re-init) and the last good time is
+  kept (`rtc_i2c_resets` counts these). `Set_Time` retries once after a reset.
+- If the halt bit is set, or the seconds stop for 3 s, the clock is restarted (`rtc_kicks`).
+- Safety net: if the time is invalid (year < 24) or unread for 60 s with the LPC1768 off, the LPC845 wakes it after
+  15 minutes (`bad_clock_wakes`) so it can take tower or server time.
+Jams come only while the unit is awake, about 1-7 per slot on 1922 (the modem is the likely source); none seen asleep.
 
 ### 7.5 Firmware update from the SD card
 
@@ -330,7 +345,7 @@ With no card and no network, the oldest records are overwritten after about 6.5 
 | LPC845 silent | No record made (no zeros); slot filled later | |
 | `CUM_RF` would drop | Held at the stored total (TRG) | Day total can't carry past 08:45 after a restart |
 | Restart mid-slot | Slot runs again without a second stored copy; sent again (the server may see a repeat) | |
-| Bad clock | Gives up after 3 min (2 with no network) | |
+| Bad clock | Gives up after 3 min (2 with no network) | Jammed I2C reset, stopped RTC restarted, wake after 15 min with no valid time (845-v1.5) |
 | No SIM / no network | Record saved to backlog; 1 try a slot after about an hour | |
 | Stuck job (SMS, GPS, test) | Cancelled at 8 min, restart if that fails | |
 
@@ -389,14 +404,33 @@ All on the bench unit: BIHAR_TRG, station 1923, BSNL SIM, bench power supply (ba
 | v6.9.11 | First slot 17:30, with 1 tip | Pass: sent first try, 0.5 mm, CUM_RF 9.0 to 9.5; heap 4,128 B; stacks same as v6.9.10; 0 damaged frames. 85 s on-time: slow network (CIPOPEN 6 s, server reply 6 s), not firmware |
 | all | Hosted tests rerun before each commit | Pass |
 
+### 2026-11-07 evening to 2026-11-08: second unit, RTC jam, gap fill
+
+Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
+
+| Version | Test | Result |
+|---|---|---|
+| v6.9.11 | KSNDMC_TRG programmed by MCU-Link (chip erase), station ID 1922 from the build default | Pass: 18:15-19:15 sent to the KSNDMC server |
+| 845-v1.3 | Silence after 19:15 | Found: LPC845 I2C0 jam, time read as zeros, no slot wakes (see 7.4). A loose CR2032 was a separate problem |
+| v6.9.11 | Clock restored after the silence | 19:30-20:45 filled as -112 with CUM_RF 6.5; 21:00 onward normal; no duplicate 21:30 |
+| 845-v1.4 | Update by SD | Pass (`845 UPDATE OK`); kept count lost as `.noinit` moved, `$T` restored CUM_RF 6.5. Led to the fixed address |
+| 845-v1.4 | RTC stopped with the halt bit (`rtc_lost845.py halt`) | Showed the real fault: I2C jammed 26 s after the rails came on, 78 restarts did nothing. Led to v1.5 |
+| 845-v1.5 | Installed by MCU-Link at 21:28 | Pass: 13 kept tips survived |
+| 845-v1.5 | I2C0 forced off 3 times (`rtc_lost845.py jam`) | Pass: 3 of 3 recovered, time never invalid |
+| 845-v1.5 | RTC stopped at 00:14 with the halt bit | Pass: restarted at once, wake at 21:33:55, tower time set 21:34:28, no repeat send |
+| v6.9.11 + 845-v1.5 | Overnight 21:45-09:00, probe watching the LPC845 | Pass: every slot sent first try (38 of 38 to 07:00); 43 natural jams cleared, clock never invalid, no safety wakes; stacks and heap steady; no new errors; 08:45 day total to 0 |
+| v6.9.11 | GPS search at 01:00 and 07:00 | 90 s, no fix (indoors); slot takes 101 s instead of about 8 s |
+| v6.9.12 | Gap-fill rule host test (11 cases, month and year ends, two-day gap, no history) | Pass |
+| v6.9.12 + 845-v1.5 | BIHAR 1923 off 19:00 to 09:00, both installed by SD at power-up | Pass: 19:15-08:30 sent as -110 with CUM 10, 08:45 as -112 with CUM 0, live from 09:00, backlog done in 4 slots (15 a slot); 845 UPDATE OK |
+
 ### Not tested yet
 
 - Bad-clock wait (v6.9.4 change)
 - GPS job stack margin, and GPS fix at all (no fix seen, even with the antenna)
 - Damaged-frame count comparison (no damaged frames occurred)
-- KSNDMC_TRG and KSNDMC_TWS on a unit and server
+- KSNDMC_TWS on a unit and server
+- v6.9.12 on unit 1922; `rtc_lost845.py safety` (safety wake alone) on a unit
 - Real battery drain; long outages; full card; power cuts during settings save and firmware swap on the real unit
-- The 1-2 day run of v6.9.11 + 845-v1.3 (in progress since 17:25)
 - Crash capture with the stack in AHB SRAM (needs a forced hard fault in a test build)
 
 ---
@@ -412,14 +446,19 @@ All on the bench unit: BIHAR_TRG, station 1923, BSNL SIM, bench power supply (ba
 | RAM | Fixed in v6.9.11: heap in AHB SRAM, about 16.8 KB main RAM free (was 764 B). Confirm on the long run |
 | SMS on 2G can take over a minute | Watch (power) |
 | Bihar SMS number | Temporary 9980945474; the ESP32 uses 9741391102 |
+| BIHAR 1923 sent the 09:00 slot straight after the power-up and updates on 2026-11-08 | Open: an operator boot should wait for the next slot unless switched on exactly on a quarter-hour. Check the power-on time and boot type in SLOTS.CSV; an update restart may look like a scheduled boot. No data lost or duplicated |
+| LPC845 I2C0 jams while the modem is on | Recovered by 845-v1.5. Hardware cause (noise or supply dip on the RTC bus) worth a look on the next board |
 | RTC coin cell | Can't be measured on this board; firmware can only detect a stop. ADC link proposed for the next board |
 
 ---
 
 ## 12. Plan
 
-**Done today:** stack, watchdog, error log, LPC845 protection, rain count kept, RAM relieved (v6.9.11). v6.9.11 on
-the 1-2 day run; commit and tag it proven if clean.
+**Done:** stack, watchdog, error log, LPC845 protection, rain count kept, RAM relieved (v6.9.11); RTC jam recovery
+(845-v1.5); gap fill for the day after an off period (v6.9.12); KSNDMC_TRG on a second unit.
+
+**Next on the LPC1768:** when the LPC845's slot time is invalid, SLOTS.CSV shows slot 20000000000000 and that slot's
+15-min rain is lost (use the LPC1768's corrected slot time and the live count); log "LPC845 clock was lost".
 
 **Next batches**, each tested before the next:
 
