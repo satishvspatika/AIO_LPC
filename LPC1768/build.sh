@@ -39,7 +39,7 @@ else
 fi
 
 echo "=== 1. Compiling Clean AIO LPC1768 Sources ==="
-CFLAGS="-c -mcpu=cortex-m3 -mthumb -O2 -g -fcommon \
+CFLAGS="-c -mcpu=cortex-m3 -mthumb -O2 -g -fcommon -ffunction-sections -fdata-sections \
   -DDEBUG -D__USE_CMSIS=CMSISv1p30_LPC17xx \
   -I${LPC_DIR} \
   -I${PROJECT_ROOT}/CMSISv1p30_LPC17xx/inc \
