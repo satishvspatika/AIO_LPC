@@ -1054,12 +1054,59 @@ void sim7600_worker_step(void)
     sim7600_release();
 }
 
-/* The carrier's own view of the data connection: the APN and address really in use */
-static void log_bearer_details(void)
+static bool apn_field_is(const char *field, const char *apn)
 {
+    size_t n = strlen(apn);
+    for (size_t i = 0; i < n; i++) {
+        char x = field[i], y = apn[i];
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (x != y) {
+            return false;
+        }
+    }
+    /* The carrier may add ".mncNNN.mccNNN.gprs" */
+    return field[n] == '\0' || field[n] == ',' || field[n] == '"' || field[n] == '.' || field[n] == '\r' || field[n] == '\n';
+}
+
+/* The carrier's own view of the data connection: the APN and address really in use. Returns false
+ * only when it is plainly on another of the APNs this firmware sets (left in the modem from another
+ * SIM); an APN name the carrier reports in its own words counts as fine, so it never costs a radio
+ * restart. apn NULL: just log it. */
+static bool log_bearer_details_apn(const char *apn)
+{
+    static const char *const known[] = {"airteliot.com", "airtelgprs.com", "bsnlnet", "bsnlm2m", "jionet", NULL};
+    char reply[160] = "";
     clear_rx();
     send_raw("AT+CGCONTRDP=1\r\n");
-    wait_response("OK", 3000, NULL, 0);
+    wait_response("OK", 3000, reply, sizeof(reply));
+    if (!apn || !apn[0]) {
+        return true;
+    }
+    /* +CGCONTRDP: <cid>,<bearer id>,<apn>,... */
+    const char *field = strstr(reply, "+CGCONTRDP:");
+    field = field ? strchr(field, ',') : NULL;
+    field = field ? strchr(field + 1, ',') : NULL;
+    if (!field) {
+        return true;
+    }
+    field++;
+    if (*field == '"') {
+        field++;
+    }
+    if (apn_field_is(field, apn)) {
+        return true;
+    }
+    for (int i = 0; known[i]; i++) {
+        if (apn_field_is(field, known[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void log_bearer_details(void)
+{
+    (void)log_bearer_details_apn(NULL);
 }
 
 /* ESP32 try_activate_apn, plus AT+CGSOCKCONT and AT+CSOCKSETPN, which the SIM7600's own socket
@@ -1213,6 +1260,14 @@ static void __attribute__((noinline)) ensure_bearer(void)
     portTickType start = xTaskGetTickCount();
 
     s_bearer_ready = primary[0] && activate_apn(primary);
+    if (s_bearer_ready && !log_bearer_details_apn(primary)) {
+        /* The modem attaches by itself at power-on with the APN it last stored, before this sets the
+         * new one: after a SIM swap the data connection can be up on the old operator's APN. BSNL
+         * then gave an address on airteliot.com but NETOPEN failed twice (BIHAR 23:45, 2026-11-08,
+         * 72 s). Attach again on the right APN before sending. */
+        storage_log_debug("APN", "Data connection is on another APN: fresh attach on the SIM's APN");
+        s_bearer_ready = reattach_on_apn(primary) && activate_apn(primary);
+    }
     if (!s_bearer_ready && primary[0]) {
         storage_log_debug("APN", "Fresh attach on the same APN");
         s_bearer_ready = reattach_on_apn(primary) && activate_apn(primary);
@@ -1385,6 +1440,14 @@ static bool __attribute__((noinline)) http_post_tcp(const http_endpoint_t *endpo
     if (!wait_response("+CIPOPEN: 0,0", 20000, capture, sizeof(capture))) {
         snprintf(log_msg, sizeof(log_msg), "CIPOPEN failed! (Response: %.60s)", capture);
         storage_log_debug("TCP", log_msg);
+        if (!strstr(capture, "+CIPOPEN:")) {
+            /* No answer at all: socket 0 is still opening and AT+CIPCLOSE doesn't stop that, so the
+             * next try got "+CIPOPEN: 0,4 ERROR" at once (BIHAR 07:00, 2026-11-09). Closing the
+             * network clears it; the next try opens it again. */
+            clear_rx();
+            send_raw("AT+NETCLOSE\r\n");
+            wait_response("+NETCLOSE", 3000, NULL, 0);
+        }
         return false;
     }
     storage_log_debug("TCP", "TCP socket connected (+CIPOPEN: 0,0 OK)!");
