@@ -197,6 +197,14 @@ void fw_app_init(void)
     char line[48];
     snprintf(line, sizeof(line), "Running %s%s", g_fw_image_info.version, s_on_trial ? ", new firmware on trial" : "");
     storage_log_debug("FW", line);
+
+    /* Before the main loop can start a slot. From fw_app_step alone, a slot wake ran its slot at +1 s
+     * and slept before the check came round, so it copied the old type's records to the card under
+     * the new name and would have sent its queue to the new server (1922, 17:30, 2026-11-09). Firmware
+     * on trial still waits for its confirmation, so a failed update costs no data. */
+    if (!s_on_trial) {
+        check_station_type_change();
+    }
 }
 
 /* ---- The LPC845's side of an update ---- */
@@ -242,10 +250,10 @@ static void ctrl_report(unsigned state, const char *version)
     const char *what;
     bool failed = true;
     switch (state) {
-    case FW_J_CONFIRMED:   what = "845 UPDATE OK"; failed = false; break;
-    case FW_J_ROLLED_BACK: what = "845 FAILED:OLD"; break;
-    case FW_J_RECOVERED:   what = "845 RESTORED"; break;
-    case FW_J_REJECTED:    what = "845 REJECTED"; break;
+    case FW_J_CONFIRMED:   what = "CTRL UPDATE OK"; failed = false; break;
+    case FW_J_ROLLED_BACK: what = "CTRL FAILED:OLD"; break;
+    case FW_J_RECOVERED:   what = "CTRL RESTORED"; break;
+    case FW_J_REJECTED:    what = "CTRL REJECTED"; break;
     default:               return;
     }
     s_ctrl_last_result = what;

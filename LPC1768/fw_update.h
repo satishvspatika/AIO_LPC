@@ -46,7 +46,7 @@ bool fw_update_slot_b_info(fw_file_info_t *info);
 
 const char *fw_update_error_text(fw_result_t r);
 
-/* The same checks for sensor.hex, which is for the LPC845's flash map instead */
+/* The same checks for ctrl.hex, which is for the LPC845's flash map instead */
 fw_result_t fw_ctrl_check(const char *name, fw_file_info_t *info, fw_progress_fn progress);
 
 /* Reads the file again, handing the image over in order, in pieces of chunk_bytes (at most 256) */

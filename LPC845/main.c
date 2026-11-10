@@ -918,64 +918,88 @@ void read_wd_val(void){
  */
 
 
+/* Temperature and humidity (CTRL v1.9). Two sensors are fitted in the field at address 0x40, as in
+ * the TWS845 project: HDC1080 (device ID 0x1050) and HDC2022/HDC2080 (0x07D0). The first byte of
+ * register 0xFF tells them apart. Before v1.9 only the HDC2022/2080 sequence was sent, so an HDC1080
+ * read as 0. Bytes are unsigned now: a reading byte of 0x80 or more used to come out negative. */
+volatile uint8_t th_sensor_id = 0;		//first device ID byte seen: 0x10 HDC1080, 0x07 HDC2022/2080 (probe)
+volatile uint32_t th_reads_failed = 0;	//reads with no answer (probe)
+
+static status_t th_transfer(uint8_t *data, size_t size, i2c_direction_t dir)
+{
+	XITC_I2C_TH.slaveAddress = HDC_DEV_ADDR;
+	XITC_I2C_TH.flags = 0;
+	XITC_I2C_TH.data = data;
+	XITC_I2C_TH.dataSize = size;
+	XITC_I2C_TH.direction = dir;
+	return I2C_MasterTransferBlocking(I2C_MASTER1, &XITC_I2C_TH);
+}
+
+static void th_delay(int outer, int inner)
+{
+	for(volatile int i = 0; i < outer; i++)
+		for(volatile int j = 0; j < inner; j++);
+}
+
 void read_th_val(void)
 {
+	uint8_t cmd[4];
+	uint8_t b[4] = {0, 0, 0, 0};
 
-	int i, j;
-	char hdc_nor_cmd[6];
-
-	hdc_nor_cmd[0] = 0x0E;
-	hdc_nor_cmd[1] = 0x70;
-	hdc_nor_cmd[2] = 0x0F;
-	hdc_nor_cmd[3] = 0x00;
-
-	i2c_clkval1[0]= 0;
-	i2c_clkval1[1]= 0;
-	i2c_clkval1[2]= 0;
-	i2c_clkval1[3]= 0;
-
-	XITC_I2C_TH.slaveAddress = HDC_DEV_ADDR;
-	XITC_I2C_TH.flags = 0;
-	XITC_I2C_TH.data = &hdc_nor_cmd[0];
-	XITC_I2C_TH.dataSize = 4;
-	XITC_I2C_TH.direction = kI2C_Write;
-	I2C_MasterTransferBlocking(I2C_MASTER1, &XITC_I2C_TH);
-
-
-	for(i=0;i<800;i++)
-		for(j=0;j<20;j++);
-
-	hdc_nor_cmd[0] = 0x00;
-	hdc_nor_cmd[1] = 0x01;
-	hdc_nor_cmd[2] = 0x02;
-	hdc_nor_cmd[3] = 0x03;
-
-	XITC_I2C_TH.slaveAddress = HDC_DEV_ADDR;
-	XITC_I2C_TH.flags = 0;
-	XITC_I2C_TH.data = &hdc_nor_cmd[0];
-	XITC_I2C_TH.dataSize = 4;
-	XITC_I2C_TH.direction = kI2C_Write;
-	I2C_MasterTransferBlocking(I2C_MASTER1, &XITC_I2C_TH);
-
-
-	for(i=0;i<800;i++)
-		for(j=0;j<100;j++);
-
-	XITC_I2C_TH.slaveAddress = HDC_DEV_ADDR;
-	XITC_I2C_TH.flags = 0;
-	XITC_I2C_TH.data = &i2c_clkval1[0];
-	XITC_I2C_TH.dataSize = 4;
-	XITC_I2C_TH.direction = kI2C_Read;
-	I2C_MasterTransferBlocking(I2C_MASTER1, &XITC_I2C_TH);
-
-	present_temperature	= ((i2c_clkval1[1])*256) + (i2c_clkval1[0]);
-	present_humid	= ((i2c_clkval1[3])*256) + (i2c_clkval1[2]);
-
-	if((present_temperature == 0) || (present_humid == 0))
+	//Device ID: point at 0xFF and read its first byte
+	cmd[0] = 0xFF;
+	uint8_t id = 0;
+	if(th_transfer(cmd, 1, kI2C_Write) != kStatus_Success){
+		//No sensor (every TRG unit, or a TWS cable fault). CTRL v1.10: give up here. v1.9 went on
+		//through about 0.1 s of waits every 10 s, during which a second command from the LPC1768
+		//(the $f7 that follows $f4 by 100 ms at sleep) was lost: the receive buffer holds one.
+		th_sensor_id = 0;
+		present_temperature = 0;
+		present_humid = 0;
+		th_reads_failed++;
 		I2C1_init();
+		return;
+	}
+	th_transfer(&id, 1, kI2C_Read);
+	th_sensor_id = id;
+	bool hdc1080 = (id == 0x10);
 
-	for(i=0;i<800;i++)
-		for(j=0;j<100;j++);
+	//Configure and start a measurement
+	if(hdc1080){
+		cmd[0] = 0x02; cmd[1] = 0x10; cmd[2] = 0x00;	//config: temperature and humidity in sequence, 14 bit
+		th_transfer(cmd, 3, kI2C_Write);
+	}
+	else{
+		cmd[0] = 0x0E; cmd[1] = 0x70; cmd[2] = 0x0F; cmd[3] = 0x00;	//as before (HDC2022/2080)
+		th_transfer(cmd, 4, kI2C_Write);
+	}
+	th_delay(800, 20);
+
+	//Point at the readings (for the HDC1080 this also triggers the conversion), wait, read 4 bytes
+	cmd[0] = 0x00; cmd[1] = 0x01;
+	th_transfer(cmd, 2, kI2C_Write);
+	th_delay(800, 200);		//about 40 ms; the HDC1080 needs about 13 ms for both readings. The old empty
+							//loops were removed by -Os, so it got no wait at all
+	th_transfer(b, 4, kI2C_Read);
+	memcpy(i2c_clkval1, b, 4);
+
+	if(hdc1080){
+		//MSB first. The TWS845 project subtracts 902 (about 2.3 C) from the HDC1080 temperature;
+		//kept so both builds report the same
+		uint32_t t = ((uint32_t)b[0] << 8) | b[1];
+		present_temperature = (t > 902) ? t - 902 : 0;
+		present_humid = ((uint32_t)b[2] << 8) | b[3];
+	}
+	else{
+		//LSB first
+		present_temperature = ((uint32_t)b[1] << 8) | b[0];
+		present_humid = ((uint32_t)b[3] << 8) | b[2];
+	}
+
+	if((present_temperature == 0) || (present_humid == 0)){
+		th_reads_failed++;
+		I2C1_init();
+	}
 }
 
 /*
@@ -1113,6 +1137,32 @@ static volatile uint8_t s_rtc_raw_sec = 0;	//last raw seconds register, halt bit
 static volatile uint16_t s_rtc_last_ok_ticks = 0;	//100 ms ticks since the last good RTC read
 volatile uint32_t rtc_kicks = 0;			//times a stopped RTC was started again (read by probe)
 volatile uint32_t bad_clock_wakes = 0;		//safety-net wakes with an invalid clock (read by probe)
+
+/* Late slot wake (845-v1.7). The slot is still closed at the boundary (store_data), but an LPC1768
+ * that is off is powered this long after it, not at once: the server takes nothing before +62 s, and
+ * it used to sit through a 55 s hold. The modem boots with its rail and needs about 16-18 s to answer
+ * and 20-27 s to register (bench logs, 2026-11-08), so 30 s still leaves it registered by +62 s. */
+#define SLOT_WAKE_DELAY_100MS  300U
+static volatile uint8_t late_wake_pending = 0;
+static volatile uint16_t late_wake_ticks = 0;
+volatile uint32_t late_wakes = 0;			//slot wakes made late (read by probe)
+
+/* 845-v1.8: a slot is closed once. The LPC1768 sets this clock from the server; set back across a
+ * boundary (10:16:02 to 10:15:50), the minute became :15 again and the slot closed a second time,
+ * writing over its stored rain count with the few seconds of tips since the first close. Those
+ * tips now stay counted for the next slot. A clock set back further closes the earlier slots
+ * again, as before: their times were wrong. */
+static uint32_t last_closed_slot = 0;
+volatile uint32_t repeat_closes = 0;		//boundaries not closed again (read by probe)
+
+static uint32_t slot_key_now(void)
+{
+	uint32_t k = (uint32_t)Present_Date_Time.century * 100u + Present_Date_Time.year;
+	k = k * 13u + Present_Date_Time.month;
+	k = k * 32u + Present_Date_Time.date;
+	k = k * 24u + Present_Date_Time.hour;
+	return k * 4u + Present_Date_Time.minute / 15u;
+}
 volatile uint32_t rtc_i2c_resets = 0;		//times I2C0 was reset after a failed RTC transfer (read by probe)
 
 /* Seen on the bench (2026-11-07): I2C0 jams with a START requested that never completes
@@ -2051,7 +2101,7 @@ int main(void)
 {
 
 	int i, j, k;
-	int last_rec_min;
+	static volatile int last_rec_min;		//static: the probe can set it back to test a repeated boundary
 	char rec_data;
 	char lpc845_ver;
 	// uint32_t sctimerClock;
@@ -2311,6 +2361,23 @@ int main(void)
 			}
 			Get_Time();
 			rtc_watch_100ms();
+			//Late slot wake. Anything else that powered the LPC1768 meanwhile (DSP key, safety wake)
+			//runs the slot itself, so the pending wake is dropped.
+			if(late_wake_pending){
+				if(!GPIO_PinRead(GPIO, LPC845_PORT, LPC1768_PWR_STDN)){
+					late_wake_pending = 0;
+				}
+				else if(++late_wake_ticks >= SLOT_WAKE_DELAY_100MS){
+					late_wake_pending = 0;
+					late_wakes++;
+					time_since_reset_interval = 0;
+					GPIO_PortSet(GPIO, LPC845_PORT, 1u << LCD_PWR_STDN);	//unattended: LCD stays off
+					wake_reason = 'S';
+					GPIO_PortClear(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);
+					GPIO_PortClear(GPIO, LPC845_PORT, 1u << SIM7600_PWR_STDN);
+					row2_input_configuration();
+				}
+			}
 			stack_guard_check();
 			rain_keep_save();
 			timer3_ovf_100ms = 0;
@@ -2337,21 +2404,27 @@ int main(void)
 		if(last_rec_min != Present_Date_Time.minute){
 
 			//
-			if((Present_Date_Time.minute % 15 ) == 0){
+			if(((Present_Date_Time.minute % 15 ) == 0) && (slot_key_now() == last_closed_slot)){
+				repeat_closes++;
+			}
+			else if((Present_Date_Time.minute % 15 ) == 0){
 
+				last_closed_slot = slot_key_now();
 				store_data();
 
 				time_since_reset_interval = 0;
 
-				//Power on LPC1768 and GPRS. Keep LCD 5V OFF for an unattended wake, but
-				//leave it alone if the LPC1768 is already running (operator may be using it)
+				//An LPC1768 that is off gets the late wake above (LCD stays off). One already
+				//running (operator using it, or a slot still finishing) runs this slot itself:
+				//its rails are kept on as before.
 				if(GPIO_PinRead(GPIO, LPC845_PORT, LPC1768_PWR_STDN)){
-					GPIO_PortSet(GPIO, LPC845_PORT, 1u << LCD_PWR_STDN);
-					wake_reason = 'S';
+					late_wake_pending = 1;
+					late_wake_ticks = 0;
 				}
-				GPIO_PortClear(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);
-				GPIO_PortClear(GPIO, LPC845_PORT, 1u << SIM7600_PWR_STDN);
-				row2_input_configuration();
+				else{
+					GPIO_PortClear(GPIO, LPC845_PORT, 1u << SIM7600_PWR_STDN);
+					row2_input_configuration();
+				}
 
 
 				present_avg_ws = 0;

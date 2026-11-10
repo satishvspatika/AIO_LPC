@@ -432,7 +432,7 @@ const char *fw_update_error_text(fw_result_t r)
     case FW_E_BAD_CRC:       return "FILE DAMAGED";
     case FW_E_FLASH:         return "FLASH ERROR";
     case FW_E_JOURNAL:       return "FLASH ERROR";
-    case FW_E_LINK:          return "845 NO ANSWER";
+    case FW_E_LINK:          return "CTRL NO ANSWER";
     default:                 return "OK";
     }
 }

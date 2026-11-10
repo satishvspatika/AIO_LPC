@@ -21,6 +21,7 @@ Requirements set by the product owner, in force:
 | Requirement | How it is met |
 |---|---|
 | The 15th-minute transmission is critical | Wake at every slot; the record is saved before any send; failed sends go to a backlog |
+| Slot wake 30 s after the boundary (845-v1.7) | The LPC845 closes the slot at the boundary as before, but powers an LPC1768 that is off 30 s later (`SLOT_WAKE_DELAY_100MS`). The server takes nothing before +62 s and the LPC1768 used to hold about 55 s. The modem boots with its rail (no PWRKEY pulse) and needs 16-18 s to answer and 20-27 s to register (operator boots, 2026-11-08), so 30 s keeps it registered by +62 s; a 45 s wake would push every send to about +70 s. An LPC1768 already running at the boundary runs the slot itself, and a DSP or safety wake in the 30 s drops the late wake. Expected: about 30 s less awake time for both the LPC1768 and the modem per slot (68 s to about 38 s) |
 | Don't lose records; don't loop and drain the battery | Flash + SD copies, backlog, missed-slot fill, send time limits, restart-loop limit |
 | Rain day is 08:45 to 08:30 next day | LPC845 indexes samples from 08:45; day total resets only on a real change of rain day |
 | `CUM_RF` never dips within a rain day | Never-dip rule on the LPC1768 (TRG); rain count kept across LPC845 restarts |
@@ -74,7 +75,7 @@ Chosen at build time with `UNIT_CFG` in `LPC1768/user_config.h`.
 | `BIHAR_TRG` (1) | `rtdasbmsk.spatika.net` / 164.100.130.199:8085 `/Home/UpdateTRGData` | JSON, 15-min and cumulative rain | `fw_bihar.hex` | Bench station 1923, test station 1003 |
 | `KSNDMC_TWS` (2) | `rtdas.ksndmc.net` / 117.216.42.181:80 `/tws_gprs/update_tws_data_v3` | form fields, temp, humidity, wind | `fw_ksn_tws.hex` | No rain total; no fill of slots not measured. Test station 1002 |
 
-The LPC845 firmware (`sensor.hex`) is the same for all three.
+The LPC845 firmware (`ctrl.hex`, called `sensor.hex` before v6.9.26) is the same for all three.
 
 **BIHAR_TRG** runs on bench unit 1923 (BSNL SIM). **KSNDMC_TRG** runs on unit 1922 (Airtel IoT SIM) since 2026-11-07
 18:04, sending to the KSNDMC server. KSNDMC_TWS is built and passes the SD file check for each release, but has not
@@ -314,7 +315,7 @@ LPC1768: MENU > FIRMWARE UPDATE copies the config's file (`fw_bihar.hex` etc.) t
 the bootloader, which swaps it in and gives it 3 boots under a 5-minute watchdog. The new image confirms itself after
 30 s with good LPC845 frames, or is rolled back. `REVERT F/W` goes back to the previous image.
 
-LPC845 (CTRL F/W): the LPC1768 sends `sensor.hex` over the link (about 60 s, about 330 B/s), the LPC845 checks it,
+LPC845 (CTRL F/W): the LPC1768 sends `ctrl.hex` over the link (about 60 s, about 330 B/s), the LPC845 checks it,
 swaps it in (about 9 s) and runs it on trial until the LPC1768 confirms it with `$UC`. A hang on trial is restarted
 by the bootloader's 5.3-minute watchdog and rolled back. Updates are refused within 3 minutes of a slot. The LPC845
 restart drops the rails, so the LPC1768 restarts too; the rain count is kept (845-v1.3).
@@ -339,7 +340,7 @@ SD card files:
 | `REJECTED.TXT` | Records the server refused 3 times |
 | `LOG/<YYMMDD>.TXT`, `HTTPLOG.TXT`, `DEBUG.TXT` | Debug logs (about 1 MB a day). To be switched off in production |
 | `LASTSLOT.DAT`, `LASTLOG.DAT`, `FLASHSYN.DAT`, `ERRSYNC.DAT`, `RATMODE.DAT`, `SDCHECK.DAT` | State |
-| `fw_bihar.hex`, `fw_ksn_trg.hex`, `fw_ksn_tws.hex`, `sensor.hex` | Firmware files, never deleted by the unit |
+| `fw_bihar.hex`, `fw_ksn_trg.hex`, `fw_ksn_tws.hex`, `ctrl.hex` | Firmware files, never deleted by the unit |
 
 Flash record log: each page holds the SD record and the HTTP payload (up to 167 characters; Bihar's is about 140).
 Outage start and end are marked, so after a card failure the unit can work out which records never reached the
@@ -471,6 +472,24 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | Overnight 2026-11-08/09, both units back on BSNL SIMs | 1922 (its own SIM 404719180719647): all 33 slots 23:30-07:30 sent in 6 s, no "no network service" at all, so the evening refusals were the network, not the SIM. BIHAR (its own SIM 404719200808782): all slots sent, 7-9 s, except 23:45 (72 s: first slot after the swap, data up on the old `airteliot.com`, `NETOPEN` failed twice, sent by modem HTTP) and 07:00 (37 s: `CIPOPEN` by name got no answer in 20 s, the retry by IP got `+CIPOPEN: 0,4 ERROR` at once as socket 0 was still opening, sent by modem HTTP). Swap back logged on both (40445 to 40471) | Pass; two fixes in v6.9.22 |
 | v6.9.22 | Built and host-tested only: after activating data, `AT+CGCONTRDP` is read and if the connection is on another of this firmware's APNs (left from another SIM), a fresh attach on the SIM's own APN before sending; an APN in the carrier's own words counts as fine (parser host-tested on the logged replies, suffix `.mncNNN.mccNNN.gprs`, quotes, case, bad replies). A `CIPOPEN` with no answer at all now closes the network (`AT+NETCLOSE`) so the next try starts clean. All three configs build (108,852 / 108,828 / 107,728 B); hosted update tests; static stack unchanged (modem 368 B spare) | Pass |
 | v6.9.22 on units (2026-11-09) | SD install on both (BIHAR 07:41, 1922 the same morning). BIHAR SIM swaps: to Airtel at 08:00 (data already on `airteliot.com`, no re-attach needed, 10 s); back to BSNL at 08:15: data came up on `airteliot.com` again, the check saw it, re-attached on `bsnlnet` and sent in **21 s** (the same case took 72 s on v6.9.21). Stacks and heap unchanged | Pass |
+| 845-v1.7 | BIHAR from 09:20 and 1922 from 10:34, 2026-11-09: wake at hh:mm:30, registered at the first check at +62 s, awake about 40 s a slot (was 68-81 s). BIHAR: 6 of 6 slots with a SIM sent first time on BSNL. 1922: BSNL refused data ("no network service") in 3 of 4 slots (10:45, 11:15, 11:30), against 1 of about 40 on the old wake that morning and 8 on the afternoon of 11-08; same network as BIHAR, so watched overnight before commit | Pass so far; overnight pending |
+| v6.9.22T test build, 1922 | Settings cut: KEY TEST LEFT erases the settings sector and cuts power before rewriting it. Woke as 1922, ERROR "Settings sector was blank ... station ID 001922 taken from the newest record", sector rewritten, 11:15 sent as 001922. The ID is now stored padded (001922), same as the payload | Pass |
+| v6.9.22T test build, 1922 | Forced crash: KEY TEST ENTER jumps to 0xF0000000. Restarted in 4 s; ERRORS.TXT "RESTARTED AFTER CRASH: pc=0xF0000000 lr=0x0002372D cfsr=0x00000001" (lr in ui_display_task_step); next slot normal. The line had run time (T+0.2 s), not the date: fixed in v6.9.23 | Pass |
+| v6.9.22, BIHAR | SIM removed 10:20-11:20: each slot stopped 2 s after "SIM not inserted" (5 s awake), record kept; 11:30 sent its own record and the 4 late ones (24 s) | Pass |
+| v6.9.22U test build, 1922 | Catch-up cut: TESTCUT.TXT cuts power after the 2nd record is copied from flash to the card and before FLASHSYN.DAT notes it. Next slot repeated only the newest row, which the day file recognised: no duplicate rows | Pass |
+| v6.9.22U, 1922 | Cut during the send (`bench/cut845.py`, 12:30 slot): the record was stored in flash but never queued, so it was lost (server had no 12:30). Queuing happens only when a send fails, and the cut came before that | **Fail, fixed in v6.9.23** |
+| v6.9.23, 1922 | Same cut at 13:45: at the next boot `queue_unfinished_slot` finds the newest record newer than LASTSLOT.DAT and already on the card, queues it ("stored but did not finish (power lost?)"), sent at 14:00. Server has 13:45 once | Pass |
+| v6.9.24, 1922 | LCD flash at a slot wake: the LPC1768 drove the LCD pins (backlight included) at start-up before knowing the boot type. Pins now held low until the status frame says operator boot (or the 3 s fallback). 14:00 slot: LCD stayed dark | Pass |
+| v6.9.24, 1922 | 12 V off 10 s at 14:11 (whole unit): operator boot 14:12:02, clock right, LPC845 rain count restored from the 14:00 record (rainday 1.00 kept), sleep at 14:13:32; 14:15-15:15 sent once each, no false gap rows | Pass |
+| v6.9.24, 1922 | Card filled to 0 bytes (`bench/fill_card.sh`): 15:45 failed to write the card and kept the record in flash, sent it; 16:00 copied 15:30 and 15:45 to the card. No 15:45 debug lines reached the card at all, so the card was probably not readable at 15:45 rather than full: every file has up to a cluster of slack, enough for a day row and a slot's log. Records and sends proven; the full-card write path itself not exercised. v6.9.25: a short write is cut back off the day file (no half row for the catch-up to append after), and the error says "SD card full" | Partly: recovery Pass |
+| v6.9.24, 1922 | 5 tries on CGACT "no network service" (added in v6.9.24): at 14:00 all 5 failed in 13 s and the radio restart cleared it as before. Back to 2 tries in v6.9.25 | Reverted |
+| CTRL v1.8, 1922 | Slot closed once (`bench/repeat_close.py`): at 17:15:40 the probe set `last_rec_min` back to 14, as a clock set back across 17:15 does. repeat_closes 0 to 1, rain_day_tips 2 kept, late_wakes 1 kept, no wake pending. Before v1.8 the slot closed again and its stored count was overwritten with the tips since the first close | Pass |
+| v6.9.26 + CTRL v1.8 | Names: the control board version is plain v1.8 and the LCD says CTRL, never 845; its SD file is `ctrl.hex` (was `sensor.hex`). Backlog: one more try 3 s after a send that failed before reaching the server (not after a refusal, an unanswered send, a lost network or the slot time) | Installed on 1922 17:03; overnight pending |
+| v6.9.26, 1922 to KSNDMC_TWS | First real type change since the DATA clean-up was added. Crash loop: `storage_erase_station_data` passed f_readdir a FILINFO with `lfname` left as stack garbage (`_USE_LFN` 1), FatFs wrote the long name there; pc=0x28DE0 in get_fileinfo, cfsr 0x400, every boot until the erase finished, so 3 faults then off. Recovered by removing DATA from the card. Then the 17:30 slot wake ran its slot at +1 s and slept before `fw_app_step` reached the type check: 120 old TRG records copied to the card as 001002 files (card only; queue was empty, so nothing old was sent). **Fail, both fixed in v6.9.27:** FILINFO zeroed; the check runs in `fw_app_init` before any slot (firmware on trial still waits for its confirmation). 17:30 TWS record delivered, 200 OK | Fail, fixed |
+| CTRL v1.9 + v6.9.28, 1922 (TWS 1002) | Sensors fitted 17:50: T/H read 0 (no I2C answer at 0x40), WD 6-24 deg, WS max about 0.7 m/s, battery 0.23 V from 17:45 (11.87 V at 17:30, same firmware): battery sense lost with the new TWS cable. Compared with TWS845 (LPC845) and TWS5_1_0_5 (LPC1768): CTRL v1.9 reads the device ID (0x10 HDC1080, else HDC2022/2080) and uses each one's sequence, unsigned bytes, a real conversion wait (the old empty loops were removed by -Os), HDC1080 -902 as TWS845. v6.9.28 wind scaling as TWS5: speed = pulses per second / 4, direction = ADC x 360 / 4095 (was the ESP32's 0.45 m/2 pulses, ADC 140-3950). TWS5's two-point calibration defaults (+2.8 C, humidity x0.75 +10.45) not taken | Built; cable to check |
+| CTRL v1.9 by MCU-Link, 1922 18:05 | HDC1080 found (ID 0x10): 24.8-25.2 C, 58-72 %. P0_18 (wind direction) ADC 18-56 and P0_17 (battery sense, next pin) 0-4 with the new TWS cable: both inputs unconnected; same code as TWS845, so the cable. v6.9.28 also logs ERROR at each slot for a battery below 2 V (sense line) and, on TWS, temperature and humidity both 0 (no sensor answer), and lets an update through on a battery below 2 V (it blocked CTRL v1.9: "BATTERY LOW NOT UPDATING"). 1922 back to KSNDMC_TRG (station 1922) until a new cable; TWS resumes then | Cable fault; T/H Pass |
+| CTRL v1.10, built 2026-11-09 evening | Pre-night review: v1.9's T/H read busy-waits about 0.1 s every 10 s even with no sensor (every TRG unit: 959 failed reads on 1922 by 19:47). The receive buffer holds one command, so a second one inside that time is dropped, e.g. the $f7 sent 100 ms after $f4 at sleep (the LPC1768 resends it after 10 s, so only power is lost). v1.10 stops when the sensor doesn't answer its ID request, and drops the 35 ms wait after the read (removed by -Os before v1.9). 20,184 B of 24 KB | Built |
+| v6.9.28 + CTRL v1.10, 1922 overnight 2026-11-09/10 | CTRL v1.9 to v1.10 by SD 20:25 (rain total kept: 4 tips). SIM taken out 20:30-22:00 (user test): 7 slots "No SIM inserted", stored and queued, each asleep by +36 s; SIM back for 22:15: all 7 sent in that slot. 44 of 44 slots accounted for to 07:15; BSNL refusal only at 22:16 (cleared in the slot), 22:30-07:15 all first try in 5-7 s; no crash, no damaged frames, no $f7 resend | Pass |
 | v6.9.12 + 845-v1.5 | BIHAR 1923 off 19:00 to 09:00, both installed by SD at power-up | Pass: 19:15-08:30 sent as -110 with CUM 10, 08:45 as -112 with CUM 0, live from 09:00, backlog done in 4 slots (15 a slot); 845 UPDATE OK |
 
 ### Not tested yet
@@ -478,11 +497,12 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 - Bad-clock wait (v6.9.4 change)
 - GPS job stack margin, and GPS fix at all (no fix seen, even with the antenna)
 - Damaged-frame count comparison (no damaged frames occurred)
-- KSNDMC_TWS on a unit and server
+- KSNDMC_TWS: records and server proven (1002, 17:30 and 17:45, 2026-11-09), HDC1080 proven; wind direction, wind speed against a reference, and battery on the TWS cable wait for a new cable
 - `rtc_lost845.py safety` (safety wake alone) on a unit
 - v6.9.13 slot naming on a unit (needs the LPC845 clock lost at a slot)
-- Real battery drain; long outages; full card; power cuts during settings save and firmware swap on the real unit
-- Crash capture with the stack in AHB SRAM (needs a forced hard fault in a test build)
+- Real battery drain; long outages
+- A card that stays full for many slots (the full-card write path, v6.9.25)
+- Power cut at the firmware swap on a unit (the LPC845 cannot time it; covered by host tests)
 
 ---
 
@@ -499,8 +519,8 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | Status SMS marked "Flag Invalid" by the server | Ignored (user, 2026-11-08) |
 | RAM | Fixed in v6.9.11: heap in AHB SRAM, about 16.8 KB main RAM free (was 764 B). Confirm on the long run |
 | SMS on 2G can take over a minute | Watch (power) |
-| Bihar SMS number | Temporary 9980945474; the ESP32 uses 9741391102 |
-| No low-battery handling | Open: a flat battery tries the modem every slot and can reset in a loop (1922 on 2026-11-08). Skip the modem below a set voltage and keep the records |
+| Bihar SMS number | Closed: 9980945474 stays as the production number (user, 2026-11-09) |
+| No low-battery handling | On hold (user, 2026-11-09): a flat battery tries the modem every slot and can reset in a loop (1922 on 2026-11-08). Skip the modem below a set voltage and keep the records |
 | Log noise | Fixed in v6.9.14: the SMS poll and socket closes are no longer logged unless a message arrives |
 | Modem task stack | **Fixed in v6.9.15.** v6.9.10 cut it from 768 to 512 words, but `bench/stack_callgraph.py` kept the old limits, so the "200 B spare" reported since was against 768 words: at 512 the worst path (an SMS command reply that fails, restarts a silent modem and syncs the clock) was about 820 B short. 74 words free was measured on 1922 in the safety-wake slot (2026-11-08 16:07). Now 832 words (456 B spare in the worst case), heap 20 KB; the script's limits match the firmware |
 | LPC845 clock set back across a boundary | A server correction of 90 s or more across xx:00/15/30/45 runs that boundary twice: the stored 15-min sample keeps only the second part (CUM_RF stays right). Rare; not fixed |
@@ -559,7 +579,7 @@ the power-cut tests themselves.
 
 **Then:** KSNDMC_TRG on the bench (after the long run), then KSNDMC_TWS last (needs sensors); health report twice a
 day (01:00 and 13:00) with SEND HEALTH; OTA through the health server with a signature check; production settings
-(debug log switch, Bihar SMS number, solar on TRG); real-battery test; factory programming script; merge to `main`.
+(debug log switch, solar on TRG); real-battery test; factory programming script; merge to `main`.
 
 **On hold:** hourly backoff in outages; GPS power reduction until GPS works; old-unit fallback mode; ESP32 test jig
 (separate project).

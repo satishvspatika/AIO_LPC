@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION    "v6.9.22"
+#define FIRMWARE_VERSION "v6.9.28"
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
 #define ENABLE_TEST_SEND    0
@@ -65,7 +65,7 @@
 #define FW_FILE_KSNDMC_TRG      "fw_ksn_trg.hex"
 #define FW_FILE_BIHAR_TRG       "fw_bihar.hex"
 #define FW_FILE_KSNDMC_TWS      "fw_ksn_tws.hex"
-#define FW_CTRL_FILENAME        "sensor.hex"
+#define FW_CTRL_FILENAME        "ctrl.hex"
 #define FW_HISTORY_FILENAME     "UPDATE.TXT"
 #define DEBUG_TRIGGER_FILENAME  "DEBUG.TXT"
 
@@ -80,15 +80,19 @@
 #define GPS_MOVE_LIMIT_M        50      /* Save a new position only if it moved further than this */
 #define GPS_FIX_TIMEOUT_SEC     90      /* Longest try: with no antenna, this is all it costs */
 #define GPS_MIN_BATTERY_V       11.8f   /* Scheduled tries are skipped below this */
+#define BATTERY_SENSE_FAULT_V   2.0f    /* A reading below this is a broken sense line, not a battery */
 
 /* Rainfall Parameters */
 #define RF_BUCKET_RESOLUTION   0.50f   /* mm per bucket tip */
 
-/* Sensor Scaling (same as the ESP32): the LPC845 sends raw counts */
-#define WS_CALIBRATION_FACTOR  0.45f   /* Metres per anemometer revolution */
-#define WIND_TEETH_COUNT       2.0f    /* Pulses per revolution */
-#define WIND_DIR_ADC_MIN       140
-#define WIND_DIR_ADC_MAX       3950
+/* Sensor scaling: the LPC845 sends raw counts. As the LPC TWS5 firmware (TWS5_1_0_5, sensor.c) that
+ * ran these sensors on this board: speed = pulses per second / 4, direction = ADC x 360 / 4095.
+ * Up to v6.9.27 these were the ESP32's (0.45 m per revolution, 2 pulses, ADC 140-3950), which read
+ * speed 10% low and direction offset. */
+#define WS_CALIBRATION_FACTOR  0.5f    /* With 2 pulses per revolution: 0.25 m/s per pulse a second */
+#define WIND_TEETH_COUNT       2.0f
+#define WIND_DIR_ADC_MIN       0
+#define WIND_DIR_ADC_MAX       4095
 
 #endif /* USER_CONFIG_H */
 

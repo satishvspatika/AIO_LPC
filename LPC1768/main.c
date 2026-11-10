@@ -69,8 +69,27 @@ __attribute__((naked)) void HardFault_Handler(void)
 
 static uint32_t s_reset_reason; /* Set first thing in main() */
 
+/* After a crash or watchdog restart the LPC845 is still running, but its first status frame with the
+ * time comes about 1 s after this chip starts. Wait for it (2.5 s at most) so the ERROR line carries
+ * the date and time, not just time since boot. Static: the main task's stack is tight. */
+static void wait_for_clock(void)
+{
+    static telemetry_data_t t;
+    for (int i = 0; i < 25; i++) {
+        if (intermcu_get_telemetry(&t) && strlen(t.present_time) >= 14 && strncmp(t.present_time, "20", 2) == 0 &&
+            t.present_time[2] != '0') {
+            return;
+        }
+        vTaskDelay(100 / portTICK_RATE_MS);
+    }
+}
+
 static void log_previous_crash(void)
 {
+    if ((s_reset_reason & 0x04) || LPC_RTC->GPREG0 == CRASH_MAGIC || LPC_RTC->GPREG0 == STUCK_MAGIC ||
+        LPC_RTC->GPREG0 == STACK_CRASH_MAGIC) {
+        wait_for_clock();
+    }
     /* The hardware watchdog leaves no note of its own: the reset reason is all there is */
     if (s_reset_reason & 0x04) {
         storage_log_debug("ERROR", "RESTARTED BY THE WATCHDOG: the disk task, which feeds it, had stopped");
@@ -289,6 +308,22 @@ static void sync_flash_records_to_sd(void)
             break;
         }
         synced = rec->seq;
+#ifdef TEST_FAULTS
+        /* Bench test build only: TESTCUT.TXT holding "CUT" cuts power after the 2nd record is on the
+         * card and before FLASHSYN.DAT notes it, the worst point. Marked DONE first so it cuts once. */
+        if (n == 1) {
+            char t[8];
+            if (storage_state_load("TESTCUT.TXT", t, sizeof(t)) && strncmp(t, "CUT", 3) == 0) {
+                storage_state_save("TESTCUT.TXT", "DONE\r\n");
+                storage_log_debug("TEST", "Cutting power part way through the catch-up (2nd record on the card, not noted)");
+                vTaskDelay(1000 / portTICK_RATE_MS);
+                hal_power_sleep_system();
+                for (;;) {
+                    vTaskDelay(100 / portTICK_RATE_MS);
+                }
+            }
+        }
+#endif
         /* Noted after every record: a power cut or restart part way through a catch-up then repeats
          * only the newest row, which storage_archive_slot recognises. Noted once at the end, every
          * row copied before the cut would be written to the card a second time. */
@@ -303,7 +338,8 @@ static void sync_flash_records_to_sd(void)
     }
     if (!ok) {
         if (s_sd_ok) {
-            storage_log_debug("ERROR", "SD card not available: records are being kept in flash");
+            storage_log_debug("ERROR", storage_card_full() ? "SD card full: records are being kept in flash"
+                                                           : "SD card not available: records are being kept in flash");
         }
         storage_sd_is_ok(); /* Prepares a refitted card for the next slot */
     }
@@ -379,6 +415,26 @@ static void __attribute__((noinline)) gps_auto_step(const telemetry_data_t *tele
     sim7600_gps_update(today);
 }
 #endif
+
+/* One backlog record, with one more try if the connection failed before the record went out.
+ * Not after a refusal (the record is the problem), a send with no answer (the server may have it:
+ * a repeat could duplicate it), a lost network or a used-up slot. 2G sometimes fails one socket
+ * open straight after another and takes the next (1922, 2026-11-09): one failure used to leave
+ * the rest of the backlog to the next slot. */
+static bool post_backlog_record(const http_endpoint_t *endpoint, const char *payload, int route, portTickType budget_end)
+{
+    if (sim7600_http_post_once(endpoint, payload, route)) {
+        return true;
+    }
+    if (sim7600_post_rejected() || sim7600_post_unanswered() || !sim7600_still_registered() ||
+        (long)(budget_end - xTaskGetTickCount()) <= 0) {
+        return false;
+    }
+    storage_log_debug("BACKLOG", "Backlog send failed before reaching the server: one more try in 3s");
+    hal_power_heartbeat();
+    vTaskDelay(3000 / portTICK_RATE_MS);
+    return sim7600_http_post_once(endpoint, payload, route);
+}
 
 static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out_attempts, int *out_csq, const char **out_reason)
 {
@@ -537,7 +593,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                 /* Carrier NAT needs this gap after a socket closes before opening the next */
                 vTaskDelay(3000 / portTICK_RATE_MS);
 
-                bool bk_ok = sim7600_http_post_once(endpoint, payload, good_route);
+                bool bk_ok = post_backlog_record(endpoint, payload, good_route, budget_end);
 
                 if (bk_ok) {
                     storage_log_debug("BACKLOG", "Backlog delivered OK, marking SENT");
@@ -581,7 +637,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                 hal_power_heartbeat();
                 vTaskDelay(3000 / portTICK_RATE_MS);
 
-                if (sim7600_http_post_once(endpoint, payload, good_route)) {
+                if (post_backlog_record(endpoint, payload, good_route, budget_end)) {
                     storage_log_debug("BACKLOG", "Flash backlog record delivered OK");
                     flash_log_mark_sent(flash_seq);
                     ui_dec_backlog_count();
@@ -678,6 +734,38 @@ static int32_t load_last_slot(void)
         }
     }
     return last;
+}
+
+/* Power lost after a slot's record was stored but before the slot finished (during the modem's send,
+ * the likeliest moment for a weak battery to drop out) left it neither sent nor queued, so the server
+ * never got it: 1922's 12:30 record in the power-cut test, 2026-11-09. The card's LASTSLOT.DAT says
+ * which slot last finished; a newer record means its slot didn't, so it's queued now. Judged only
+ * when the card already held that record (FLASHSYN.DAT): a slot run with the card out can't note
+ * that it finished, and its record mustn't go to the server twice. */
+static void queue_unfinished_slot(int32_t slot_id)
+{
+    const flash_log_page_t *newest = flash_log_newest_record();
+    char line[16];
+    if (!newest || newest->slot_id >= slot_id || newest->payload[0] == '\0') {
+        return;
+    }
+    if (!storage_state_load(LAST_SLOT_FILENAME, line, sizeof(line)) || strlen(line) < 10 ||
+        newest->slot_id <= (int32_t)atol(line)) {
+        return;
+    }
+    if (!storage_state_load(FLASH_SYNC_FILENAME, line, sizeof(line)) || strlen(line) < 10 ||
+        (uint32_t)atol(line) < newest->seq) {
+        return;
+    }
+    if (flash_log_mark_pending(newest->seq)) {
+        ui_inc_backlog_count();
+        /* The record starts "NN,YYYY-MM-DD,HH:MM": name the slot as people read it */
+        const char *r = newest->record;
+        bool readable = strlen(r) >= 19 && r[2] == ',' && r[13] == ',';
+        snprintf(s_slot_line, sizeof(s_slot_line), "Slot %.10s %.5s was stored but did not finish (power lost?): queued to send",
+                 readable ? r + 3 : "?", readable ? r + 14 : "?");
+        storage_log_debug("ERROR", s_slot_line);
+    }
 }
 
 static telemetry_data_t s_gap_record; /* Used by vMain_Task only */
@@ -1002,6 +1090,13 @@ static void __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data
 static void __attribute__((noinline)) note_values_out_of_range(const telemetry_data_t *telem)
 {
     char v[8];
+    /* Not a battery limit: no unit runs on this, so the sense line is broken or unplugged (1922,
+     * new TWS cable, 0.23 V, 2026-11-09). Sent as read. */
+    if (telem->bat1_volt < BATTERY_SENSE_FAULT_V) {
+        fmt_fixed(v, sizeof(v), telem->bat1_volt, 4, 2);
+        snprintf(s_slot_line, sizeof(s_slot_line), "Battery reads %s V: battery sense line broken or unplugged", v);
+        storage_log_debug("ERROR", s_slot_line);
+    }
 #if (UNIT_CFG != KSNDMC_TWS)
     if (telem->rf_15m_mm > SANE_RAIN_15M_MAX_MM) {
         fmt_fixed(v, sizeof(v), telem->rf_15m_mm, 5, 2);
@@ -1009,7 +1104,10 @@ static void __attribute__((noinline)) note_values_out_of_range(const telemetry_d
         storage_log_debug("ERROR", s_slot_line);
     }
 #else
-    (void)telem; (void)v;
+    /* Both exactly 0 is the LPC845's "no answer" (CTRL v1.9 counts these), never a real reading */
+    if (telem->temp_c == 0.0f && telem->humidity_pct == 0.0f) {
+        storage_log_debug("ERROR", "No temperature/humidity reading: check the sensor and its cable");
+    }
 #endif
 }
 
@@ -1068,6 +1166,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         return;
     }
 
+    queue_unfinished_slot(slot_id);
     /* Queue anything missed in the wait below, so it can't delay this slot's record */
     fill_missed_slots(telem, slot_id);
     s_archive_slot_id = slot_id;

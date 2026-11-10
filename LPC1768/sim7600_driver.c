@@ -1154,6 +1154,9 @@ static bool __attribute__((noinline)) activate_apn(const char *apn)
     send_raw("AT+CSOCKSETPN=1\r\n");
     wait_response("OK", 1000, NULL, 0);
 
+    /* Two tries, with an attach between. BSNL's "no network service" on 1922 (2026-11-09) cleared on
+     * the second try once (10:45); 3 times only the radio restart that follows cleared it, and 5
+     * tries over 13 s (v6.9.24, 14:00) didn't help, so more tries only add time. */
     bool active = false;
     for (int attempt = 0; attempt < 2 && !active; attempt++) {
         clear_rx();
@@ -1260,7 +1263,9 @@ static void __attribute__((noinline)) ensure_bearer(void)
     portTickType start = xTaskGetTickCount();
 
     s_bearer_ready = primary[0] && activate_apn(primary);
+    bool details_logged = s_bearer_ready; /* The APN check below logs them */
     if (s_bearer_ready && !log_bearer_details_apn(primary)) {
+        details_logged = false;
         /* The modem attaches by itself at power-on with the APN it last stored, before this sets the
          * new one: after a SIM swap the data connection can be up on the old operator's APN. BSNL
          * then gave an address on airteliot.com but NETOPEN failed twice (BIHAR 23:45, 2026-11-08,
@@ -1294,7 +1299,9 @@ static void __attribute__((noinline)) ensure_bearer(void)
         s_bearer_ready = activate_apn(primary);
     }
 
-    log_bearer_details();
+    if (!details_logged || !s_bearer_ready) {
+        log_bearer_details();
+    }
 }
 
 /* "+IPD" only says a reply has started. Collect the rest, up to 8s as the ESP32 does, because a

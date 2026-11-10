@@ -755,20 +755,20 @@ static void vFwUpdate_Task(void *pvParameters)
         fw_ctrl_state_t state;
         fw_result_t r = fw_ctrl_check(FW_CTRL_FILENAME, &s_fw_info, fw_progress);
         if (r == FW_E_NOT_FOUND) {
-            fw_show(FW_UI_MESSAGE, "SENSOR.HEX", "NOT FOUND");
+            fw_show(FW_UI_MESSAGE, "CTRL.HEX", "NOT FOUND");
         } else if (r != FW_OK) {
             storage_log_debug("ERROR", fw_update_error_text(r));
             fw_show(FW_UI_MESSAGE, "UPDATE REFUSED", fw_update_error_text(r));
         } else if (!fw_ctrl_query(&state)) {
             /* Firmware from before the bootloader: this needs MCU-Link */
-            fw_show(FW_UI_MESSAGE, "845 CAN'T UPDATE", "NO BOOTLOADER");
+            fw_show(FW_UI_MESSAGE, "CTRL CANT UPDATE", "NO BOOTLOADER");
         } else if (state.state == FW_J_TRIAL_BOOT) {
-            fw_show(FW_UI_MESSAGE, "845 ON TRIAL", "TRY AGAIN SOON");
+            fw_show(FW_UI_MESSAGE, "CTRL ON TRIAL", "TRY AGAIN SOON");
         } else if (s_fw_info.crc32 == state.crc32) {
-            snprintf(line, sizeof(line), "SAME F/W %.7s", s_fw_info.version);
+            snprintf(line, sizeof(line), "SAME CTRL %.6s", s_fw_info.version);
             fw_show(FW_UI_CONFIRM_CTRL, line, "EN=REDO BACK=NO");
         } else {
-            snprintf(line, sizeof(line), "%.12s FOUND", s_fw_info.version);
+            snprintf(line, sizeof(line), "CTRL %.6s FOUND", s_fw_info.version);
             fw_show(FW_UI_CONFIRM_CTRL, line, "EN=YES  BACK=NO");
         }
         break;
@@ -776,7 +776,7 @@ static void vFwUpdate_Task(void *pvParameters)
     case FW_OP_INSTALL_CTRL: {
         fw_result_t r = fw_ctrl_send_image(FW_CTRL_FILENAME, &s_fw_info, fw_progress);
         if (r == FW_OK) {
-            fw_show(FW_UI_BUSY, "INSTALLING 845", "DO NOT POWER OFF");
+            fw_show(FW_UI_BUSY, "INSTALLING CTRL", "DO NOT POWER OFF");
             strncpy(s_status_sms_substep, "DO NOT POWER OFF", sizeof(s_status_sms_substep) - 1);
             storage_log_debug("FW", "New LPC845 firmware sent and checked, restarting it to install");
             storage_log_flush();
@@ -861,7 +861,12 @@ static bool fw_safe_to_install(const telemetry_data_t *telemetry)
             return false;
         }
     }
-    if (telemetry->bat1_volt < GPS_MIN_BATTERY_V) {
+    /* Below 2 V the unit could not be running: the battery sense line is broken or unplugged, not the
+     * battery flat (1922, new TWS cable, 0.23 V, 2026-11-09). Blocking would leave no way to install
+     * the fix, so that one is logged and allowed; a real low battery still stops the update. */
+    if (telemetry->bat1_volt < BATTERY_SENSE_FAULT_V) {
+        storage_log_debug("ERROR", "Battery reads below 2 V (sense line?): updating anyway");
+    } else if (telemetry->bat1_volt < GPS_MIN_BATTERY_V) {
         fw_show(FW_UI_MESSAGE, "BATTERY LOW", "NOT UPDATING");
         return false;
     }
@@ -973,6 +978,9 @@ static void lcd_pulse_en(void)
 
 static void lcd_write_nibble(uint8_t nibble, bool is_data)
 {
+    if (!s_lcd_initialized) {
+        return; /* Pins held low until the LCD is set up (lcd_pins_quiet) */
+    }
     if (is_data) {
         LPC_GPIO2->FIOSET = MASK_LCD_RS;
     } else {
@@ -1027,6 +1035,7 @@ static void lcd_init_hw(void)
     LPC_GPIO2->FIODIR |= (MASK_LCD_RS | MASK_LCD_RW | MASK_LCD_EN | MASK_LCD_D4 | MASK_LCD_D5 | MASK_LCD_D6 | MASK_LCD_D7 | MASK_LCD_BL);
     LPC_GPIO2->FIOCLR = (MASK_LCD_RS | MASK_LCD_RW | MASK_LCD_EN | MASK_LCD_D4 | MASK_LCD_D5 | MASK_LCD_D6 | MASK_LCD_D7);
     LPC_GPIO2->FIOSET = MASK_LCD_BL;
+    s_lcd_initialized = true;
 
     delay_us(60000);
     lcd_write_nibble(0x03, false);
@@ -1332,10 +1341,31 @@ bool ui_is_operator_touched(void)
     return s_operator_touched_key;
 }
 
+/* LCD lines low and the backlight off. Driven high or pulled up while the LCD's 5 V rail is off, they
+ * power the backlight and controller weakly through the pins: a flicker at every slot wake (1922,
+ * 2026-11-09) and wasted current. The LCD is set up once the boot is known to be an operator's. */
+static void lcd_pins_quiet(void)
+{
+    PINSEL_CFG_Type pin_cfg;
+    pin_cfg.Portnum = LCD_PORT;
+    pin_cfg.Funcnum = PINSEL_FUNC_0;
+    pin_cfg.Pinmode = PINSEL_PINMODE_TRISTATE;
+    pin_cfg.OpenDrain = PINSEL_PINMODE_NORMAL;
+
+    const uint8_t lcd_pins[] = {PIN_LCD_RS, PIN_LCD_RW, PIN_LCD_EN, PIN_LCD_D4, PIN_LCD_D5, PIN_LCD_D6, PIN_LCD_D7, PIN_LCD_BL};
+    for (size_t i = 0; i < sizeof(lcd_pins); i++) {
+        pin_cfg.Pinnum = lcd_pins[i];
+        PINSEL_ConfigPin(&pin_cfg);
+    }
+    LPC_GPIO2->FIOCLR = (MASK_LCD_RS | MASK_LCD_RW | MASK_LCD_EN | MASK_LCD_D4 | MASK_LCD_D5 | MASK_LCD_D6 | MASK_LCD_D7 | MASK_LCD_BL);
+    LPC_GPIO2->FIODIR |= (MASK_LCD_RS | MASK_LCD_RW | MASK_LCD_EN | MASK_LCD_D4 | MASK_LCD_D5 | MASK_LCD_D6 | MASK_LCD_D7 | MASK_LCD_BL);
+    s_lcd_initialized = false;
+}
+
 void ui_display_init(void)
 {
     keypad_init_hw();
-    lcd_init_hw();
+    lcd_pins_quiet();
     s_current_screen_idx = 0;
     s_ui_mode = UI_MODE_BROWSE;
     s_status_sms_state = STATUS_UI_IDLE;
@@ -1934,6 +1964,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             s_boot_mode_known = true;
         } else if (telemetry->usb_power_flag == 'U') {
             storage_log_debug("BOOT", "Boot type: OPERATOR (LCD rail on)");
+            lcd_init_hw();
             s_boot_mode_known = true;
         } else if (++s_boot_wait_ticks >= (3 * 20)) {
             storage_log_debug("ERROR", "No status from LPC845 after 3s: assuming OPERATOR boot, check UART3 link");
@@ -2102,6 +2133,16 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 vTaskDelay(500 / portTICK_RATE_MS);
                 for (;;) {
                 }
+            } else if (key == KEY_LEFT) {
+                extern volatile int g_test_cut_after_erase;
+                storage_log_debug("TEST", "Cutting power between erasing and rewriting the settings sector");
+                vTaskDelay(2000 / portTICK_RATE_MS);
+                g_test_cut_after_erase = 1;
+                flash_nvram_set_station_id(flash_nvram_get_station_id());
+            } else if (key == KEY_EN) {
+                storage_log_debug("TEST", "Forcing a hard fault (jump to 0xF0000000)");
+                vTaskDelay(2000 / portTICK_RATE_MS);
+                ((void (*)(void))0xF0000001UL)();
             }
 #endif
             s_key_test_last = key;

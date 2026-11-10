@@ -1,8 +1,8 @@
 /* A whole LPC845 update on a simulated chip: the LPC1768's sender (fw_update.c, fw_ctrl.c) talking to
- * the LPC845's receiver (fw845_recv.c) and bootloader logic (boot_core.c), with a real sensor.hex:
+ * the LPC845's receiver (fw845_recv.c) and bootloader logic (boot_core.c), with a real ctrl.hex:
  *   cc -std=gnu11 -DFW_TARGET_LPC845 -I.. -I../.. -I../../../LPC845/boot -o ctrl_test ctrl_test.c \
  *      ../../fw_update.c ../../fw_ctrl.c ../../../LPC845/boot/fw845_recv.c ../boot_core.c ../fw_journal.c
- *   ./ctrl_test ../../../LPC845/sensor.hex */
+ *   ./ctrl_test ../../../LPC845/ctrl.hex */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

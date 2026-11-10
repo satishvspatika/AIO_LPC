@@ -76,14 +76,14 @@ ${OBJCOPY} -O binary "${DIR}/LPC845_TWS.axf" "${DIR}/LPC845_TWS.bin"
 python3 "${SCRIPTS_DIR}/lpc_checksum.py" "${DIR}/LPC845_TWS.bin"
 python3 "${SCRIPTS_DIR}/fw_image.py" "${DIR}/LPC845_TWS.bin" --lpc845
 # The SD card file: firmware only, as the bootloader never changes
-${OBJCOPY} -I binary -O ihex --change-addresses 0x00002400 "${DIR}/LPC845_TWS.bin" "${DIR}/sensor.hex"
+${OBJCOPY} -I binary -O ihex --change-addresses 0x00002400 "${DIR}/LPC845_TWS.bin" "${DIR}/ctrl.hex"
 # The factory file: bootloader and firmware, for MCU-Link
 HEX_STRIP='^:00000001FF|^:04000005|^:04000003'
 grep -vE "${HEX_STRIP}" "${DIR}/LPC845_BOOT.hex" > "${DIR}/LPC845_TWS.hex"
-grep -vE "${HEX_STRIP}" "${DIR}/sensor.hex" >> "${DIR}/LPC845_TWS.hex"
+grep -vE "${HEX_STRIP}" "${DIR}/ctrl.hex" >> "${DIR}/LPC845_TWS.hex"
 echo ":00000001FF" >> "${DIR}/LPC845_TWS.hex"
 python3 "${SCRIPTS_DIR}/fw_check_hex.py" "${DIR}/LPC845_TWS.hex" --lpc845
 ${SIZE} "${DIR}/LPC845_TWS.axf"
 echo "=== LPC845 Build Successful! ==="
 echo "    Factory (MCU-Link): ${DIR}/LPC845_TWS.hex"
-echo "    SD card:            ${DIR}/sensor.hex"
+echo "    SD card:            ${DIR}/ctrl.hex"

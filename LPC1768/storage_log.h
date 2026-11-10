@@ -36,6 +36,8 @@ bool storage_state_save(const char *filename, const char *text);
 
 /* 15-minute raw sensor archive */
 bool storage_archive_slot(const char *day_file, const char *record);
+/* True when the last storage_archive_slot failed because the card is full */
+bool storage_card_full(void);
 
 /* Backlog Management on SD Card */
 void storage_backlog_init(void);

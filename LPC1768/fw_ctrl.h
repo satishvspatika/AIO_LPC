@@ -1,4 +1,4 @@
-/* Sends sensor.hex to the LPC845 over the link between the chips. The LPC845's running firmware
+/* Sends ctrl.hex to the LPC845 over the link between the chips. The LPC845's running firmware
  * stores it in staging and proves it (LPC845/boot/fw845_recv.c), and its bootloader installs it. */
 #ifndef FW_CTRL_H
 #define FW_CTRL_H

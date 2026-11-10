@@ -451,6 +451,13 @@ void storage_log_flush(void)
     }
 }
 
+static bool s_card_full;
+
+bool storage_card_full(void)
+{
+    return s_card_full;
+}
+
 bool storage_archive_slot(const char *day_file, const char *record)
 {
     if (!day_file || !record) return false;
@@ -468,6 +475,7 @@ bool storage_archive_slot(const char *day_file, const char *record)
     /* Data reaches the card at close, so its result counts: with no card-detect pin this is
      * how a pulled card shows up */
     bool ok = false;
+    s_card_full = false;
     if (f_open(&s_archive_file, filepath, FA_OPEN_ALWAYS | FA_READ | FA_WRITE) == FR_OK) {
         UINT bw = 0, bw_end = 0;
         UINT len = (UINT)strlen(record);
@@ -486,11 +494,19 @@ bool storage_archive_slot(const char *day_file, const char *record)
             }
         }
 
-        f_lseek(&s_archive_file, s_archive_file.fsize);
+        DWORD start = s_archive_file.fsize;
+        f_lseek(&s_archive_file, start);
         FRESULT r1 = f_write(&s_archive_file, record, len, &bw);
         FRESULT r2 = f_write(&s_archive_file, "\r\n", 2, &bw_end);
+        s_card_full = (r1 == FR_OK && r2 == FR_OK && (bw != len || bw_end != 2));
+        if (s_card_full) {
+            /* A full card takes part of a row. Cut it back off, or the catch-up adds the whole row
+             * after the broken one. */
+            f_lseek(&s_archive_file, start);
+            f_truncate(&s_archive_file);
+        }
         FRESULT r3 = f_close(&s_archive_file);
-        ok = (r1 == FR_OK && r2 == FR_OK && r3 == FR_OK && bw == len && bw_end == 2);
+        ok = (r1 == FR_OK && r2 == FR_OK && r3 == FR_OK && !s_card_full);
     }
     fs_unlock();
     return ok;
@@ -768,7 +784,11 @@ int storage_erase_station_data(void)
     static const char *const state_files[] = { LAST_SLOT_FILENAME, FLASH_SYNC_FILENAME, LAST_LOGGED_FILENAME, BACKLOG_FILENAME, REJECTED_FILENAME };
     int removed = 0;
     DIR dir;
-    FILINFO info;
+    /* Zeroed: with long names on (_USE_LFN), f_readdir writes each name to info.lfname. Left as
+     * stack garbage it wrote to a random address and the unit crashed at every boot until the
+     * erase finished (1922 to KSNDMC_TWS, 2026-11-09). NULL means short names only, which is what
+     * f_unlink below needs. */
+    FILINFO info = { 0 };
     char path[24];
 
     fs_lock();

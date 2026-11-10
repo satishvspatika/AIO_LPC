@@ -4,6 +4,13 @@
 #include "LPC17xx.h"
 #include <string.h>
 #include <stddef.h>
+#ifdef TEST_FAULTS
+#include "hal_power.h"
+#include "FreeRTOS.h"
+#include "task.h"
+/* Bench test build only (KEY TEST, LEFT): cut power with the settings sector erased, not rewritten */
+volatile int g_test_cut_after_erase = 0;
+#endif
 
 #define IAP_LOCATION    0x1FFF1FF1
 
@@ -57,6 +64,14 @@ static bool iap_write_sector1(const void *src_buf, size_t len)
 
         /* Critical: Settling delay after sector erase (~100-200ms) */
         for (volatile int d = 0; d < 300000; d++);
+#ifdef TEST_FAULTS
+        if (g_test_cut_after_erase) {
+            hal_power_sleep_system(); /* $f7: the LPC845 cuts this chip's rail */
+            for (;;) {
+                vTaskDelay(100 / portTICK_RATE_MS); /* if $f7 is lost, the watchdog resets with the sector blank */
+            }
+        }
+#endif
 
         /* Step 3: Prepare Sector 1 again before write */
         s_iap_cmd[0] = 50;
