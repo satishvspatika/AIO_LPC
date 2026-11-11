@@ -24,7 +24,7 @@
 #include "fw_layout.h"
 #include "boot_core.h"
 
-#define MIG_VERSION "MIG-1.2"
+#define MIG_VERSION "MIG-1.3"
 
 const fw_image_info_t g_fw_image_info = {
     FW_IMAGE_MAGIC, FW_BOARD_ID, 0, 0, 0xFFFFFFFFUL, MIG_VERSION   /* Length and CRC: build.sh */
@@ -143,6 +143,19 @@ static void set_unit_dir(void)
     }
 }
 
+/* The production firmware takes the station ID from 0x1000 only as 4-6 digits there
+ * (LPC1768/flash_nvram.c flash_nvram_init). Anything else and it would fall back to the ID in the
+ * newest stored record, which a first conversion clears, so the unit would send as the build's
+ * default station. MIG-1.3: the conversion carries on (the ID can be set from the keypad
+ * afterwards); the report and the LCD say so. */
+static bool station_id_valid(void)
+{
+    const char *p = (const char *)0x1000;
+    int n = 0;
+    while (n < 7 && p[n] >= '0' && p[n] <= '9') n++;
+    return n >= 4 && n <= 6;
+}
+
 static const char *unit_path(const char *name)
 {
     strcpy(s_path, s_dir);
@@ -246,6 +259,15 @@ int main(void)
         }
     } else {
         rep("OLDFLASH.BIN already there (rerun on this unit): kept\r\n");
+    }
+
+    /* Station ID the production firmware will read */
+    if (station_id_valid()) {
+        rep("Station ID: valid, the new firmware keeps it\r\n");
+    } else {
+        rep("Station ID: none found (not 4-6 digits at 0x1000): the new firmware starts with its default ID. Set it from the keypad afterwards\r\n");
+        lcd_show("NO OLD STN ID", "DEFAULT ID USED");
+        hal_delay_ms(4000);
     }
 
     /* 4. Station type: which production file. Before touching anything. */

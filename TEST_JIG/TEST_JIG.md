@@ -441,6 +441,12 @@ MIG-1.1 the files sat in `MIGRATE/` itself and a second unit found the first uni
 (the keep is for reruns on the same unit after a power cut), so its own were never saved. About 165 KB
 per unit. `MIGRATE/TYPE.TXT` stays where it is.
 
+MIG-1.3 (built 2026-11-11, not yet run on a unit): reports the station ID. If 0x1000 starts with 4-6
+digits (the only form the production firmware takes the ID from, `flash_nvram_init`) the unit keeps it;
+otherwise the conversion carries on, the LCD shows NO OLD STN ID / DEFAULT ID USED for 4 s, RESULT.TXT
+says so, and the unit comes up with the build's default ID, to be set from the keypad. Keypad changes keep
+the digit form (`flash_nvram_set_station_id`), so reruns on converted units keep their ID.
+
 Practice resets: `TEST_JIG/restore_old_unit.py lpc845|lpc1768 <dump>` puts a converted bench unit back on
 its old firmware (MCU-Link on J2 / J4; waits for DSP, used part only at 4 MHz, about 3 s, read back). CTRL
 chip first, conversion card out of the unit while resetting. Bench only.
