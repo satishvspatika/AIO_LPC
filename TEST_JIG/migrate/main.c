@@ -18,11 +18,12 @@
 #include "LPC17xx.h"
 #include "hal.h"
 #include "isp845.h"
+#include "ctrl845.h"
 #include "ff.h"
 #include "fw_layout.h"
 #include "boot_core.h"
 
-#define MIG_VERSION "MIG-S0.8"
+#define MIG_VERSION "MIG-M1.0"
 
 const fw_image_info_t g_fw_image_info = {
     FW_IMAGE_MAGIC, FW_BOARD_ID, 0, 0, 0xFFFFFFFFUL, MIG_VERSION   /* Length and CRC: build.sh */
@@ -89,7 +90,7 @@ static bool old_bootloader_present(void)
 }
 
 /* Printable runs of 4+ characters in the old settings sector, for the report */
-static void rep_settings_strings(void)
+__attribute__((unused)) static void rep_settings_strings(void)
 {
     char run[40];
     int n = 0;
@@ -127,6 +128,42 @@ static bool write_file(const char *path, const void *data, uint32_t len)
     return r == FR_OK && c == FR_OK && done == len;
 }
 
+static bool file_exists(const char *path)
+{
+    if (f_open(&s_file, path, FA_OPEN_EXISTING | FA_READ) != FR_OK) {
+        return false;
+    }
+    f_close(&s_file);
+    return true;
+}
+
+/* M1 hands over the old CTRL's flash a sector at a time: MIGRATE/OLD845.BIN */
+static FIL s_old845;
+static bool s_old845_open;
+
+static bool save_old845(uint32_t addr, const uint8_t *data, uint32_t len)
+{
+    UINT done = 0;
+    if (addr == 0) {
+        s_old845_open = (f_open(&s_old845, "MIGRATE/OLD845.BIN", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK);
+    }
+    if (!s_old845_open || f_write(&s_old845, data, len, &done) != FR_OK || done != len) {
+        return false;
+    }
+    if (addr + len >= 0x10000U) {
+        s_old845_open = false;
+        return f_close(&s_old845) == FR_OK;
+    }
+    return true;
+}
+
+static void note_line(const char *text)
+{
+    rep("  ");
+    rep(text);
+    rep("\r\n");
+}
+
 static void stop(const char *l1, const char *l2)
 {
     lcd_show(l1, l2);
@@ -138,85 +175,90 @@ int main(void)
 {
     hal_init();
     lcd_init();
-    lcd_show("CONVERT SURVEY", MIG_VERSION);
+    lcd_show("CONVERT M1", MIG_VERSION);
     hal_delay_ms(1500);
 
     /* 1. Own image */
-    rep("Migration survey " MIG_VERSION "\r\n");
+    rep("Migration " MIG_VERSION ": stage M1, CTRL chip (LPC845) to the new CTRL\r\n");
     bool self_ok = fw_image_valid(FW_SLOT_A_BASE);
     rep(self_ok ? "Image check: OK\r\n" : "Image check: FAILED\r\n");
     if (!self_ok) {
         stop("IMAGE DAMAGED", "COPY fw.hex AGAIN");
     }
 
-    /* 2. What is on this chip */
+    /* 2. What is on the LPC1768 */
     rep("Sector 0: ");
     rep(sector0_kind());
     rep("\r\n");
-    rep_kv_hex("  SP    ", rd32(0x0));
-    rep_kv_hex("  reset ", rd32(0x4));
     rep(old_bootloader_present() ? "Old bootloader at 0xB000: present\r\n" : "Old bootloader at 0xB000: NOT FOUND\r\n");
-    rep_kv_hex("  reset ", rd32(0xB004));
     rep_kv_hex("Code protection word 0x2FC: ", rd32(0x2FC));
-    rep("Old settings (0x1000) text:\r\n");
-    rep_settings_strings();
+
+    /* 3. SD card (the old CTRL is saved to it during M1) */
+    bool sd_ok = (f_mount(0, &s_fs) == FR_OK);
+    if (sd_ok) {
+        FRESULT m = f_mkdir("MIGRATE");
+        sd_ok = (m == FR_OK || m == FR_EXIST);
+    }
+    if (!sd_ok) {
+        stop("SD CARD FAIL", "CHECK FAT32 CARD");
+    }
+    if (!file_exists("MIGRATE/OLDFLASH.BIN")) {
+        lcd_show("SD CARD", "SAVING OLD FLASH");
+        bool saved = write_file("MIGRATE/OLDFLASH.BIN", (const void *)0x0, 0x18000);
+        rep(saved ? "Old LPC1768 flash 0x0-0x17FFF saved: MIGRATE/OLDFLASH.BIN\r\n" : "Old LPC1768 flash copy: FAILED\r\n");
+    } else {
+        rep("MIGRATE/OLDFLASH.BIN already there: kept\r\n");
+    }
 
     /* 4. Jumpers */
     bool jp1 = line_jumper_fitted(LINE_RST845);
     bool jp2 = line_jumper_fitted(LINE_PGM845);
     rep(jp1 ? "JP1 (RST_845): fitted\r\n" : "JP1 (RST_845): open\r\n");
     rep(jp2 ? "JP2 (PGM_845): fitted\r\n" : "JP2 (PGM_845): open\r\n");
-
-    /* 5. LPC845 ROM loader */
-    bool isp_ok = false;
-    static isp_survey_t isp;
-    if (jp1 && jp2) {
-        lcd_show("CTRL CHIP", "ROM LOADER...");
-        isp_ok = isp_enter(&isp);
-        if (isp_ok) {
-            isp_read_ids(&isp);
-        }
-        isp_leave();
-        char num[12];
-        rep("LPC845 ROM loader: ");
-        rep(isp_ok ? "OK, rails held by the RAM stub\r\n" : "FAILED\r\n");
-        rep("  last step: "); fmt_dec(num, (uint32_t)isp.step); rep(num);
-        rep(" (1 sync, 2 echo off, 3 unlock, 4 stub written, 5 stub started, 6 resynced)\r\n");
-        rep("  ms to first Synchronized: "); fmt_dec(num, isp.ms_to_sync); rep(num); rep("\r\n");
-        rep("  ms rails floating (reset to stub started): "); fmt_dec(num, isp.ms_rails_floating); rep(num); rep("\r\n");
-        rep("  replies: "); rep(isp.note); rep("\r\n");
-        if (isp_ok) {
-            rep("  J (part ID):   "); rep(isp.part_id); rep("\r\n");
-            rep("  K (boot ver):  "); rep(isp.boot_ver); rep("\r\n");
-            rep("  N (serial):    "); rep(isp.uid); rep("\r\n");
-        }
-        rep("LPC845 restarted with its own firmware\r\n");
-    } else {
-        rep("LPC845 ROM loader: not tried (JP1 + JP2 needed)\r\n");
-    }
-
-    /* 3. Copy of the old flash */
-    lcd_show("SD CARD", "SAVING OLD FLASH");
-    bool sd_ok = (f_mount(0, &s_fs) == FR_OK);
-    if (sd_ok) {
-        FRESULT m = f_mkdir("MIGRATE");
-        sd_ok = (m == FR_OK || m == FR_EXIST);
-    }
-    bool saved = sd_ok && write_file("MIGRATE/OLDFLASH.BIN", (const void *)0x0, 0x18000);
-    rep(saved ? "Old flash 0x0-0x17FFF saved: MIGRATE/OLDFLASH.BIN\r\n" : "Old flash copy: FAILED (SD card)\r\n");
-
-    /* 6. Report */
-    bool rep_ok = sd_ok && write_file("MIGRATE/SURVEY.TXT", s_report, strlen(s_report));
-
-    if (!sd_ok || !rep_ok || !saved) {
-        stop("SURVEY: SD FAIL", "CHECK FAT32 CARD");
-    }
     if (!(jp1 && jp2)) {
-        stop("SURVEY SAVED", jp1 ? "JP2 NOT FITTED" : "JP1 NOT FITTED");
+        write_file("MIGRATE/M1.TXT", s_report, strlen(s_report));
+        stop("FIT JP1 + JP2", "THEN POWER ON");
     }
+
+    /* 5. ROM loader, then M1 */
+    static isp_survey_t isp;
+    lcd_show("CTRL CHIP", "ROM LOADER...");
+    bool isp_ok = isp_enter(&isp);
+    char num[12];
+    rep("LPC845 ROM loader: ");
+    rep(isp_ok ? "OK, rails held by the RAM stub\r\n" : "FAILED\r\n");
+    rep("  last step: "); fmt_dec(num, (uint32_t)isp.step); rep(num); rep("\r\n");
+    rep("  replies: "); rep(isp.note); rep("\r\n");
+    m1_result_t m1 = M1_FAIL_READ;
+    if (isp_ok) {
+        isp_read_ids(&isp);
+        rep("  J (part ID):   "); rep(isp.part_id); rep("\r\n");
+        rep("  K (boot ver):  "); rep(isp.boot_ver); rep("\r\n");
+        rep("M1, new CTRL "); rep(m1_ctrl_version()); rep(":\r\n");
+        bool have_old = file_exists("MIGRATE/OLD845.BIN");
+        m1 = m1_program_ctrl(have_old ? NULL : save_old845, note_line);
+        if (have_old) {
+            rep("  MIGRATE/OLD845.BIN already there: kept\r\n");
+        }
+        static const char *const names[] = {"DONE", "ALREADY NEW", "FAIL READ", "FAIL SECTOR 0", "FAIL ERASE", "FAIL WRITE", "FAIL VERIFY"};
+        rep("  result: "); rep(names[m1]); rep("\r\n");
+    }
+    isp_leave();
+    rep("LPC845 restarted\r\n");
+    write_file("MIGRATE/M1.TXT", s_report, strlen(s_report));
+
     if (!isp_ok) {
-        stop("SURVEY SAVED", "CTRL NO ANSWER");
+        stop("M1: CTRL NO", "ANSWER. RETRY");
     }
-    stop("SURVEY OK", "REMOVE JP1+JP2");
+    if (m1 == M1_DONE) {
+        stop("CTRL NOW NEW", "REMOVE JP1+JP2");
+    }
+    if (m1 == M1_ALREADY) {
+        stop("CTRL ALREADY NEW", "REMOVE JP1+JP2");
+    }
+    if (m1 == M1_FAIL_SECTOR0) {
+        stop("M1 FAIL SECTOR 0", "DO NOT POWER OFF");
+    }
+    stop("M1 FAILED", "POWER OFF/ON");
     return 0;
 }

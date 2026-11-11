@@ -223,6 +223,125 @@ bool isp_enter(isp_survey_t *out)
     return true;
 }
 
+/* ---- commands after the session is up (UM11029 5.5) ---- */
+static char s_cmd[48];
+
+static void cmd_start(char c)
+{
+    s_cmd[0] = c;
+    s_cmd[1] = '\0';
+}
+
+static void cmd_num(uint32_t v)
+{
+    size_t n = strlen(s_cmd);
+    s_cmd[n] = ' ';
+    fmt_dec(&s_cmd[n + 1], v);
+}
+
+/* Sends s_cmd and reads the return code line (blank lines skipped) */
+static int cmd_send(uint32_t timeout_ms)
+{
+    char line[LINE_MAX];
+    uart3_flush_rx();
+    uart3_puts(s_cmd);
+    uart3_puts("\r\n");
+    uint32_t start = hal_ms();
+    while ((hal_ms() - start) < timeout_ms) {
+        int n = read_line(line, sizeof(line), timeout_ms - (hal_ms() - start));
+        if (n < 0) {
+            return -1;
+        }
+        if (n == 0) {
+            continue;
+        }
+        if (line[0] < '0' || line[0] > '9') {
+            return -1;
+        }
+        int rc = 0;
+        for (int i = 0; line[i] >= '0' && line[i] <= '9'; i++) {
+            rc = rc * 10 + (line[i] - '0');
+        }
+        return rc;
+    }
+    return -1;
+}
+
+int isp_unlock(void)
+{
+    strcpy(s_cmd, "U 23130");
+    return cmd_send(200);
+}
+
+int isp_prepare(uint32_t first_sector, uint32_t last_sector)
+{
+    cmd_start('P'); cmd_num(first_sector); cmd_num(last_sector);
+    return cmd_send(200);
+}
+
+int isp_erase(uint32_t first_sector, uint32_t last_sector)
+{
+    int rc = isp_prepare(first_sector, last_sector);
+    if (rc != 0) {
+        return rc;
+    }
+    cmd_start('E'); cmd_num(first_sector); cmd_num(last_sector);
+    return cmd_send(5000);
+}
+
+int isp_blank_check(uint32_t first_sector, uint32_t last_sector)
+{
+    char line[LINE_MAX];
+    cmd_start('I'); cmd_num(first_sector); cmd_num(last_sector);
+    int rc = cmd_send(2000);
+    if (rc == 8) {                      /* SECTOR_NOT_BLANK: offset and contents follow */
+        read_line(line, sizeof(line), 100);
+        read_line(line, sizeof(line), 100);
+    }
+    return rc;
+}
+
+bool isp_write_ram(uint32_t ram_addr, const void *data, uint32_t len)
+{
+    cmd_start('W'); cmd_num(ram_addr); cmd_num(len);
+    if (cmd_send(200) != 0) {
+        return false;
+    }
+    uart3_write(data, len);
+    /* Measured: this ROM sends nothing after the data (UM11029 says "OK"); take it if it comes */
+    char line[LINE_MAX];
+    (void)read_line(line, sizeof(line), 5);
+    return true;
+}
+
+int isp_copy_to_flash(uint32_t flash_addr, uint32_t ram_addr, uint32_t len)
+{
+    uint32_t first = flash_addr / 1024U, last = (flash_addr + len - 1U) / 1024U;
+    int rc = isp_prepare(first, last);
+    if (rc != 0) {
+        return rc;
+    }
+    cmd_start('C'); cmd_num(flash_addr); cmd_num(ram_addr); cmd_num(len);
+    return cmd_send(1000);
+}
+
+bool isp_read(uint32_t addr, void *buf, uint32_t len)
+{
+    cmd_start('R'); cmd_num(addr); cmd_num(len);
+    if (cmd_send(200) != 0) {
+        return false;
+    }
+    uint8_t *p = buf;
+    for (uint32_t i = 0; i < len; i++) {
+        int c = uart3_getc(100);
+        if (c < 0) {
+            return false;
+        }
+        p[i] = (uint8_t)c;
+    }
+    return true;
+}
+
 static void query(const char *cmd, int data_lines, char *raw)
 {
     char line[LINE_MAX];
@@ -247,12 +366,14 @@ void isp_read_ids(isp_survey_t *out)
 
 void isp_leave(void)
 {
-    if (SystemCoreClock != 100000000UL) {
-        set_cclk_div(3, 115200);           /* A failed entry returns still at 25 MHz */
-    }
+    /* The LPC845 restarts its own firmware: the old CTRL drives the rails within a few ms, the new
+     * CTRL's bootloader first checks the firmware's CRC (about 25 ms). Run slowly across it. */
+    set_cclk_div(15, 115200);
     line_release(LINE_PGM845);
     hal_delay_ms(2);
     line_drive(LINE_RST845, false);
     hal_delay_ms(2);
     line_release(LINE_RST845);
+    hal_delay_ms(300);
+    set_cclk_div(3, 115200);
 }

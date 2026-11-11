@@ -23,6 +23,15 @@ typedef struct {
 bool isp_enter(isp_survey_t *out);
 /* J, K and N: part ID, boot code version, serial number */
 void isp_read_ids(isp_survey_t *out);
+/* ROM loader commands, after isp_enter (UM11029 5.5). Return code, or -1 on no answer. */
+int isp_unlock(void);
+int isp_prepare(uint32_t first_sector, uint32_t last_sector);
+int isp_erase(uint32_t first_sector, uint32_t last_sector);          /* Prepares first */
+int isp_blank_check(uint32_t first_sector, uint32_t last_sector);    /* 0 blank, 8 not blank */
+bool isp_write_ram(uint32_t ram_addr, const void *data, uint32_t len); /* len multiple of 4 */
+int isp_copy_to_flash(uint32_t flash_addr, uint32_t ram_addr, uint32_t len); /* Prepares first; len 64..1024 */
+bool isp_read(uint32_t addr, void *buf, uint32_t len);               /* len multiple of 4 */
+
 /* -PGM_845 released (high), short RST_845 pulse: the LPC845 starts its own firmware again,
  * which drives the rail lines within a few ms */
 void isp_leave(void);

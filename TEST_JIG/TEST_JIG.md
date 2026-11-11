@@ -129,6 +129,7 @@ taken from those manuals when the code is written, not from memory.
 | 2026-11-11 15:21 | **Survey MIG-S0.1 on old unit 2114**, JP1 + JP2 fitted, 1922's card. Ran, then the unit went dark at the LPC845 step: the LPC845 sat in its ROM loader (PC 0x0F000736), rail lines inputs, LPC1768 unpowered (no SWD answer). Rerun with JP1/JP2 off: SURVEY.TXT complete (image check OK, OLD JUMP LOADER, old bootloader present, CRP none, settings text), OLDFLASH.BIN equal to the probe dump except day data 0x2000-0x2C03 (old firmware kept recording) | Fail at the LPC845 step: **old unit's power board switches the LPC1768 off while the LPC845's rail lines float** (1922's did not, 2026-11-10) |
 | 2026-11-11 15:27-15:32 | **Rail hold-up on 2114** (probe pulses on the LPC845's RESET; old CTRL drives the rail lines again within a few ms of reset, its Pin_init runs first): 3 s = LPC1768 restarts; 20 ms = steady; 100 ms = LCD flickers, LPC1768 keeps running; 300 ms = backlight off briefly, LPC1768 keeps running | LPC1768 survives at least 300 ms of floating rail lines |
 | 2026-11-11 15:40-16:05 | **Survey S0.2-S0.8 on 2114, JP1 + JP2 fitted** (probe on the 845's J2 to read its RAM after each run). S0.2-S0.5: unit dark after the stub was written. Probe: stub byte-perfect in RAM; run by hand to the IAP call it drives the rails (LPC1768 powers up) and IAP 57 keeps them held. Stopwatch in the W data: synced at 5-11 ms, W accepted at 14 ms. Hold-up stream (S0.5, one word per ms into a long W): **the LPC1768 stops at 58 ms** once the ROM loader runs (its pull-ups switch the rails off; in plain reset the pins are off and the rails last over 300 ms). S0.6/S0.7: survives, but after the data the ROM sends no "OK", and "G" gets "0" + 0x8D (CR cut short). S0.7 also: stub cut to 52 bytes, LPC1768 at 25 MHz during the window. **S0.8: no waiting for "OK" or for G's answer; the stub is proven by synchronising again.** Report: step 6, J = 0 / 33876 (0x8454, LPC845 64 KB), K = 0 / 1 / 13, N = 0 / 201543722 / 2937783520 / 1505891545 / 4110424325; "after W: (nothing)", "after G: 30 8D" (the stub restarts the loader mid-reply); LPC845 restarted with its firmware | **Pass: LPC845 ROM loader reached and held over the CTRL link on an old unit** |
+| 2026-11-11 16:25 | **M1 (MIG-M1.0) on old unit 2114**, SD + JP1/JP2 only (probe left on the LPC1768's J4, so not involved). LCD: CTRL NOW NEW / REMOVE JP1+JP2. Then probe on the 845's J2: **whole 64 KB equal to the factory files** (CTRL bootloader at 0x0, v1.10 at 0x2400, rest blank: 0 bytes differ), new CTRL running (VTOR 0x2400), rails driven. Old CTRL flash saved by M1 to MIGRATE/OLD845.BIN | **Pass: LPC845 converted to the new CTRL by SD card + 2 jumpers** |
 
 ---
 
@@ -402,3 +403,14 @@ pulse; the old CTRL drives the lines again within a few ms. Facts from NXP UM110
    wait for it; back to 100 MHz; synchronise again (only a restarted loader answers).
 4. Budget: the LPC1768 lasts about 58 ms after reset once the ROM runs; the stub starts at about 22 ms.
 5. Leaving: 2 ms reset with PGM released; the old CTRL drives the rails again within a few ms.
+
+### Stage M1 (MIG-M1.0): LPC845 to the new CTRL, passed 2026-11-11
+
+`ctrl845.c`, CTRL bootloader and firmware embedded from `LPC845/LPC845_BOOT.bin` and `LPC845_TWS.bin`
+(build.sh checks their vector checksum, image info, CRC and the CRP word). Order, so a power cut leaves a
+unit that comes back by itself: read all 64 sectors (saved to `MIGRATE/OLD845.BIN` while they still hold
+the old firmware; nothing written if already the new CTRL); sector 0 <- rescue program (`rescue845.s`:
+vector table, drives the LPC1768/LCD rail lines, IAP 57 into the ROM loader, so a power-up after a cut
+powers the LPC1768 and the migration carries on); sectors 1-63 erased, written, read back; sector 0 <- the
+CTRL bootloader's head last; whole chip read back. Unsafe only between erasing and writing sector 0
+(twice, about 20 ms each). Handover at 25 MHz with a 300 ms wait.
