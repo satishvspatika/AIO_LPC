@@ -133,6 +133,7 @@ taken from those manuals when the code is written, not from memory.
 | 2026-11-11 16:35 | **Full conversion MIG-1.0 on old unit 2114**, SD card + JP1/JP2 only (card: `fw.hex` = MIG-1.0, `fw_ksn_trg.hex` = v6.9.31 KSNDMC_TRG). M1 found the new CTRL already there (nothing written; also proves M1 is safe to repeat); M2 staged v6.9.31 in slot B, new bootloader, boot stub, cleared 9-16 and 25-29, PENDING; asked for the jumpers off, restarted; new bootloader swapped and trialled. LCD: v6.9.31. Probe, LPC1768: boot stub and bootloader equal to the production build; sector 1 station 002114 untouched; slot A v6.9.31 (profile 0, CRC good); slot B MIG-1.0 (byte-exact); journal ... SWAP_STEP 11, SWAPPED, TRIAL_BOOT 1, CONFIRMED, REPORTED; record log in use. LPC845: CTRL bootloader and v1.10 exact, journal blank. M1's OLD845.BIN (read through the ROM loader) equals the probe dump of the old CTRL | **Pass: old unit converted to the new bootloaders and firmware by SD card + 2 jumpers** |
 | 2026-11-11 evening | **Converted 2114 in normal use.** Clock was wrong after the conversion, so FIRMWARE UPDATE refused with SLOT DUE SOON; a slot send set the clock from the server reply (UNIT BUSY while that slot ran). Then MENU > FIRMWARE UPDATE with `fw_ksn_trg.hex` (same version, EN=REDO): installed, LCD v6.9.31, server receiving data. Station ID changed from the keypad to **1902** (unit is now station 1902) | **Pass: converted unit takes a normal SD update and reports to the server** |
 | 2026-11-11 evening | **CTRL update on converted 2114 (now station 1902)**: `ctrl.hex` (equal to `LPC845/ctrl.hex`, v1.10) from MENU > FIRMWARE UPDATE, same-version reinstall through the new CTRL bootloader that M1 put on. LCD: CTRL v1.10 | **Pass: converted unit updates both chips by the normal SD route** |
+| 2026-11-11 20:45-21:15 | **MIG-1.2 on 2114 (per-station folder `MIGRATE/002114/`)**, card reused from the first conversion (old files still in `MIGRATE/`). Main chip put back to the old dump by probe (J4). Run 1 (CTRL still new): OLDFLASH.BIN saved in the station folder, then a full conversion, v6.9.31 installed 20:49. Then old CTRL written back by probe (J2) by mistake on the converted unit (v6.9.31 + old CTRL: no CTRL link, power off 90 s after DSP), main chip put back to the old dump again (4 MHz, used 228 KB only, 3 s; the old CTRL's 90 s on-time was too short for a 1 MHz full-chip write). Run 2: OLDFLASH.BIN kept (rerun), M1 found the old CTRL and converted it, M2 DONE, v6.9.31 installed 21:14. `MIGRATE/002114/OLD845.BIN` equals the old CTRL probe dump, OLDFLASH.BIN equals the old LPC1768 dump (first 96 KB) | **Pass: MIG-1.2 keeps each unit's backups in its own folder; full old-to-new conversion repeated** |
 
 ---
 
@@ -434,9 +435,17 @@ in slot B as the "previous" firmware, so a revert from the production menu runs 
 jumpers off it stops at FIT JP1 + JP2, with them fitted it reinstalls the production firmware and keeps
 the records.
 
+MIG-1.2 (passed on 2114, 2026-11-11 21:14): each unit's files go in `MIGRATE/<station ID>/` (ID from 0x1000,
+e.g. `MIGRATE/002114/`: OLDFLASH.BIN, OLD845.BIN, RESULT.TXT), so one card converts many units. Up to
+MIG-1.1 the files sat in `MIGRATE/` itself and a second unit found the first unit's backups and kept them
+(the keep is for reruns on the same unit after a power cut), so its own were never saved. About 165 KB
+per unit. `MIGRATE/TYPE.TXT` stays where it is.
+
 **Field procedure:**
 1. Card (FAT32): `fw.hex` (migration image), the production file for the station type.
 2. Unit off; fit JP1 + JP2; card in; power on.
 3. Wait (about 2 minutes): CONVERTING UNIT, CTRL CHIP ..., MAIN CHIP ..., then REMOVE JP1+JP2.
 4. Remove both jumpers: the unit restarts and comes up on the production firmware.
-5. Keep `MIGRATE/` from the card (old flash of both chips, RESULT.TXT).
+5. Take the card out once the LCD shows the production version, before its first slot: the production
+   firmware writes its logs (SLOTS.CSV, HTTPLOG.TXT, ...) to whatever card is in. Put the unit's own card in.
+6. Copy `MIGRATE/` to the Mac now and then (old flash of both chips and RESULT.TXT, one folder per station).

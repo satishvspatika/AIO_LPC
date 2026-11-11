@@ -8,7 +8,7 @@
  *   1. Checks its own image (length and CRC in its image info): fw.hex lines with bad checksums are
  *      skipped by the old bootloader without a word, so a damaged copy must stop here.
  *   2. Says what is at 0x0 (old jump loader or our boot stub) and at 0xB000 (old bootloader).
- *   3. Copies the old flash 0x0-0x17FFF (settings, day data, old bootloader) to MIGRATE/OLDFLASH.BIN.
+ *   3. Copies the old flash 0x0-0x17FFF (settings, day data, old bootloader) to MIGRATE/<ID>/OLDFLASH.BIN.
  *   4. Senses JP1 and JP2.
  *   5. With both fitted: puts the LPC845 in its ROM loader, reads part ID, boot version, serial
  *      number, then restarts the LPC845's own firmware.
@@ -24,7 +24,7 @@
 #include "fw_layout.h"
 #include "boot_core.h"
 
-#define MIG_VERSION "MIG-1.1"
+#define MIG_VERSION "MIG-1.2"
 
 const fw_image_info_t g_fw_image_info = {
     FW_IMAGE_MAGIC, FW_BOARD_ID, 0, 0, 0xFFFFFFFFUL, MIG_VERSION   /* Length and CRC: build.sh */
@@ -120,7 +120,38 @@ static bool file_exists(const char *path)
     return true;
 }
 
-/* M1 hands over the old CTRL's flash a sector at a time: MIGRATE/OLD845.BIN */
+/* Each unit's files go in MIGRATE/<station ID>/, so one card serves many units: a rerun on the
+ * same unit (after a power cut) finds and keeps its own backups, another unit gets a new folder.
+ * The ID is the old settings' first field (0x1000, e.g. "002114"); sector 1 is never changed by
+ * the conversion, so a rerun reads the same ID. */
+static char s_dir[24] = "MIGRATE/NOID";
+static char s_path[40];
+
+static void set_unit_dir(void)
+{
+    char id[9];
+    int n = 0;
+    for (const char *p = (const char *)0x1000; n < 8; p++) {
+        char c = *p;
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) break;
+        id[n++] = c;
+    }
+    id[n] = '\0';
+    if (n > 0) {
+        strcpy(s_dir, "MIGRATE/");
+        strcat(s_dir, id);
+    }
+}
+
+static const char *unit_path(const char *name)
+{
+    strcpy(s_path, s_dir);
+    strcat(s_path, "/");
+    strcat(s_path, name);
+    return s_path;
+}
+
+/* M1 hands over the old CTRL's flash a sector at a time: MIGRATE/<ID>/OLD845.BIN */
 static FIL s_old845;
 static bool s_old845_open;
 
@@ -128,7 +159,7 @@ static bool save_old845(uint32_t addr, const uint8_t *data, uint32_t len)
 {
     UINT done = 0;
     if (addr == 0) {
-        s_old845_open = (f_open(&s_old845, "MIGRATE/OLD845.BIN", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK);
+        s_old845_open = (f_open(&s_old845, unit_path("OLD845.BIN"), FA_CREATE_ALWAYS | FA_WRITE) == FR_OK);
     }
     if (!s_old845_open || f_write(&s_old845, data, len, &done) != FR_OK || done != len) {
         return false;
@@ -197,25 +228,31 @@ int main(void)
         FRESULT m = f_mkdir("MIGRATE");
         sd_ok = (m == FR_OK || m == FR_EXIST);
     }
+    if (sd_ok) {
+        set_unit_dir();
+        FRESULT m = f_mkdir(s_dir);
+        sd_ok = (m == FR_OK || m == FR_EXIST);
+        rep("Files for this unit: "); rep(s_dir); rep("\r\n");
+    }
     if (!sd_ok) {
         stop("SD CARD FAIL", "CHECK FAT32 CARD");
     }
-    if (!file_exists("MIGRATE/OLDFLASH.BIN")) {
+    if (!file_exists(unit_path("OLDFLASH.BIN"))) {
         lcd_show("SD CARD", "SAVING OLD FLASH");
-        bool saved = write_file("MIGRATE/OLDFLASH.BIN", (const void *)0x0, 0x18000);
-        rep(saved ? "Old LPC1768 flash 0x0-0x17FFF saved: MIGRATE/OLDFLASH.BIN\r\n" : "Old LPC1768 flash copy: FAILED\r\n");
+        bool saved = write_file(unit_path("OLDFLASH.BIN"), (const void *)0x0, 0x18000);
+        rep(saved ? "Old LPC1768 flash 0x0-0x17FFF saved: OLDFLASH.BIN\r\n" : "Old LPC1768 flash copy: FAILED\r\n");
         if (!saved) {
             stop("SD WRITE FAIL", "CHECK CARD");
         }
     } else {
-        rep("MIGRATE/OLDFLASH.BIN already there: kept\r\n");
+        rep("OLDFLASH.BIN already there (rerun on this unit): kept\r\n");
     }
 
     /* 4. Station type: which production file. Before touching anything. */
     int type = m2_detect_type(note_line);
     rep("Station type: "); rep(m2_type_name(type)); rep("\r\n");
     if (type < 0) {
-        write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
+        write_file(unit_path("RESULT.TXT"), s_report, strlen(s_report));
         stop("UNKNOWN TYPE", "SEE RESULT.TXT");
     }
 
@@ -225,7 +262,7 @@ int main(void)
     rep(jp1 ? "JP1 (RST_845): fitted\r\n" : "JP1 (RST_845): open\r\n");
     rep(jp2 ? "JP2 (PGM_845): fitted\r\n" : "JP2 (PGM_845): open\r\n");
     if (!(jp1 && jp2)) {
-        write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
+        write_file(unit_path("RESULT.TXT"), s_report, strlen(s_report));
         stop("FIT JP1 + JP2", "THEN POWER ON");
     }
 
@@ -242,7 +279,7 @@ int main(void)
         isp_read_ids(&isp);
         rep("  J (part ID):   "); rep(isp.part_id); rep("\r\n");
         rep("M1, new CTRL "); rep(m1_ctrl_version()); rep(":\r\n");
-        bool have_old = file_exists("MIGRATE/OLD845.BIN");
+        bool have_old = file_exists(unit_path("OLD845.BIN"));
         m1 = m1_program_ctrl(have_old ? NULL : save_old845, note_line);
         static const char *const names[] = {"DONE", "ALREADY NEW", "FAIL READ", "FAIL SECTOR 0", "FAIL ERASE", "FAIL WRITE", "FAIL VERIFY"};
         rep("  result: "); rep(names[m1]); rep("\r\n");
@@ -250,7 +287,7 @@ int main(void)
         rep("  replies: "); rep(isp.note); rep("\r\n");
     }
     isp_leave();
-    write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
+    write_file(unit_path("RESULT.TXT"), s_report, strlen(s_report));
     if (!isp_ok) {
         stop("CTRL NO ANSWER", "POWER OFF/ON");
     }
@@ -266,7 +303,7 @@ int main(void)
     m2_result_t m2 = m2_convert(type, note_line);
     static const char *const m2names[] = {"DONE", "FAIL FILE", "FAIL IMAGE", "FAIL FLASH", "FAIL BOOT SECTOR", "FAIL TRIAL"};
     rep("  result: "); rep(m2names[m2]); rep("\r\n");
-    write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
+    write_file(unit_path("RESULT.TXT"), s_report, strlen(s_report));
     switch (m2) {
     case M2_DONE:
         break;
@@ -285,7 +322,7 @@ int main(void)
     /* 8. Jumpers off, then the new bootloader installs the production firmware */
     wait_jumpers_off();
     rep("Jumpers removed; restarting into the new bootloader\r\n");
-    write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
+    write_file(unit_path("RESULT.TXT"), s_report, strlen(s_report));
     NVIC_SystemReset();
     return 0;
 }
