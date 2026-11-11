@@ -19,33 +19,16 @@
 #include "hal.h"
 #include "isp845.h"
 #include "ctrl845.h"
+#include "m2.h"
 #include "ff.h"
 #include "fw_layout.h"
 #include "boot_core.h"
 
-#define MIG_VERSION "MIG-M1.0"
+#define MIG_VERSION "MIG-1.1"
 
 const fw_image_info_t g_fw_image_info = {
     FW_IMAGE_MAGIC, FW_BOARD_ID, 0, 0, 0xFFFFFFFFUL, MIG_VERSION   /* Length and CRC: build.sh */
 };
-
-/* ---- Flash access for boot_core.c / fw_journal.c: read only in the survey ---- */
-const uint8_t *fw_hal_ptr(uint32_t addr)
-{
-    return (const uint8_t *)addr;
-}
-
-bool fw_hal_erase(uint32_t sector)
-{
-    (void)sector;
-    return false;
-}
-
-bool fw_hal_program(uint32_t addr, const void *src, uint32_t len)
-{
-    (void)addr; (void)src; (void)len;
-    return false;
-}
 
 /* ---- report text ---- */
 static char s_report[3072];
@@ -55,7 +38,7 @@ static void rep(const char *s)
     strncat(s_report, s, sizeof(s_report) - 1 - strlen(s_report));
 }
 
-static void rep_kv_hex(const char *key, uint32_t v)
+__attribute__((unused)) static void rep_kv_hex(const char *key, uint32_t v)
 {
     char buf[12];
     rep(key);
@@ -171,15 +154,25 @@ static void stop(const char *l1, const char *l2)
     }
 }
 
+static void wait_jumpers_off(void)
+{
+    lcd_show("REMOVE JP1+JP2", "TO FINISH");
+    while (line_jumper_fitted(LINE_RST845) || line_jumper_fitted(LINE_PGM845)) {
+        hal_delay_ms(200);
+    }
+    lcd_show("JUMPERS OFF", "RESTARTING...");
+    hal_delay_ms(1500);
+}
+
 int main(void)
 {
     hal_init();
     lcd_init();
-    lcd_show("CONVERT M1", MIG_VERSION);
+    lcd_show("CONVERTING UNIT", MIG_VERSION);
     hal_delay_ms(1500);
 
     /* 1. Own image */
-    rep("Migration " MIG_VERSION ": stage M1, CTRL chip (LPC845) to the new CTRL\r\n");
+    rep("Migration " MIG_VERSION ": old unit to the new bootloaders and firmware\r\n");
     bool self_ok = fw_image_valid(FW_SLOT_A_BASE);
     rep(self_ok ? "Image check: OK\r\n" : "Image check: FAILED\r\n");
     if (!self_ok) {
@@ -190,10 +183,15 @@ int main(void)
     rep("Sector 0: ");
     rep(sector0_kind());
     rep("\r\n");
-    rep(old_bootloader_present() ? "Old bootloader at 0xB000: present\r\n" : "Old bootloader at 0xB000: NOT FOUND\r\n");
-    rep_kv_hex("Code protection word 0x2FC: ", rd32(0x2FC));
+    rep(old_bootloader_present() ? "Old bootloader at 0xB000: present\r\n" : "Old bootloader at 0xB000: not there (converted part-way)\r\n");
+    rep("Station ID (kept as it is): ");
+    char stn[8];
+    memcpy(stn, (const void *)0x1000, 7);
+    stn[7] = '\0';
+    rep(stn);
+    rep("\r\n");
 
-    /* 3. SD card (the old CTRL is saved to it during M1) */
+    /* 3. SD card */
     bool sd_ok = (f_mount(0, &s_fs) == FR_OK);
     if (sd_ok) {
         FRESULT m = f_mkdir("MIGRATE");
@@ -206,21 +204,32 @@ int main(void)
         lcd_show("SD CARD", "SAVING OLD FLASH");
         bool saved = write_file("MIGRATE/OLDFLASH.BIN", (const void *)0x0, 0x18000);
         rep(saved ? "Old LPC1768 flash 0x0-0x17FFF saved: MIGRATE/OLDFLASH.BIN\r\n" : "Old LPC1768 flash copy: FAILED\r\n");
+        if (!saved) {
+            stop("SD WRITE FAIL", "CHECK CARD");
+        }
     } else {
         rep("MIGRATE/OLDFLASH.BIN already there: kept\r\n");
     }
 
-    /* 4. Jumpers */
+    /* 4. Station type: which production file. Before touching anything. */
+    int type = m2_detect_type(note_line);
+    rep("Station type: "); rep(m2_type_name(type)); rep("\r\n");
+    if (type < 0) {
+        write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
+        stop("UNKNOWN TYPE", "SEE RESULT.TXT");
+    }
+
+    /* 5. Jumpers */
     bool jp1 = line_jumper_fitted(LINE_RST845);
     bool jp2 = line_jumper_fitted(LINE_PGM845);
     rep(jp1 ? "JP1 (RST_845): fitted\r\n" : "JP1 (RST_845): open\r\n");
     rep(jp2 ? "JP2 (PGM_845): fitted\r\n" : "JP2 (PGM_845): open\r\n");
     if (!(jp1 && jp2)) {
-        write_file("MIGRATE/M1.TXT", s_report, strlen(s_report));
+        write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
         stop("FIT JP1 + JP2", "THEN POWER ON");
     }
 
-    /* 5. ROM loader, then M1 */
+    /* 6. M1: the CTRL chip */
     static isp_survey_t isp;
     lcd_show("CTRL CHIP", "ROM LOADER...");
     bool isp_ok = isp_enter(&isp);
@@ -228,37 +237,55 @@ int main(void)
     rep("LPC845 ROM loader: ");
     rep(isp_ok ? "OK, rails held by the RAM stub\r\n" : "FAILED\r\n");
     rep("  last step: "); fmt_dec(num, (uint32_t)isp.step); rep(num); rep("\r\n");
-    rep("  replies: "); rep(isp.note); rep("\r\n");
     m1_result_t m1 = M1_FAIL_READ;
     if (isp_ok) {
         isp_read_ids(&isp);
         rep("  J (part ID):   "); rep(isp.part_id); rep("\r\n");
-        rep("  K (boot ver):  "); rep(isp.boot_ver); rep("\r\n");
         rep("M1, new CTRL "); rep(m1_ctrl_version()); rep(":\r\n");
         bool have_old = file_exists("MIGRATE/OLD845.BIN");
         m1 = m1_program_ctrl(have_old ? NULL : save_old845, note_line);
-        if (have_old) {
-            rep("  MIGRATE/OLD845.BIN already there: kept\r\n");
-        }
         static const char *const names[] = {"DONE", "ALREADY NEW", "FAIL READ", "FAIL SECTOR 0", "FAIL ERASE", "FAIL WRITE", "FAIL VERIFY"};
         rep("  result: "); rep(names[m1]); rep("\r\n");
+    } else {
+        rep("  replies: "); rep(isp.note); rep("\r\n");
     }
     isp_leave();
-    rep("LPC845 restarted\r\n");
-    write_file("MIGRATE/M1.TXT", s_report, strlen(s_report));
-
+    write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
     if (!isp_ok) {
-        stop("M1: CTRL NO", "ANSWER. RETRY");
-    }
-    if (m1 == M1_DONE) {
-        stop("CTRL NOW NEW", "REMOVE JP1+JP2");
-    }
-    if (m1 == M1_ALREADY) {
-        stop("CTRL ALREADY NEW", "REMOVE JP1+JP2");
+        stop("CTRL NO ANSWER", "POWER OFF/ON");
     }
     if (m1 == M1_FAIL_SECTOR0) {
-        stop("M1 FAIL SECTOR 0", "DO NOT POWER OFF");
+        stop("CTRL SECTOR 0", "FAIL: CALL JIG");
     }
-    stop("M1 FAILED", "POWER OFF/ON");
+    if (m1 != M1_DONE && m1 != M1_ALREADY) {
+        stop("CTRL FAILED", "POWER OFF/ON");
+    }
+
+    /* 7. M2: the main chip */
+    rep("M2, main chip ("); rep(m2_type_name(type)); rep("):\r\n");
+    m2_result_t m2 = m2_convert(type, note_line);
+    static const char *const m2names[] = {"DONE", "FAIL FILE", "FAIL IMAGE", "FAIL FLASH", "FAIL BOOT SECTOR", "FAIL TRIAL"};
+    rep("  result: "); rep(m2names[m2]); rep("\r\n");
+    write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
+    switch (m2) {
+    case M2_DONE:
+        break;
+    case M2_FAIL_FILE:
+        stop("NO FIRMWARE FILE", "SEE RESULT.TXT");
+    case M2_FAIL_IMAGE:
+        stop("BAD FIRMWARE", "FILE: SEE RESULT");
+    case M2_FAIL_BOOT_SECTOR:
+        stop("BOOT SECTOR FAIL", "CALL JIG");
+    case M2_FAIL_TRIAL:
+        stop("NEW FIRMWARE", "FAILED TRIAL");
+    default:
+        stop("MAIN CHIP FAILED", "POWER OFF/ON");
+    }
+
+    /* 8. Jumpers off, then the new bootloader installs the production firmware */
+    wait_jumpers_off();
+    rep("Jumpers removed; restarting into the new bootloader\r\n");
+    write_file("MIGRATE/RESULT.TXT", s_report, strlen(s_report));
+    NVIC_SystemReset();
     return 0;
 }

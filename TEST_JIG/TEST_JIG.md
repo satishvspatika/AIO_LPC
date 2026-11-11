@@ -130,6 +130,7 @@ taken from those manuals when the code is written, not from memory.
 | 2026-11-11 15:27-15:32 | **Rail hold-up on 2114** (probe pulses on the LPC845's RESET; old CTRL drives the rail lines again within a few ms of reset, its Pin_init runs first): 3 s = LPC1768 restarts; 20 ms = steady; 100 ms = LCD flickers, LPC1768 keeps running; 300 ms = backlight off briefly, LPC1768 keeps running | LPC1768 survives at least 300 ms of floating rail lines |
 | 2026-11-11 15:40-16:05 | **Survey S0.2-S0.8 on 2114, JP1 + JP2 fitted** (probe on the 845's J2 to read its RAM after each run). S0.2-S0.5: unit dark after the stub was written. Probe: stub byte-perfect in RAM; run by hand to the IAP call it drives the rails (LPC1768 powers up) and IAP 57 keeps them held. Stopwatch in the W data: synced at 5-11 ms, W accepted at 14 ms. Hold-up stream (S0.5, one word per ms into a long W): **the LPC1768 stops at 58 ms** once the ROM loader runs (its pull-ups switch the rails off; in plain reset the pins are off and the rails last over 300 ms). S0.6/S0.7: survives, but after the data the ROM sends no "OK", and "G" gets "0" + 0x8D (CR cut short). S0.7 also: stub cut to 52 bytes, LPC1768 at 25 MHz during the window. **S0.8: no waiting for "OK" or for G's answer; the stub is proven by synchronising again.** Report: step 6, J = 0 / 33876 (0x8454, LPC845 64 KB), K = 0 / 1 / 13, N = 0 / 201543722 / 2937783520 / 1505891545 / 4110424325; "after W: (nothing)", "after G: 30 8D" (the stub restarts the loader mid-reply); LPC845 restarted with its firmware | **Pass: LPC845 ROM loader reached and held over the CTRL link on an old unit** |
 | 2026-11-11 16:25 | **M1 (MIG-M1.0) on old unit 2114**, SD + JP1/JP2 only (probe left on the LPC1768's J4, so not involved). LCD: CTRL NOW NEW / REMOVE JP1+JP2. Then probe on the 845's J2: **whole 64 KB equal to the factory files** (CTRL bootloader at 0x0, v1.10 at 0x2400, rest blank: 0 bytes differ), new CTRL running (VTOR 0x2400), rails driven. Old CTRL flash saved by M1 to MIGRATE/OLD845.BIN | **Pass: LPC845 converted to the new CTRL by SD card + 2 jumpers** |
+| 2026-11-11 16:35 | **Full conversion MIG-1.0 on old unit 2114**, SD card + JP1/JP2 only (card: `fw.hex` = MIG-1.0, `fw_ksn_trg.hex` = v6.9.31 KSNDMC_TRG). M1 found the new CTRL already there (nothing written; also proves M1 is safe to repeat); M2 staged v6.9.31 in slot B, new bootloader, boot stub, cleared 9-16 and 25-29, PENDING; asked for the jumpers off, restarted; new bootloader swapped and trialled. LCD: v6.9.31. Probe, LPC1768: boot stub and bootloader equal to the production build; sector 1 station 002114 untouched; slot A v6.9.31 (profile 0, CRC good); slot B MIG-1.0 (byte-exact); journal ... SWAP_STEP 11, SWAPPED, TRIAL_BOOT 1, CONFIRMED, REPORTED; record log in use. LPC845: CTRL bootloader and v1.10 exact, journal blank. M1's OLD845.BIN (read through the ROM loader) equals the probe dump of the old CTRL | **Pass: old unit converted to the new bootloaders and firmware by SD card + 2 jumpers** |
 
 ---
 
@@ -414,3 +415,26 @@ vector table, drives the LPC1768/LCD rail lines, IAP 57 into the ROM loader, so 
 powers the LPC1768 and the migration carries on); sectors 1-63 erased, written, read back; sector 0 <- the
 CTRL bootloader's head last; whole chip read back. Unsafe only between erasing and writing sector 0
 (twice, about 20 ms each). Handover at 25 MHz with a 300 ms wait.
+
+### Full conversion (MIG-1.x), passed 2026-11-11 on unit 2114
+
+One `fw.hex` does everything: self-check, old LPC1768 flash to `MIGRATE/OLDFLASH.BIN`, station type from
+the old settings (agency 0x1028, type 0x1038; `MIGRATE/TYPE.TXT` overrides), M1, then M2 (`m2.c`):
+production app from the card (`fw_ksn_trg.hex`, `fw_bihar.hex` or `fw_ksn_tws.hex`) staged in slot B
+and checked (CRC, board, profile = type); new bootloader into sectors 2-8; boot stub into sector 0 (the
+unsafe moment); sectors 9-16 erased, 25-29 blank; journal PENDING; waits for JP1 + JP2 to come off;
+restarts. The new bootloader then installs the production firmware by the normal swap and trial.
+Sector 1 is left as it is: the production firmware reads the station ID from offset 0 (old layout too).
+A run that finds the new boot stub carries on from the clearing step. Report: `MIGRATE/RESULT.TXT`.
+
+MIG-1.1: the record log is cleared only on a first conversion (journal empty). The migration image stays
+in slot B as the "previous" firmware, so a revert from the production menu runs it again; with the
+jumpers off it stops at FIT JP1 + JP2, with them fitted it reinstalls the production firmware and keeps
+the records.
+
+**Field procedure:**
+1. Card (FAT32): `fw.hex` (migration image), the production file for the station type.
+2. Unit off; fit JP1 + JP2; card in; power on.
+3. Wait (about 2 minutes): CONVERTING UNIT, CTRL CHIP ..., MAIN CHIP ..., then REMOVE JP1+JP2.
+4. Remove both jumpers: the unit restarts and comes up on the production firmware.
+5. Keep `MIGRATE/` from the card (old flash of both chips, RESULT.TXT).
