@@ -441,6 +441,10 @@ MIG-1.1 the files sat in `MIGRATE/` itself and a second unit found the first uni
 (the keep is for reruns on the same unit after a power cut), so its own were never saved. About 165 KB
 per unit. `MIGRATE/TYPE.TXT` stays where it is.
 
+Practice resets: `TEST_JIG/restore_old_unit.py lpc845|lpc1768 <dump>` puts a converted bench unit back on
+its old firmware (MCU-Link on J2 / J4; waits for DSP, used part only at 4 MHz, about 3 s, read back). CTRL
+chip first, conversion card out of the unit while resetting. Bench only.
+
 **Field procedure:**
 1. Card (FAT32): `fw.hex` (migration image), the production file for the station type.
 2. Unit off; fit JP1 + JP2; card in; power on.
