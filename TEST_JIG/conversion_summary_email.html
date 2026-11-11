@@ -1,0 +1,159 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Old Unit Conversion</title>
+</head>
+<body style="margin:0;padding:16px;background:#ffffff;">
+<div style="max-width:720px;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;color:#222222;">
+
+<h2 style="font-size:20px;margin:0 0 4px 0;color:#1a3d6d;">Converting old AIO units to the new system with an SD card and two jumpers</h2>
+<p style="margin:0 0 16px 0;color:#666666;font-size:13px;">Status as of 11 Nov 2026: proven end to end on old unit 2114 (KSNDMC TRG), including normal SD updates afterwards</p>
+
+<h3 style="font-size:16px;margin:20px 0 6px 0;color:#1a3d6d;">What it achieves</h3>
+<p style="margin:0 0 8px 0;">An old field unit (old LPC1768 bootloader V1.1 and old CTRL firmware) ends up exactly like a new factory unit. No MCU-Link, no cable, nothing to solder. From then on it updates itself from its SD card like any new unit.</p>
+<table cellpadding="6" cellspacing="0" border="1" style="border-collapse:collapse;border-color:#cccccc;font-size:13px;width:100%;">
+  <tr style="background:#eef3f9;">
+    <th align="left" style="border:1px solid #cccccc;">Chip</th>
+    <th align="left" style="border:1px solid #cccccc;">Before</th>
+    <th align="left" style="border:1px solid #cccccc;">After</th>
+  </tr>
+  <tr>
+    <td style="border:1px solid #cccccc;"><b>CTRL board (LPC845)</b></td>
+    <td style="border:1px solid #cccccc;">Old CTRL firmware, no bootloader</td>
+    <td style="border:1px solid #cccccc;">New CTRL bootloader + CTRL firmware v1.10, identical to a factory flash</td>
+  </tr>
+  <tr>
+    <td style="border:1px solid #cccccc;"><b>Main board (LPC1768)</b></td>
+    <td style="border:1px solid #cccccc;">Old jump loader, old SD bootloader, old application</td>
+    <td style="border:1px solid #cccccc;">New boot stub + new bootloader + production firmware (e.g. v6.9.31), installed and confirmed through the normal update path</td>
+  </tr>
+  <tr>
+    <td style="border:1px solid #cccccc;"><b>Settings</b></td>
+    <td style="border:1px solid #cccccc;">Station ID etc.</td>
+    <td style="border:1px solid #cccccc;">Unchanged: the new firmware reads the station ID where the old firmware kept it</td>
+  </tr>
+</table>
+
+<h3 style="font-size:16px;margin:20px 0 6px 0;color:#1a3d6d;">What the conversion program (fw.hex) is</h3>
+<p style="margin:0 0 8px 0;"><b>fw.hex</b> is a small, temporary program (about 48 KB) written only for this conversion. It is named fw.hex because that is the one file name the old unit's own SD bootloader looks for. So the old unit loads it by itself, exactly as it would load an old firmware update. It never sends data to a server and is not the station firmware.</p>
+<p style="margin:0 0 4px 0;">Once running, it does five jobs:</p>
+<table cellpadding="6" cellspacing="0" border="1" style="border-collapse:collapse;border-color:#cccccc;font-size:13px;width:100%;">
+  <tr style="background:#eef3f9;">
+    <th align="left" style="border:1px solid #cccccc;width:28%;">Job</th>
+    <th align="left" style="border:1px solid #cccccc;">What it does</th>
+  </tr>
+  <tr>
+    <td style="border:1px solid #cccccc;"><b>1. Checks</b></td>
+    <td style="border:1px solid #cccccc;">Checks itself (CRC), the card, the jumpers and the station type before changing anything.</td>
+  </tr>
+  <tr>
+    <td style="border:1px solid #cccccc;"><b>2. Backs up</b></td>
+    <td style="border:1px solid #cccccc;">Saves the old firmware of both chips to the card (MIGRATE folder), so nothing is lost.</td>
+  </tr>
+  <tr>
+    <td style="border:1px solid #cccccc;"><b>3. Programs the CTRL chip</b></td>
+    <td style="border:1px solid #cccccc;">Carries the new CTRL bootloader and CTRL firmware v1.10 inside itself and writes them into the LPC845 through JP1/JP2, using the chip's built-in ROM loader. It keeps the unit powered while doing so.</td>
+  </tr>
+  <tr>
+    <td style="border:1px solid #cccccc;"><b>4. Converts the main chip</b></td>
+    <td style="border:1px solid #cccccc;">Carries the new LPC1768 bootloader and boot stub inside itself and writes them. It reads the production firmware from the card (fw_ksn_trg.hex etc.) and queues it for installation.</td>
+  </tr>
+  <tr>
+    <td style="border:1px solid #cccccc;"><b>5. Hands over</b></td>
+    <td style="border:1px solid #cccccc;">Waits for the jumpers to come off, then restarts. The new bootloader installs the production firmware, which then runs the station.</td>
+  </tr>
+</table>
+<p style="margin:8px 0 8px 0;">Each job is checked by reading back what was written. If anything fails, the program stops with a message on the LCD and a report on the card (MIGRATE/RESULT.TXT). After the conversion it stays on the unit only as the "previous firmware" copy. Running it again on a converted unit does no harm: stored records are kept.</p>
+
+<h3 style="font-size:16px;margin:20px 0 6px 0;color:#1a3d6d;">What you need</h3>
+<ul style="margin:0 0 8px 20px;padding:0;">
+  <li>One microSD card, <b>formatted FAT32</b> (32 GB or less, not exFAT), holding:
+    <ul style="margin:4px 0 4px 20px;padding:0;">
+      <li><b>fw.hex</b>: the conversion program</li>
+      <li>the production file for the station type: <b>fw_ksn_trg.hex</b>, <b>fw_bihar.hex</b> or <b>fw_ksn_tws.hex</b></li>
+    </ul>
+  </li>
+  <li>Two jumper caps for <b>JP1</b> and <b>JP2</b> on the CTRL board</li>
+</ul>
+
+<h3 style="font-size:16px;margin:20px 0 6px 0;color:#1a3d6d;">Field steps</h3>
+<table cellpadding="6" cellspacing="0" border="0" style="border-collapse:collapse;font-size:14px;width:100%;">
+  <tr><td valign="top" style="width:28px;font-weight:bold;color:#1a3d6d;">1.</td><td>Unit <b>off</b>. Fit <b>JP1 + JP2</b>. Insert the card.</td></tr>
+  <tr><td valign="top" style="font-weight:bold;color:#1a3d6d;">2.</td><td>Power <b>on</b>. Wait about 2 minutes, watching the LCD.</td></tr>
+  <tr><td valign="top" style="font-weight:bold;color:#1a3d6d;">3.</td><td>When the LCD says <b>REMOVE JP1+JP2</b>, remove both caps.</td></tr>
+  <tr><td valign="top" style="font-weight:bold;color:#1a3d6d;">4.</td><td>The unit restarts and comes up on the <b>production firmware</b>.</td></tr>
+  <tr><td valign="top" style="font-weight:bold;color:#1a3d6d;">5.</td><td>Keep the card's <b>MIGRATE</b> folder: it holds both chips' old firmware and the report <b>RESULT.TXT</b>.</td></tr>
+  <tr><td valign="top" style="font-weight:bold;color:#1a3d6d;">6.</td><td>The clock may be wrong until the first successful send to the server (the next slot), and then corrects itself. Until then a firmware update from the menu is refused with <b>SLOT DUE SOON</b>; just wait for one slot to be sent.</td></tr>
+</table>
+
+<h3 style="font-size:16px;margin:20px 0 6px 0;color:#1a3d6d;">What happens inside, in order</h3>
+
+<p style="margin:10px 0 4px 0;"><b>A. The old system loads the converter</b> (about 10 seconds, blank LCD)</p>
+<ol style="margin:0 0 8px 20px;padding:0;">
+  <li>At power-up the old CTRL switches the main chip on (and keeps it on for up to 32 minutes).</li>
+  <li>The old SD bootloader finds fw.hex, writes it to the application area, deletes the file and starts it.</li>
+</ol>
+
+<p style="margin:10px 0 4px 0;"><b>B. Checks, before anything is changed</b> (LCD: CONVERTING UNIT)</p>
+<ol start="3" style="margin:0 0 8px 20px;padding:0;">
+  <li>The converter checks its own CRC (a damaged copy stops with COPY fw.hex AGAIN).</li>
+  <li>It saves the old main-chip flash to the card.</li>
+  <li>It reads the station type from the old settings (a TYPE.TXT file on the card can override it); an unknown type stops here.</li>
+  <li>It checks both jumpers are fitted (if not: FIT JP1 + JP2).</li>
+</ol>
+
+<p style="margin:10px 0 4px 0;"><b>C. Stage M1: the CTRL chip</b> (LCD: CTRL CHIP ...)</p>
+<ol start="7" style="margin:0 0 8px 20px;padding:0;">
+  <li>Through JP1/JP2 the main chip resets the CTRL chip into its built-in ROM loader.</li>
+  <li>Within about 22 ms it loads a <b>52-byte program</b> into the CTRL chip's RAM, which switches the power back on and keeps it on. (On old units the power board cuts the main chip about 58 ms after the CTRL chip stops driving the power lines.)</li>
+  <li>It reads the whole CTRL chip and saves the old CTRL firmware to the card. If it already has the new CTRL, nothing is written.</li>
+  <li>It writes a <b>rescue program</b> to the CTRL chip's first sector first, so a power cut from here still powers the unit up and the conversion carries on.</li>
+  <li>It writes the CTRL bootloader and firmware and reads every sector back.</li>
+  <li>It writes the real first sector <b>last</b>, then reads the whole chip back and compares.</li>
+  <li>The CTRL chip restarts on the new CTRL v1.10.</li>
+</ol>
+
+<p style="margin:10px 0 4px 0;"><b>D. Stage M2: the main chip</b> (LCD: MAIN CHIP ...)</p>
+<ol start="14" style="margin:0 0 8px 20px;padding:0;">
+  <li><b>Staging:</b> loads the production firmware from the card into the spare slot, then checks its CRC and that it matches the station type.</li>
+  <li><b>New bootloader:</b> written where the old unit only kept old day data, then read back.</li>
+  <li><b>Boot sector:</b> the new boot stub is written. From now on the new bootloader starts the unit.</li>
+  <li><b>Clearing:</b> the old bootloader area becomes the error log, update journal and swap area, and the record log is cleared.</li>
+  <li>A "pending update" entry is written to the journal.</li>
+</ol>
+
+<p style="margin:10px 0 4px 0;"><b>E. Finish</b></p>
+<ol start="19" style="margin:0 0 8px 20px;padding:0;">
+  <li>The LCD asks to REMOVE JP1+JP2; once both are off, the unit restarts.</li>
+  <li>The new bootloader installs the production firmware by the normal update path (swap, trial run, confirmed), the same as any SD-card update.</li>
+</ol>
+
+<h3 style="font-size:16px;margin:20px 0 6px 0;color:#1a3d6d;">Safety</h3>
+<ul style="margin:0 0 8px 20px;padding:0;">
+  <li><b>Power cut at almost any point:</b> the unit comes back by itself and the conversion carries on from where it stopped.</li>
+  <li><b>Running it twice is safe:</b> a converted CTRL chip is left alone, and stored records are kept.</li>
+  <li><b>Two unsafe moments of under 0.1 s each:</b> rewriting the CTRL chip's first sector and the main chip's boot sector. A power cut at exactly those moments needs the programming jig.</li>
+  <li><b>The jumpers are only fitted while converting:</b> the converter does not finish until they are removed.</li>
+</ul>
+
+<h3 style="font-size:16px;margin:20px 0 6px 0;color:#1a3d6d;">Proven so far</h3>
+<p style="margin:0 0 8px 0;">Old unit <b>2114</b> (KSNDMC TRG, old firmware TRG5-1.0.5) was converted end to end on 11 Nov 2026 and checked afterwards with a debug probe:</p>
+<ul style="margin:0 0 8px 20px;padding:0;">
+  <li>Both chips match the production and factory images exactly.</li>
+  <li>The new firmware passed its trial run and is confirmed.</li>
+  <li>The station ID was kept, and the unit is storing records.</li>
+  <li>Afterwards it took a normal firmware update from the menu (v6.9.31) and a normal CTRL update (ctrl.hex, CTRL v1.10), both from the SD card exactly like a new unit.</li>
+  <li>It sends to the server every slot. Its station ID was then changed from the keypad to 1902 without trouble.</li>
+</ul>
+
+<h3 style="font-size:16px;margin:20px 0 6px 0;color:#1a3d6d;">Still to do</h3>
+<ul style="margin:0 0 8px 20px;padding:0;">
+  <li>Try on more old units: BIHAR and TWS types, other old firmware versions and power-board revisions.</li>
+  <li>Test a deliberate power cut during the conversion.</li>
+  <li>Units the SD route cannot do (damaged old bootloader, no JP1/JP2 headers) still need the programming jig or a board swap.</li>
+</ul>
+
+</div>
+</body>
+</html>
