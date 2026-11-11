@@ -295,6 +295,36 @@ bool storage_sd_is_ok(void)
     return storage_state_save(SD_CHECK_FILENAME, probe);
 }
 
+/* v6.9.31: written straight after the last log write before power-off. BIHAR's card dropped the
+ * last data block it was given before power-off (while keeping the file size written after it), so
+ * the log's last lines were lost at about half of all slots, even with 1 s to settle. This small
+ * write makes the log block no longer the last one. The next boot logs what this file holds, which
+ * shows whether this write itself survived. Fixed length, so no older text is left behind. */
+void storage_power_off_mark(void)
+{
+    char ts[36];
+    char text[40];
+    format_log_time(ts, sizeof(ts));
+    snprintf(text, sizeof(text), "%-32.32s\r\n", ts);
+    storage_state_save(POWER_OFF_MARK_FILENAME, text);
+}
+
+/* The mark the last power-off left, for the boot log */
+void storage_log_power_off_mark(void)
+{
+    char text[40];
+    char line[64];
+    if (!storage_state_load(POWER_OFF_MARK_FILENAME, text, sizeof(text))) {
+        return;
+    }
+    size_t n = strlen(text);
+    while (n > 0 && (text[n - 1] == '\r' || text[n - 1] == '\n' || text[n - 1] == ' ')) {
+        text[--n] = '\0';
+    }
+    snprintf(line, sizeof(line), "Last power-off mark: %s", text);
+    storage_log_debug("BOOT", line);
+}
+
 /* One log file per day: LOG/YYMMDD.TXT, or DEBUG.TXT until the clock is valid */
 static void current_log_path(char *path, size_t size)
 {

@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.28"
+#define FIRMWARE_VERSION "v6.9.31"
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
 #define ENABLE_TEST_SEND    0
@@ -62,6 +62,7 @@
 #define LAST_SLOT_FILENAME      "LASTSLOT.DAT"
 #define FLASH_SYNC_FILENAME     "FLASHSYN.DAT"
 #define SD_CHECK_FILENAME       "SDCHECK.DAT"
+#define POWER_OFF_MARK_FILENAME "PWROFF.DAT"  /* Written last before power-off: see storage_power_off_mark() */
 #define FW_FILE_KSNDMC_TRG      "fw_ksn_trg.hex"
 #define FW_FILE_BIHAR_TRG       "fw_bihar.hex"
 #define FW_FILE_KSNDMC_TWS      "fw_ksn_tws.hex"
@@ -80,6 +81,8 @@
 #define GPS_MOVE_LIMIT_M        50      /* Save a new position only if it moved further than this */
 #define GPS_FIX_TIMEOUT_SEC     90      /* Longest try: with no antenna, this is all it costs */
 #define GPS_MIN_BATTERY_V       11.8f   /* Scheduled tries are skipped below this */
+/* Wait after the last SD write before asking the CTRL board to cut power (v6.9.29) */
+#define SD_SETTLE_BEFORE_POWER_OFF_MS 1000
 #define BATTERY_SENSE_FAULT_V   2.0f    /* A reading below this is a broken sense line, not a battery */
 
 /* Rainfall Parameters */

@@ -490,6 +490,8 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | CTRL v1.9 by MCU-Link, 1922 18:05 | HDC1080 found (ID 0x10): 24.8-25.2 C, 58-72 %. P0_18 (wind direction) ADC 18-56 and P0_17 (battery sense, next pin) 0-4 with the new TWS cable: both inputs unconnected; same code as TWS845, so the cable. v6.9.28 also logs ERROR at each slot for a battery below 2 V (sense line) and, on TWS, temperature and humidity both 0 (no sensor answer), and lets an update through on a battery below 2 V (it blocked CTRL v1.9: "BATTERY LOW NOT UPDATING"). 1922 back to KSNDMC_TRG (station 1922) until a new cable; TWS resumes then | Cable fault; T/H Pass |
 | CTRL v1.10, built 2026-11-09 evening | Pre-night review: v1.9's T/H read busy-waits about 0.1 s every 10 s even with no sensor (every TRG unit: 959 failed reads on 1922 by 19:47). The receive buffer holds one command, so a second one inside that time is dropped, e.g. the $f7 sent 100 ms after $f4 at sleep (the LPC1768 resends it after 10 s, so only power is lost). v1.10 stops when the sensor doesn't answer its ID request, and drops the 35 ms wait after the read (removed by -Os before v1.9). 20,184 B of 24 KB | Built |
 | v6.9.28 + CTRL v1.10, 1922 overnight 2026-11-09/10 | CTRL v1.9 to v1.10 by SD 20:25 (rain total kept: 4 tips). SIM taken out 20:30-22:00 (user test): 7 slots "No SIM inserted", stored and queued, each asleep by +36 s; SIM back for 22:15: all 7 sent in that slot. 44 of 44 slots accounted for to 07:15; BSNL refusal only at 22:16 (cleared in the slot), 22:30-07:15 all first try in 5-7 s; no crash, no damaged frames, no $f7 resend | Pass |
+| v6.9.28 + CTRL v1.10, BIHAR 1923 overnight 2026-11-09/10 | CTRL v1.7 to v1.10 by SD 20:33. Same SIM-out test (20:30-22:00): 7 queued, all sent at 22:15; 44 of 44 slots; no BSNL refusal at all (1922: one), no crash, no damaged frames. BIHAR's card (not 1922's) loses the last 20-150 bytes of the log at the end of some slots (NULs from a sector start: 23 on the 8th, 6 on the 9th): the write is made and the card reports ready (CTRL_SYNC waits), then the power goes. Records are written earlier and complete | Pass; log loss to v6.9.29 |
+| v6.9.29, built 2026-11-10 | 1 s pause (`SD_SETTLE_BEFORE_POWER_OFF_MS`) after the last log write before $f7, and before each $f7 resend. bench/host_tests.sh: KSNDMC update tests take KSN_TRG_HEX / KSN_TWS_HEX (were stale paths). All three configs built, host and update tests pass | Built; to check on BIHAR (no NUL gaps for a day) |
 | v6.9.12 + 845-v1.5 | BIHAR 1923 off 19:00 to 09:00, both installed by SD at power-up | Pass: 19:15-08:30 sent as -110 with CUM 10, 08:45 as -112 with CUM 0, live from 09:00, backlog done in 4 slots (15 a slot); 845 UPDATE OK |
 
 ### Not tested yet
@@ -530,6 +532,9 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 ---
 
 ## 12. Plan
+
+The programming jig is a separate project in `TEST_JIG/` (design, learnings and tests in
+`TEST_JIG/TEST_JIG.md`). Nothing from it goes into the production firmware.
 
 **Done:** stack, watchdog, error log, LPC845 protection, rain count kept, RAM relieved (v6.9.11); RTC jam recovery
 (845-v1.5); gap fill for the day after an off period (v6.9.12); KSNDMC_TRG on a second unit.

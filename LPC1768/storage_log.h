@@ -14,6 +14,8 @@ bool storage_sd_is_ok(void);
 void storage_log_timer_step_10ms(void);
 void storage_log_drain_step(void);
 void storage_log_flush(void);
+void storage_power_off_mark(void);
+void storage_log_power_off_mark(void);
 
 /* Verbose debug logger */
 void storage_log_debug(const char *tag, const char *msg);

@@ -1489,6 +1489,10 @@ void ui_enter_sleep(void)
 
     storage_log_debug("PWR", "Power cut command $f7 sent to LPC845");
     storage_log_flush();
+    storage_power_off_mark(); /* v6.9.31: so the log's last block isn't the card's last write */
+    /* v6.9.29: a second for the card before power goes. It did not stop BIHAR's card losing the
+     * log's last block (v6.9.31's mark is for that); kept while that is tested. */
+    vTaskDelay(SD_SETTLE_BEFORE_POWER_OFF_MS / portTICK_RATE_MS);
     hal_power_sleep_system(); /* Sends $f7;\012 */
 
     /* Status frames already on their way still carry the old rail flags. Let them pass, or
@@ -1527,6 +1531,8 @@ void ui_enter_sleep(void)
             storage_log_debug("PWR", f7_resends < 3 ? "Still powered 10s after $f7: sending it again"
                                                     : "Still powered 10s after $f7: sending it a last time");
             storage_log_flush();
+            storage_power_off_mark();
+            vTaskDelay(SD_SETTLE_BEFORE_POWER_OFF_MS / portTICK_RATE_MS);
             hal_power_sleep_system();
         }
     }

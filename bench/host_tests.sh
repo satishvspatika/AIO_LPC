@@ -7,6 +7,13 @@ cc $F -DFW_TARGET_LPC845 -o $O/bt845 boot_test.c ../boot_core.c ../fw_journal.c 
 cc $F -DFW_TARGET_LPC845 -I../../../LPC845/boot -o $O/ctrl ctrl_test.c ../../fw_update.c ../../fw_ctrl.c ../../../LPC845/boot/fw845_recv.c ../boot_core.c ../fw_journal.c && $O/ctrl ../../../LPC845/ctrl.hex | tail -1
 cc $F -o $O/ut update_test.c ../../fw_update.c ../boot_core.c ../fw_journal.c
 $O/ut $R/LPC1768/Debug/fw_bihar.hex 1 | tail -1
-$O/ut ${OUT:-/tmp/aio_bench}/b699/KSNDMC_TRG/LPC1768/Debug/fw_ksn_trg.hex 0 | tail -1
-$O/ut ${OUT:-/tmp/aio_bench}/b699/KSNDMC_TWS/LPC1768/Debug/fw_ksn_tws.hex 2 | tail -1
+# The KSNDMC builds live outside the repo: name them with KSN_TRG_HEX / KSN_TWS_HEX
+for pair in "${KSN_TRG_HEX:-}:0:KSNDMC_TRG" "${KSN_TWS_HEX:-}:2:KSNDMC_TWS"; do
+    hex=${pair%%:*}; rest=${pair#*:}; type=${rest%%:*}; name=${rest#*:}
+    if [ -n "$hex" ] && [ -f "$hex" ]; then
+        $O/ut "$hex" "$type" | tail -1
+    else
+        echo "SKIPPED $name update test: set ${name/KSNDMC_/KSN_}_HEX to its fw_*.hex"
+    fi
+done
 cc $F -I$R/LPC1768 -o $O/npt $R/LPC1768/tests/net_policy_test.c $R/LPC1768/net_policy.c && $O/npt | tail -1

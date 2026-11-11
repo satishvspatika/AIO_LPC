@@ -1281,6 +1281,7 @@ static void __attribute__((noinline)) log_boot_header(void)
     char bk_info[64];
     snprintf(bk_info, sizeof(bk_info), "Pending Backlogs: %u on SD, %u in flash", (unsigned int)bk_count, (unsigned int)flash_pending);
     storage_log_debug("BOOT", bk_info);
+    storage_log_power_off_mark();
 
     snprintf(bk_info, sizeof(bk_info), "Flash log holds %u records", (unsigned int)flash_log_record_count());
     storage_log_debug("BOOT", bk_info);

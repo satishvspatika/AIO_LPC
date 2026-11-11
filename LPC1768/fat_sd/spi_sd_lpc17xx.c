@@ -74,6 +74,12 @@
 #define SOCKET_POWER_MASK       (1 << SOCKET_POWER_PIN)
 #define SOCKET_POWER_OPENDRAIN  PINSEL_PINMODE_OPENDRAIN /* 33k pull-up mounted */
 
+/* v6.9.30: data clock 12.5 MHz (was 25 MHz, the SSP's fastest at 50 MHz PCLK). There is no data
+ * CRC on this link, so a bad bit is written without an error: BIHAR's log had sectors of log
+ * text with single bits flipped and lost tails at 25 MHz (1922's none). Log writes are small,
+ * so the slower clock costs almost nothing. */
+#define SD_SPI_FAST_HZ           12500000
+
 /* used SSP-port: */
 #define CARD_SSP                 1
 
@@ -256,7 +262,7 @@ static void spi_set_speed( enum speed_setting speed )
 	if ( speed == INTERFACE_SLOW ) {
 		SSP_SetClock(LPC_SSP1, 400000);
 	} else {
-		SSP_SetClock(LPC_SSP1, 25000000);
+		SSP_SetClock(LPC_SSP1, SD_SPI_FAST_HZ);
 	}
 }
 
@@ -560,7 +566,7 @@ static void spi_set_speed( enum speed_setting speed )
 	if ( speed == INTERFACE_SLOW ) {
 		SSP_SetClock(LPC_SSP0, 400000);
 	} else {
-		SSP_SetClock(LPC_SSP0, 25000000);
+		SSP_SetClock(LPC_SSP0, SD_SPI_FAST_HZ);
 	}
 }
 
