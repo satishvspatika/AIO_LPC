@@ -58,3 +58,7 @@ LPC1768/Debug/LPC1768_AIO.bin.sdname
 LPC1768/Debug/journal_blank.bin
 LPC1768/Debug/journal_blank.hex
 LPC845/LPC845_TWS.map
+
+# Old unit flash dumps hold server passwords: keep local, never push
+TEST_JIG/old_units/
+TEST_JIG/migrate/out/
