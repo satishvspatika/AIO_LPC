@@ -285,3 +285,66 @@ uint32_t intermcu_get_fat_time(void)
 {
     return ((uint32_t)(2026 - 1980) << 25) | (1UL << 21) | (1UL << 16);
 }
+
+/* ---- Keypad: 3 x 3 matrix, pins and scan as LPC1768/ui_display.c (keypad_init_hw, Kbd_Scan) ----
+ * Rows (outputs, idle high, driven low one at a time): P3.26 (MENU UP CALIB), P3.25 (LEFT EN RIGHT).
+ * Columns (inputs, pull-ups): P0.22, P0.21, P0.20. */
+#define KB_ROW0 (1UL << 26)   /* P3 */
+#define KB_ROW1 (1UL << 25)   /* P3 */
+#define KB_COL0 (1UL << 22)   /* P0 */
+#define KB_COL1 (1UL << 21)
+#define KB_COL2 (1UL << 20)
+
+void key_init(void)
+{
+    LPC_PINCON->PINSEL7 &= ~((0x03UL << 18) | (0x03UL << 20));   /* P3.25, P3.26: GPIO, pull-up */
+    LPC_PINCON->PINMODE7 &= ~((0x03UL << 18) | (0x03UL << 20));
+    LPC_PINCON->PINMODE_OD3 &= ~(KB_ROW0 | KB_ROW1);
+    LPC_GPIO3->FIOMASK &= ~(KB_ROW0 | KB_ROW1);
+    LPC_GPIO3->FIOSET = KB_ROW0 | KB_ROW1;
+    LPC_GPIO3->FIODIR |= KB_ROW0 | KB_ROW1;
+    LPC_PINCON->PINSEL1 &= ~((0x03UL << 8) | (0x03UL << 10) | (0x03UL << 12));   /* P0.20-22 */
+    LPC_PINCON->PINMODE1 &= ~((0x03UL << 8) | (0x03UL << 10) | (0x03UL << 12));
+    LPC_PINCON->PINMODE_OD0 &= ~(KB_COL0 | KB_COL1 | KB_COL2);
+    LPC_GPIO0->FIOMASK &= ~(KB_COL0 | KB_COL1 | KB_COL2);
+    LPC_GPIO0->FIODIR &= ~(KB_COL0 | KB_COL1 | KB_COL2);
+}
+
+static void rows_idle(void)
+{
+    LPC_GPIO3->FIOSET = KB_ROW0 | KB_ROW1;
+}
+
+/* One scan: 0 none, else row * 3 + col + 1 (the production key codes: 2 UP, 5 EN). Rows 0 and 1
+ * only: row 2 (P1.21: BACK, DOWN, DSP) also goes to the CTRL board, so it is never driven here. */
+static int key_scan(void)
+{
+    rows_idle();
+    delay_us(500);
+    uint32_t stuck = ~LPC_GPIO0->FIOPIN;   /* A column low with all rows high is not a key */
+    for (int row = 0; row < 2; row++) {
+        LPC_GPIO3->FIOCLR = (row == 0) ? KB_ROW0 : KB_ROW1;
+        delay_us(1000);
+        uint32_t p = LPC_GPIO0->FIOPIN;
+        rows_idle();
+        if (!(p & KB_COL0) && !(stuck & KB_COL0)) return row * 3 + 1;
+        if (!(p & KB_COL1) && !(stuck & KB_COL1)) return row * 3 + 2;
+        if (!(p & KB_COL2) && !(stuck & KB_COL2)) return row * 3 + 3;
+    }
+    return 0;
+}
+
+/* Waits for a press: all keys up first, then the same key on 2 scans 50 ms apart */
+int key_wait(void)
+{
+    while (key_scan() != 0) {
+        hal_delay_ms(50);
+    }
+    int last = 0;
+    for (;;) {
+        hal_delay_ms(50);
+        int k = key_scan();
+        if (k != 0 && k == last) return k;
+        last = k;
+    }
+}

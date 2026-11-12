@@ -27,6 +27,11 @@ void uart3_write(const void *data, size_t len);
 void uart3_puts(const char *s);
 int uart3_getc(uint32_t timeout_ms);        /* -1 on timeout */
 
+/* Keypad (pins as the production firmware). Top two rows only. Codes: 1 MENU 2 UP 3 CALIB 4 LEFT 5 EN 6 RIGHT */
+enum { KEY_UP = 2, KEY_EN = 5 };
+void key_init(void);
+int key_wait(void);                         /* Blocks until a key is pressed (debounced) */
+
 /* Small text helpers (no printf in this image) */
 char *fmt_hex(char *out, uint32_t value, int digits);
 char *fmt_dec(char *out, uint32_t value);

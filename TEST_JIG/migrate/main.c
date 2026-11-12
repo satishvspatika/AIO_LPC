@@ -23,8 +23,9 @@
 #include "ff.h"
 #include "fw_layout.h"
 #include "boot_core.h"
+#include "fwhex.h"
 
-#define MIG_VERSION "MIG-1.3"
+#define MIG_VERSION "MIG-1.4"
 
 const fw_image_info_t g_fw_image_info = {
     FW_IMAGE_MAGIC, FW_BOARD_ID, 0, 0, 0xFFFFFFFFUL, MIG_VERSION   /* Length and CRC: build.sh */
@@ -122,13 +123,62 @@ static bool file_exists(const char *path)
 
 /* Each unit's files go in MIGRATE/<station ID>/, so one card serves many units: a rerun on the
  * same unit (after a power cut) finds and keeps its own backups, another unit gets a new folder.
- * The ID is the old settings' first field (0x1000, e.g. "002114"); sector 1 is never changed by
- * the conversion, so a rerun reads the same ID. */
+ * The ID is the old settings' first field (0x1000, e.g. "002114"). Sector 1 stays as it was until
+ * the clean-up near the end of M2; from then on a rerun takes its folder from the tag (read_tag). */
 static char s_dir[24] = "MIGRATE/NOID";
 static char s_path[40];
 
+/* MIG-1.4: two units can share an ID (no ID, or the factory default never changed). A folder that
+ * already holds OLDFLASH.BIN is this unit's only when the saved settings sector equals the chip's
+ * (unchanged until the clean-up, after which the tag names the folder); else <ID>_2, <ID>_3, ... */
+static bool saved_settings_match(const char *path)
+{
+    static uint8_t buf[256];
+    UINT got = 0;
+    bool same = false;
+    if (f_open(&s_file, path, FA_OPEN_EXISTING | FA_READ) != FR_OK) {
+        return false;
+    }
+    if (f_lseek(&s_file, 0x1000) == FR_OK) {
+        same = true;
+        for (uint32_t off = 0; same && off < 0x1000; off += sizeof(buf)) {
+            same = f_read(&s_file, buf, sizeof(buf), &got) == FR_OK && got == sizeof(buf) &&
+                   memcmp(buf, (const void *)(0x1000 + off), sizeof(buf)) == 0;
+        }
+    }
+    f_close(&s_file);
+    return same;
+}
+
+static const char *unit_path(const char *name);
+
+/* After the settings clean-up (m2.c), a rerun takes its folder and type from the tag at 0x1080 */
+static int s_tag_type = -1;
+
+static bool read_tag(void)
+{
+    const char *t = (const char *)M2_TAG_ADDR;
+    size_t pl = strlen(M2_TAG_PREFIX);
+    if (strncmp(t, M2_TAG_PREFIX, pl) != 0 || t[pl] < '0' || t[pl] > '2' ||
+        strncmp(t + pl + 1, " D=MIGRATE/", 11) != 0) {
+        return false;
+    }
+    const char *d = t + pl + 4;
+    size_t n = 0;
+    while (n < sizeof(s_dir) - 1 && d[n] > ' ' && d[n] <= '~') n++;
+    if (d[n] != '\0') return false;
+    memcpy(s_dir, d, n);
+    s_dir[n] = '\0';
+    s_tag_type = t[pl] - '0';
+    return true;
+}
+
 static void set_unit_dir(void)
 {
+    if (read_tag()) {
+        f_mkdir(s_dir);
+        return;
+    }
     char id[9];
     int n = 0;
     for (const char *p = (const char *)0x1000; n < 8; p++) {
@@ -137,9 +187,22 @@ static void set_unit_dir(void)
         id[n++] = c;
     }
     id[n] = '\0';
-    if (n > 0) {
+    if (n == 0) strcpy(id, "NOID");
+    for (int k = 1; k <= 99; k++) {
         strcpy(s_dir, "MIGRATE/");
         strcat(s_dir, id);
+        if (k > 1) {
+            char sfx[4];
+            int i = 0;
+            sfx[i++] = '_';
+            if (k >= 10) sfx[i++] = (char)('0' + k / 10);
+            sfx[i++] = (char)('0' + k % 10);
+            sfx[i] = '\0';
+            strcat(s_dir, sfx);
+        }
+        if (f_mkdir(s_dir) == FR_OK) return;                       /* New folder: a new unit */
+        if (!file_exists(unit_path("OLDFLASH.BIN"))) return;       /* Empty folder: use it */
+        if (saved_settings_match(unit_path("OLDFLASH.BIN"))) return; /* Rerun on this unit */
     }
 }
 
@@ -198,6 +261,110 @@ static void stop(const char *l1, const char *l2)
     }
 }
 
+/* MIGRATE/<unit>/TYPE.TXT: written when the type was chosen on the LCD, so a rerun does not ask again */
+static int saved_choice(void)
+{
+    if (f_open(&s_file, unit_path("TYPE.TXT"), FA_OPEN_EXISTING | FA_READ) != FR_OK) {
+        return -1;
+    }
+    char line[32] = "";
+    f_gets(line, sizeof(line), &s_file);
+    f_close(&s_file);
+    for (int t = 0; t < 3; t++) {
+        const char *name = m2_type_name(t);
+        if (strncmp(line, name, strlen(name)) == 0) {
+            rep("  type chosen on an earlier run (TYPE.TXT)\r\n");
+            return t;
+        }
+    }
+    return -1;
+}
+
+/* Old settings not recognised: the person picks the type. UP steps, EN chooses, EN again confirms.
+ * Nothing has been written to either chip yet, so power off here is safe. */
+static int ask_type(void)
+{
+    key_init();
+    lcd_show("TYPE NOT KNOWN", "UP=NEXT EN=SET");
+    hal_delay_ms(1500);
+    int t = 0;
+    for (;;) {
+        char l1[17] = "> ";
+        strcat(l1, m2_type_label(t));
+        lcd_show(l1, file_exists(m2_type_file(t)) ? "UP=NEXT EN=SET" : "FILE NOT ON CARD");
+        int k = key_wait();
+        if (k == KEY_UP) {
+            t = (t + 1) % 3;
+        } else if (k == KEY_EN) {
+            lcd_show(m2_type_label(t), "EN=YES  UP=NO");
+            if (key_wait() == KEY_EN) break;
+        }
+    }
+    rep("  type chosen on the LCD: "); rep(m2_type_name(t)); rep("\r\n");
+    char line[16];
+    strcpy(line, m2_type_name(t));
+    strcat(line, "\r\n");
+    write_file(unit_path("TYPE.TXT"), line, strlen(line));
+    return t;
+}
+
+/* The old SD bootloader V1.1 deletes fw.hex after loading it. One card converts many units, so this
+ * image writes fw.hex back from its own flash (CRC checked at start), byte for byte as build.sh makes
+ * it. Written as FWHEX.TMP, read back and compared, then renamed: a power cut never leaves a partial
+ * fw.hex (the old bootloader would hang on one with the old app already erased). */
+static uint8_t s_hexbuf[512];
+static uint8_t s_hexcmp[512];
+
+/* Fills s_hexbuf with whole lines; returns the byte count, 0 at the end */
+static uint32_t hex_chunk(fwhex_t *h)
+{
+    static char line[48];
+    static int pending;
+    uint32_t n = 0;
+    for (;;) {
+        if (pending == 0) pending = fwhex_next(h, line);
+        if (pending == 0) return n;
+        if (n + (uint32_t)pending > sizeof(s_hexbuf)) return n;
+        memcpy(s_hexbuf + n, line, (size_t)pending);
+        n += (uint32_t)pending;
+        pending = 0;
+    }
+}
+
+static bool restore_fw_hex(void)
+{
+    const uint32_t *v = (const uint32_t *)FW_SLOT_A_BASE;
+    const fw_image_info_t *info = (const fw_image_info_t *)v[FW_VECTOR_IMAGE_INFO];
+    fwhex_t h;
+    uint32_t n;
+    UINT done;
+    bool ok;
+
+    if (f_open(&s_file, "FWHEX.TMP", FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return false;
+    fwhex_start(&h, (const uint8_t *)FW_SLOT_A_BASE, FW_SLOT_A_BASE, info->length);
+    ok = true;
+    while (ok && (n = hex_chunk(&h)) > 0) {
+        ok = f_write(&s_file, s_hexbuf, n, &done) == FR_OK && done == n;
+    }
+    ok = (f_close(&s_file) == FR_OK) && ok;
+
+    if (ok && f_open(&s_file, "FWHEX.TMP", FA_OPEN_EXISTING | FA_READ) == FR_OK) {
+        fwhex_start(&h, (const uint8_t *)FW_SLOT_A_BASE, FW_SLOT_A_BASE, info->length);
+        while (ok && (n = hex_chunk(&h)) > 0) {
+            ok = f_read(&s_file, s_hexcmp, n, &done) == FR_OK && done == n && memcmp(s_hexcmp, s_hexbuf, n) == 0;
+        }
+        ok = ok && f_read(&s_file, s_hexcmp, 1, &done) == FR_OK && done == 0;   /* Nothing after the end */
+        f_close(&s_file);
+    } else {
+        ok = false;
+    }
+    if (!ok) {
+        f_unlink("FWHEX.TMP");
+        return false;
+    }
+    return f_rename("FWHEX.TMP", "fw.hex") == FR_OK;
+}
+
 static void wait_jumpers_off(void)
 {
     lcd_show("REMOVE JP1+JP2", "TO FINISH");
@@ -243,12 +410,24 @@ int main(void)
     }
     if (sd_ok) {
         set_unit_dir();
-        FRESULT m = f_mkdir(s_dir);
+        FRESULT m = f_mkdir(s_dir);   /* Normally made by set_unit_dir already */
         sd_ok = (m == FR_OK || m == FR_EXIST);
         rep("Files for this unit: "); rep(s_dir); rep("\r\n");
     }
     if (!sd_ok) {
         stop("SD CARD FAIL", "CHECK FAT32 CARD");
+    }
+    if (file_exists("fw.hex")) {
+        rep("fw.hex on the card: still there, kept\r\n");
+    } else {
+        lcd_show("SD CARD", "PUTTING fw.hex");
+        bool back = restore_fw_hex();
+        rep(back ? "fw.hex put back on the card (the old bootloader deletes it), read back OK\r\n"
+                 : "fw.hex could NOT be put back: copy it to the card again before the next unit\r\n");
+        if (!back) {
+            lcd_show("fw.hex NOT BACK", "COPY IT LATER");
+            hal_delay_ms(4000);
+        }
     }
     if (!file_exists(unit_path("OLDFLASH.BIN"))) {
         lcd_show("SD CARD", "SAVING OLD FLASH");
@@ -270,13 +449,31 @@ int main(void)
         hal_delay_ms(4000);
     }
 
-    /* 4. Station type: which production file. Before touching anything. */
-    int type = m2_detect_type(note_line);
-    rep("Station type: "); rep(m2_type_name(type)); rep("\r\n");
-    if (type < 0) {
-        write_file(unit_path("RESULT.TXT"), s_report, strlen(s_report));
-        stop("UNKNOWN TYPE", "SEE RESULT.TXT");
+    /* 4. Station type: which production file. Before touching anything. Order: the rerun tag, the
+     * old settings, this unit's TYPE.TXT (a choice made on an earlier run), else ask on the LCD. */
+    int type = -1;
+    if (s_tag_type >= 0) {
+        type = s_tag_type;
+        rep("  type from this unit's conversion tag (rerun)\r\n");
     }
+    if (type < 0) {
+        type = m2_detect_type(note_line);
+    }
+    if (type < 0) {
+        type = saved_choice();
+    }
+    if (type < 0) {
+        type = ask_type();
+    }
+    rep("Station type: "); rep(m2_type_name(type)); rep("\r\n");
+
+    /* The production file must be on the card before the CTRL chip is touched */
+    if (!file_exists(m2_type_file(type))) {
+        rep("Production file "); rep(m2_type_file(type)); rep(": NOT ON THE CARD\r\n");
+        write_file(unit_path("RESULT.TXT"), s_report, strlen(s_report));
+        stop("NO FIRMWARE FILE", "SEE RESULT.TXT");
+    }
+    rep("Production file "); rep(m2_type_file(type)); rep(": on the card\r\n");
 
     /* 5. Jumpers */
     bool jp1 = line_jumper_fitted(LINE_RST845);
@@ -322,7 +519,7 @@ int main(void)
 
     /* 7. M2: the main chip */
     rep("M2, main chip ("); rep(m2_type_name(type)); rep("):\r\n");
-    m2_result_t m2 = m2_convert(type, note_line);
+    m2_result_t m2 = m2_convert(type, s_dir, note_line);
     static const char *const m2names[] = {"DONE", "FAIL FILE", "FAIL IMAGE", "FAIL FLASH", "FAIL BOOT SECTOR", "FAIL TRIAL"};
     rep("  result: "); rep(m2names[m2]); rep("\r\n");
     write_file(unit_path("RESULT.TXT"), s_report, strlen(s_report));

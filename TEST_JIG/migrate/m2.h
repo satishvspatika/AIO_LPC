@@ -16,9 +16,18 @@ typedef enum {
 
 typedef void (*m2_note_fn)(const char *text);
 
-/* 0 KSNDMC_TRG, 1 BIHAR_TRG, 2 KSNDMC_TWS (UNIT_CFG values), -1 unknown. SD card mounted. */
+/* MIG-1.4: the first conversion rewrites the settings sector (0x1000) to the station ID alone, so
+ * the old server login does not stay on the unit. A tag at 0x1080 keeps what a rerun needs (the old
+ * fields are gone by then): "MIGRATED T=<type> D=<MIGRATE folder>". The production firmware reads
+ * only the ID at 0x1000; a keypad ID change keeps the first 256 bytes, so the tag stays (harmless). */
+#define M2_TAG_ADDR   0x1080UL
+#define M2_TAG_PREFIX "MIGRATED T="
+
+/* 0 KSNDMC_TRG, 1 BIHAR_TRG, 2 KSNDMC_TWS (UNIT_CFG values), -1 unknown: from the old settings */
 int m2_detect_type(m2_note_fn note);
 const char *m2_type_name(int type);
-m2_result_t m2_convert(int type, m2_note_fn note);
+const char *m2_type_label(int type);   /* For the LCD: "KSNDMC TRG" */
+const char *m2_type_file(int type);    /* Production file on the card */
+m2_result_t m2_convert(int type, const char *unit_dir, m2_note_fn note);
 
 #endif

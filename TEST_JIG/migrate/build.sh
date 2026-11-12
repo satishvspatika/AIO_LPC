@@ -23,7 +23,7 @@ CFLAGS="${MIG_EXTRA_CFLAGS} -mcpu=cortex-m3 -mthumb -Os -g -ffunction-sections -
   -I${LPC}/NXP/Drivers/include -I${ROOT}/CMSISv1p30_LPC17xx/inc \
   -I${ROOT}/FreeRTOS_Library/include -I${ROOT}/FreeRTOS_Library/portable"
 
-SRCS="${HERE}/startup.c ${HERE}/hal.c ${HERE}/isp845.c ${HERE}/ctrl845.c ${HERE}/iap1768.c ${HERE}/m2.c ${HERE}/main.c \
+SRCS="${HERE}/startup.c ${HERE}/hal.c ${HERE}/isp845.c ${HERE}/ctrl845.c ${HERE}/iap1768.c ${HERE}/m2.c ${HERE}/fwhex.c ${HERE}/main.c \
   ${LPC}/boot/boot_core.c ${LPC}/boot/fw_journal.c \
   ${LPC}/fat_sd/diskio.c ${LPC}/fat_sd/spi_sd_lpc17xx.c ${LPC}/fat_sd/ff.c ${LPC}/fat_sd/fattime.c \
   ${LPC}/fat_sd/option/ccsbcs.c \

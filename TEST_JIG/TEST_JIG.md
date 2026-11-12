@@ -296,6 +296,21 @@ source `../TWS5_1_0_5_recovered_Jan2026/` (the unit runs TRG5-1.0.5, whose sourc
 
 CRP word = 0xFFFFFFFF: no protection.
 
+### Old settings layouts (sector 1, 0x1000): two in the field (MIG-1.4, 2026-11-12)
+
+| Offset | TRG5 (unit 2114, read) | TWS5 (`../TWS5_1_0_5_recovered_Jan2026` globals.h) |
+|---|---|---|
+| 0x1000 | Station ID (8) | Station ID (8) |
+| 0x1008 | Station name (32) | Station name (32) |
+| 0x1028 | Agency "KSNDMC" | Model "SPATIKA" |
+| 0x1038 | Type "TRG" | Agency "KSNDMC" |
+| 0x1048 | Version "TRG5-1.0.5" | Type "TWS" |
+
+MIG-1.3 read only the TRG5 layout, so an old TWS unit stopped at UNKNOWN TYPE (safe: before the CTRL
+step). MIG-1.4 tries both; when neither matches, RESULT.TXT lists the fields it read and the LCD asks. The station ID is
+at 0x1000 in both, which is all the production firmware reads. Old BIHAR units: layout not yet seen.
+TWS5 day data is sectors 2-10 (0x2000-0xAFFF), still below the old bootloader at 0xB000.
+
 ### Old SD bootloader V1.1: rules the migration image's `fw.hex` must follow
 
 From `Bootloader_Main1/Example01/main.c`:
@@ -422,12 +437,12 @@ CTRL bootloader's head last; whole chip read back. Unsafe only between erasing a
 ### Full conversion (MIG-1.x), passed 2026-11-11 on unit 2114
 
 One `fw.hex` does everything: self-check, old LPC1768 flash to `MIGRATE/OLDFLASH.BIN`, station type from
-the old settings (agency 0x1028, type 0x1038; `MIGRATE/TYPE.TXT` overrides), M1, then M2 (`m2.c`):
+the old settings (MIG-1.4: both layouts, else chosen on the LCD), M1, then M2 (`m2.c`):
 production app from the card (`fw_ksn_trg.hex`, `fw_bihar.hex` or `fw_ksn_tws.hex`) staged in slot B
 and checked (CRC, board, profile = type); new bootloader into sectors 2-8; boot stub into sector 0 (the
 unsafe moment); sectors 9-16 erased, 25-29 blank; journal PENDING; waits for JP1 + JP2 to come off;
 restarts. The new bootloader then installs the production firmware by the normal swap and trial.
-Sector 1 is left as it is: the production firmware reads the station ID from offset 0 (old layout too).
+Sector 1: up to MIG-1.3 left as it is; MIG-1.4 rewrites it to the station ID alone (see below).
 A run that finds the new boot stub carries on from the clearing step. Report: `MIGRATE/RESULT.TXT`.
 
 MIG-1.1: the record log is cleared only on a first conversion (journal empty). The migration image stays
@@ -439,7 +454,7 @@ MIG-1.2 (passed on 2114, 2026-11-11 21:14): each unit's files go in `MIGRATE/<st
 e.g. `MIGRATE/002114/`: OLDFLASH.BIN, OLD845.BIN, RESULT.TXT), so one card converts many units. Up to
 MIG-1.1 the files sat in `MIGRATE/` itself and a second unit found the first unit's backups and kept them
 (the keep is for reruns on the same unit after a power cut), so its own were never saved. About 165 KB
-per unit. `MIGRATE/TYPE.TXT` stays where it is.
+per unit. (`MIGRATE/TYPE.TXT` was card-wide up to MIG-1.3; MIG-1.4 replaces it, see below.)
 
 MIG-1.3 (built 2026-11-11, not yet run on a unit): reports the station ID. If 0x1000 starts with 4-6
 digits (the only form the production firmware takes the ID from, `flash_nvram_init`) the unit keeps it;
@@ -447,15 +462,43 @@ otherwise the conversion carries on, the LCD shows NO OLD STN ID / DEFAULT ID US
 says so, and the unit comes up with the build's default ID, to be set from the keypad. Keypad changes keep
 the digit form (`flash_nvram_set_station_id`), so reruns on converted units keep their ID.
 
+MIG-1.4 (built 2026-11-12, not yet run on a unit), for a smooth field run:
+- Station type from either old settings layout (TRG5 or TWS5, section 12). Only when neither matches,
+  the LCD asks: TYPE NOT KNOWN, then `> KSNDMC TRG` (UP = next type, EN = choose, EN again = confirm;
+  `FILE NOT ON CARD` on line 2 if that type's file is missing). Top two key rows only (row 2 goes to the
+  CTRL board). Nothing is written to either chip before this, so power off here is safe. The choice is
+  saved in `MIGRATE/<unit>/TYPE.TXT`, so a rerun does not ask again. The card-wide `MIGRATE/TYPE.TXT` is
+  gone (a forgotten one would have forced its type onto every later unit).
+- The production file for the type must be on the card before the CTRL step (NO FIRMWARE FILE stops
+  there, not after the CTRL chip is already new).
+- Units sharing an ID (or with none) get their own folders: a folder with OLDFLASH.BIN is this unit's
+  only when its saved settings sector equals the chip's; else `<ID>_2`, `<ID>_3` ...
+- `fw.hex` stays on the card: the old bootloader deletes it after loading, so the converter writes it
+  back from its own flash (CRC checked first), byte for byte as `build.sh` makes it (`fwhex.c`; checked
+  on the Mac against objcopy output). Written as `FWHEX.TMP`, read back and compared, then renamed, so a
+  power cut never leaves a partial `fw.hex`. LCD: SD CARD / PUTTING fw.hex. If it fails: fw.hex NOT
+  BACK / COPY IT LATER for 4 s, and the conversion carries on. Converted units never read `fw.hex`
+  (the update menu reads only the per-type files, `user_config.h` FW_FILE_*), so it is harmless there.
+- Settings sector clean-up, first conversion only, after the clearing step and before PENDING: sector 1
+  is rewritten to the station ID alone (or blank when there was no valid ID), so the old server login
+  does not stay on the unit, plus a tag at 0x1080 `MIGRATED T=<type> D=<MIGRATE folder>` from which a
+  rerun takes its type and folder. The production firmware reads only the ID; a keypad ID change keeps
+  the first 256 bytes, so the tag stays (harmless). A power cut in the erase-to-write window (a few ms)
+  leaves sector 1 blank: the rerun then asks for the type on the LCD and the unit comes up with the
+  default ID; the real ID is in that unit's `OLDFLASH.BIN` and is set from the keypad.
+
 Practice resets: `TEST_JIG/restore_old_unit.py lpc845|lpc1768 <dump>` puts a converted bench unit back on
 its old firmware (MCU-Link on J2 / J4; waits for DSP, used part only at 4 MHz, about 3 s, read back). CTRL
 chip first, conversion card out of the unit while resetting. Bench only.
 
 **Field procedure:**
-1. Card (FAT32): `fw.hex` (migration image), the production file for the station type.
+1. Card (FAT32): `fw.hex` (migration image) and all three production files (`fw_ksn_trg.hex`,
+   `fw_bihar.hex`, `fw_ksn_tws.hex`), so any old unit converts with the same card.
 2. Unit off; fit JP1 + JP2; card in; power on.
-3. Wait (about 2 minutes): CONVERTING UNIT, CTRL CHIP ..., MAIN CHIP ..., then REMOVE JP1+JP2.
+3. Wait (about 2 minutes): CONVERTING UNIT, CTRL CHIP ..., MAIN CHIP ..., then REMOVE JP1+JP2. Only if
+   the LCD shows TYPE NOT KNOWN: UP to the right type, EN, EN again.
 4. Remove both jumpers: the unit restarts and comes up on the production firmware.
 5. Take the card out once the LCD shows the production version, before its first slot: the production
    firmware writes its logs (SLOTS.CSV, HTTPLOG.TXT, ...) to whatever card is in. Put the unit's own card in.
-6. Copy `MIGRATE/` to the Mac now and then (old flash of both chips and RESULT.TXT, one folder per station).
+6. Copy `MIGRATE/` to the Mac now and then (old flash of both chips and RESULT.TXT, one folder per station),
+   then clear it: the OLDFLASH.BIN files hold each old unit's server login.

@@ -1,15 +1,16 @@
 /* M2: the LPC1768 to the new layout (LPC1768/boot/fw_layout.h), so the new bootloader installs the
  * production firmware through the normal update path (stage in slot B, PENDING, swap, trial).
  *
- * Sector 1 (settings) is not touched: the production firmware reads the station ID from offset 0,
- * where the old firmware keeps it, and checks its other fields against old bytes (flash_nvram.c).
+ * Sector 1 (settings): the production firmware reads only the station ID at offset 0, where the old
+ * firmware keeps it (flash_nvram.c). MIG-1.4 clears the rest (old server login) in step 4.
  *
  * Order, so every power cut leaves a unit that boots into something that carries on:
  *   1. Production app from the SD card into slot B (0x38000), CRC and type checked. Old path intact.
  *   2. New bootloader into sectors 2-8 (old day data only). Old path intact.
  *   3. New boot stub into sector 0. THE unsafe moment (erase to write, well under 0.1 s). From here
  *      the new bootloader starts this image (slot A is valid, the journal holds no record yet).
- *   4. Sectors 9-16 erased (the old bootloader becomes error log, journal, swap); 25-29 blank.
+ *   4. Sectors 9-16 erased (the old bootloader becomes error log, journal, swap); 25-29 blank;
+ *      settings sector rewritten to the station ID alone plus the rerun tag (MIG-1.4).
  *   5. Journal: PENDING. Restart: the new bootloader swaps the production app in, on trial.
  * A run that finds the new boot stub already there carries on from step 4. */
 #include "m2.h"
@@ -49,31 +50,50 @@ static bool contains(uint32_t addr, const char *want)
     return strstr(field, want) != NULL;
 }
 
-/* Old settings sector: agency at 0x1028, type at 0x1038 (read on unit 2114: "KSNDMC", "TRG").
- * MIGRATE/TYPE.TXT (KSNDMC_TRG, BIHAR_TRG or KSNDMC_TWS) overrides it. */
+/* Agency and type from one old settings layout: -1 when they do not match a known pair */
+static int type_at(uint32_t agency, uint32_t type)
+{
+    bool trg = str_at(type, "TRG");
+    bool tws = str_at(type, "TWS") || str_at(type, "AWS");
+    if (str_at(agency, "KSNDMC") && trg) return 0;
+    if (str_at(agency, "KSNDMC") && tws) return 2;
+    if (contains(agency, "BIHAR") && trg) return 1;
+    return -1;
+}
+
+/* Old settings sector 0x1000: station ID 8, station name 32, then two layouts in the field:
+ *   TRG5 (read on unit 2114):           agency 0x1028 "KSNDMC", type 0x1038 "TRG", version 0x1048
+ *   TWS5 (../TWS5_1_0_5 globals.h):     model 0x1028 "SPATIKA", agency 0x1038, type 0x1048 "TWS"
+ * TRG5's version field ("TRG5-1.0.5") never equals a type name, so trying both is safe.
+ * Neither: the converter asks on the LCD (main.c). */
 int m2_detect_type(m2_note_fn note)
 {
-    FIL f;
-    if (f_open(&f, "MIGRATE/TYPE.TXT", FA_OPEN_EXISTING | FA_READ) == FR_OK) {
-        char line[32] = "";
-        f_gets(line, sizeof(line), &f);
-        f_close(&f);
-        for (int t = 0; t < 3; t++) {
-            if (strncmp(line, s_type_names[t], strlen(s_type_names[t])) == 0) {
-                note("type from MIGRATE/TYPE.TXT");
-                return t;
-            }
+    int t = type_at(0x1028, 0x1038);
+    if (t >= 0) { note("type from old settings (TRG5 layout)"); return t; }
+    t = type_at(0x1038, 0x1048);
+    if (t >= 0) { note("type from old settings (TWS5 layout)"); return t; }
+    note("old settings: agency/type not recognised. Fields read:");
+    for (uint32_t a = 0x1028; a <= 0x1048; a += 0x10) {
+        char field[17];
+        for (int i = 0; i < 16; i++) {
+            char c = ((const char *)a)[i];
+            field[i] = (c >= ' ' && c <= '~') ? c : (c == 0 ? 0 : '?');
         }
-        note("MIGRATE/TYPE.TXT not understood");
-        return -1;
+        field[16] = '\0';
+        note(field);
     }
-    bool trg = str_at(0x1038, "TRG");
-    bool tws = str_at(0x1038, "TWS") || str_at(0x1038, "AWS");
-    if (str_at(0x1028, "KSNDMC") && trg) return 0;
-    if (str_at(0x1028, "KSNDMC") && tws) return 2;
-    if (contains(0x1028, "BIHAR") && trg) return 1;
-    note("old settings: agency/type not recognised (MIGRATE/TYPE.TXT can name it)");
     return -1;
+}
+
+const char *m2_type_label(int type)
+{
+    static const char *const labels[] = {"KSNDMC TRG", "BIHAR TRG", "KSNDMC TWS"};
+    return (type >= 0 && type <= 2) ? labels[type] : "UNKNOWN";
+}
+
+const char *m2_type_file(int type)
+{
+    return (type >= 0 && type <= 2) ? s_type_files[type] : "";
 }
 
 /* ---- 1. production app from an SD card hex file into slot B ---- */
@@ -193,7 +213,41 @@ static bool boot_stub_present(void)
     return true;
 }
 
-m2_result_t m2_convert(int type, m2_note_fn note)
+/* 4b. Settings sector to the station ID alone, plus the tag. Erase to write is a short window:
+ * a power cut there leaves it blank (no ID: the new firmware uses its default; the ID is in
+ * MIGRATE/<ID>/OLDFLASH.BIN and goes back from the keypad). */
+static bool clean_settings(int type, const char *unit_dir, m2_note_fn note)
+{
+    static uint8_t page[256] __attribute__((aligned(4)));
+    memset(page, 0xFF, sizeof(page));
+    const char *old = (const char *)0x1000;
+    int n = 0;
+    while (n < 7 && old[n] >= '0' && old[n] <= '9') n++;
+    if (n >= 4 && n <= 6) {
+        memset(page, 0, 8);
+        memcpy(page, old, (size_t)n);
+    }
+    char *tag = (char *)page + (M2_TAG_ADDR - 0x1000UL);
+    size_t room = sizeof(page) - (M2_TAG_ADDR - 0x1000UL) - 1;
+    memset(tag, 0, room + 1);
+    strcpy(tag, M2_TAG_PREFIX);
+    tag[strlen(tag)] = (char)('0' + type);
+    strcat(tag, " D=");
+    strncat(tag, unit_dir, room - strlen(tag));
+    if (!iap1768_erase(1, 1) || !iap1768_program(0x1000, page, sizeof(page))) {
+        note("settings sector rewrite FAILED");
+        return false;
+    }
+    if (memcmp((const void *)0x1000, page, sizeof(page)) != 0 || !iap1768_blank(0x1100, 0xF00)) {
+        note("settings sector does not read back");
+        return false;
+    }
+    note(n >= 4 && n <= 6 ? "settings sector: station ID only (old server login and settings cleared)"
+                          : "settings sector: cleared (no valid old ID: the new firmware uses its default)");
+    return true;
+}
+
+m2_result_t m2_convert(int type, const char *unit_dir, m2_note_fn note)
 {
     if (!boot_stub_present()) {
         /* 1. */
@@ -258,6 +312,10 @@ m2_result_t m2_convert(int type, m2_note_fn note)
             }
         }
         note("error log, journal, swap and record log areas blank");
+        if (strncmp((const char *)M2_TAG_ADDR, M2_TAG_PREFIX, strlen(M2_TAG_PREFIX)) != 0 &&
+            !clean_settings(type, unit_dir, note)) {
+            return M2_FAIL_FLASH;
+        }
     } else {
         note("journal already in use (converted unit): error log and record log kept");
     }
