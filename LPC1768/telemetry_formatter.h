@@ -7,7 +7,7 @@
  * %f is not linked in, because it pulls malloc and shared C library state into RTOS tasks. */
 void fmt_fixed(char *out, size_t size, float val, int width, int decimals);
 
-/* Pads a station ID to the 6 digits used in records and file names */
+/* Pads a station ID to STATION_ID_DIGITS (8 Bihar, 6 KSNDMC), as in records and file names */
 void format_station_id(char *out, size_t size, const char *stn_id);
 
 #include "intermcu_protocol.h"

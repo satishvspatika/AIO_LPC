@@ -487,6 +487,17 @@ MIG-1.4 (built 2026-11-12, not yet run on a unit), for a smooth field run:
   leaves sector 1 blank: the rerun then asks for the type on the LCD and the unit comes up with the
   default ID; the real ID is in that unit's `OLDFLASH.BIN` and is set from the keypad.
 
+Production v6.9.33 has M1's method too, for a replaced CTRL board with no bootloader (CTRL F/W with JP1+JP2):
+`stub845.s` and `rescue845.s` copied to `LPC1768/ctrl_isp/`, ISP code adapted in `LPC1768/ctrl_isp.c`, sector plan in
+`ctrl_isp_core.c` (docs/SYSTEM_DESIGN.md 7.5). Its host test found that M1 can leave sector 0 half-written if every
+retry fails; production now leaves it erased instead. `ctrl845.c` here still has the old behaviour.
+
+MIG-1.6 (built 2026-11-12): MIG-1.5 with CTRL v1.11 (software clock fallback) built in, so converted units get it at once.
+
+MIG-1.5 (built 2026-11-12, not yet run on a unit): old station IDs of 4-8 digits are kept (was 4-6), to
+match production v6.9.32, where Bihar IDs are 8 digits. An 8-digit ID fills the old 8-byte field with no NUL;
+the report shows all 8. The settings rewrite clears bytes 0-11 before the ID.
+
 Practice resets: `TEST_JIG/restore_old_unit.py lpc845|lpc1768 <dump>` puts a converted bench unit back on
 its old firmware (MCU-Link on J2 / J4; waits for DSP, used part only at 4 MHz, about 3 s, read back). CTRL
 chip first, conversion card out of the unit while resetting. Bench only.

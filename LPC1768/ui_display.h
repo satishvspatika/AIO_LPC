@@ -41,6 +41,8 @@ void ui_set_slot_busy(bool busy);
 
 /* Implemented by the slot scheduler in main.c */
 bool slot_scheduler_is_due(void);
+/* MENU > SET DATE/TIME: sets the clock, restarts the rain-day total at 0, re-arms the scheduler */
+uint32_t clock_set_by_hand(const char *ts14);
 
 /* Backlog tracking */
 uint32_t ui_get_backlog_count(void);

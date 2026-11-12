@@ -1,4 +1,5 @@
 #include "flash_log.h"
+#include "flash_nvram.h"
 #include <string.h>
 
 #define PAGE_SIZE       256
@@ -556,6 +557,8 @@ uint32_t flash_log_pending_count(void)
 
 void flash_log_erase_all(void)
 {
+    /* Record numbers start again at 1: an old rain-restart mark would hide the new records */
+    (void)flash_nvram_set_rain_reset_seq(0);
     for (uint32_t i = 0; i < SECTOR_COUNT; i++) {
         iap_erase_sector(i);
     }

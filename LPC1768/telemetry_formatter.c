@@ -56,25 +56,29 @@ void fmt_fixed(char *out, size_t size, float val, int width, int decimals)
     snprintf(out, size, "%s%0*ld.%0*ld", negative ? "-" : "", int_width, scaled / scale, decimals, scaled % scale);
 }
 
-/* Helper to format Station ID into exactly 6 zero-padded digits (e.g. "1061" -> "001061") */
-static void format_stn_id_6(char *out, size_t out_size, const char *stn_id)
+/* Station ID as exactly STATION_ID_DIGITS zero-padded digits (Bihar "1923" -> "00001923",
+ * KSNDMC "1061" -> "001061"). A longer stored ID (unit retyped from Bihar) drops only leading
+ * zeros; if its real digits still don't fit, the last ones are kept. */
+static void format_stn_id(char *out, size_t out_size, const char *stn_id)
 {
-    if (!out || out_size < 7) return;
+    const int w = STATION_ID_DIGITS;
+    if (!out || out_size < (size_t)w + 1) return;
     if (!stn_id || stn_id[0] == '\0') {
-        strncpy(out, "001061", out_size - 1);
-        out[out_size - 1] = '\0';
-        return;
+        stn_id = STATION_ID_DEFAULT;
     }
     size_t len = strlen(stn_id);
-    if (len >= 6) {
-        strncpy(out, stn_id, 6);
-        out[6] = '\0';
-    } else {
-        int pad = 6 - (int)len;
-        for (int i = 0; i < pad; i++) out[i] = '0';
-        strncpy(out + pad, stn_id, len);
-        out[6] = '\0';
+    while (len > (size_t)w && stn_id[0] == '0') {
+        stn_id++;
+        len--;
     }
+    if (len > (size_t)w) {
+        stn_id += len - (size_t)w;
+        len = (size_t)w;
+    }
+    int pad = w - (int)len;
+    for (int i = 0; i < pad; i++) out[i] = '0';
+    memcpy(out + pad, stn_id, len);
+    out[w] = '\0';
 }
 
 /* Helper to extract and format slot timestamp (YYYY-MM-DD and HH:MM) */
@@ -169,8 +173,8 @@ static void fmt_signal_4(char *out, int val)
 
 int format_payload_ksndmc_trg(char *dest, size_t dest_size, const char *stn_id, const telemetry_data_t *data, int csq_dbm)
 {
-    char clean_stn[8];
-    format_stn_id_6(clean_stn, sizeof(clean_stn), stn_id);
+    char clean_stn[STATION_ID_MAX + 1];
+    format_stn_id(clean_stn, sizeof(clean_stn), stn_id);
 
     char date_buf[12], time_buf[8];
     extract_slot_timestamp(data, date_buf, time_buf);
@@ -192,8 +196,8 @@ int format_payload_ksndmc_trg(char *dest, size_t dest_size, const char *stn_id, 
 
 int format_payload_bihar_trg(char *dest, size_t dest_size, const char *stn_id, const telemetry_data_t *data, int csq_dbm)
 {
-    char clean_stn[8];
-    format_stn_id_6(clean_stn, sizeof(clean_stn), stn_id);
+    char clean_stn[STATION_ID_MAX + 1];
+    format_stn_id(clean_stn, sizeof(clean_stn), stn_id);
 
     char date_buf[12], time_buf[8];
     extract_slot_timestamp(data, date_buf, time_buf);
@@ -217,8 +221,8 @@ int format_payload_bihar_trg(char *dest, size_t dest_size, const char *stn_id, c
 
 int format_payload_ksndmc_tws(char *dest, size_t dest_size, const char *stn_id, const telemetry_data_t *data, int csq_dbm)
 {
-    char clean_stn[8];
-    format_stn_id_6(clean_stn, sizeof(clean_stn), stn_id);
+    char clean_stn[STATION_ID_MAX + 1];
+    format_stn_id(clean_stn, sizeof(clean_stn), stn_id);
 
     char date_buf[12], time_buf[8];
     extract_slot_timestamp(data, date_buf, time_buf);
@@ -246,7 +250,7 @@ int format_payload_ksndmc_tws(char *dest, size_t dest_size, const char *stn_id, 
 
 void format_station_id(char *out, size_t size, const char *stn_id)
 {
-    format_stn_id_6(out, size, stn_id);
+    format_stn_id(out, size, stn_id);
 }
 
 int format_sd_record(char *dest, size_t dest_size, const telemetry_data_t *data, int csq_dbm)

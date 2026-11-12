@@ -71,6 +71,12 @@ bool intermcu_parse_server_time(const char *http_response, char *out_ts14, size_
 /* Seconds between two YYYYMMDDHHMMSS times, across midnight; -1 if a date is too far apart
  * or a time is invalid */
 long intermcu_clock_drift_sec(const char *a_ts14, const char *b_ts14);
+/* YYYYMMDDHHMMSS that the LPC845 can hold: 2024-2079, a real day of that month, 00:00:00-23:59:59.
+ * Every time sent by hand (menu, SMS #TIME=) is checked with this first: the LPC845 checks nothing. */
+bool intermcu_ts14_believable(const char *ts);
+/* CTRL clock: -1 not reported (CTRL before v1.11), 0 its RTC, 1 software clock as the RTC doesn't
+ * answer, 2 software clock as the RTC doesn't run */
+int intermcu_845_rtc_state(void);
 
 /* Tips counted by the LPC845 during field calibration */
 void intermcu_calib_reset(void);

@@ -25,7 +25,7 @@
 #include "boot_core.h"
 #include "fwhex.h"
 
-#define MIG_VERSION "MIG-1.4"
+#define MIG_VERSION "MIG-1.6"
 
 const fw_image_info_t g_fw_image_info = {
     FW_IMAGE_MAGIC, FW_BOARD_ID, 0, 0, 0xFFFFFFFFUL, MIG_VERSION   /* Length and CRC: build.sh */
@@ -206,7 +206,8 @@ static void set_unit_dir(void)
     }
 }
 
-/* The production firmware takes the station ID from 0x1000 only as 4-6 digits there
+/* The production firmware takes the station ID from 0x1000 only as 4-8 digits there (v6.9.32;
+ * Bihar IDs are 8 digits and fill the old 8-byte field with no NUL)
  * (LPC1768/flash_nvram.c flash_nvram_init). Anything else and it would fall back to the ID in the
  * newest stored record, which a first conversion clears, so the unit would send as the build's
  * default station. MIG-1.3: the conversion carries on (the ID can be set from the keypad
@@ -215,8 +216,8 @@ static bool station_id_valid(void)
 {
     const char *p = (const char *)0x1000;
     int n = 0;
-    while (n < 7 && p[n] >= '0' && p[n] <= '9') n++;
-    return n >= 4 && n <= 6;
+    while (n < 8 && p[n] >= '0' && p[n] <= '9') n++;
+    return n >= 4;
 }
 
 static const char *unit_path(const char *name)
@@ -396,9 +397,9 @@ int main(void)
     rep("\r\n");
     rep(old_bootloader_present() ? "Old bootloader at 0xB000: present\r\n" : "Old bootloader at 0xB000: not there (converted part-way)\r\n");
     rep("Station ID (kept as it is): ");
-    char stn[8];
-    memcpy(stn, (const void *)0x1000, 7);
-    stn[7] = '\0';
+    char stn[9];
+    memcpy(stn, (const void *)0x1000, 8);
+    stn[8] = '\0';
     rep(stn);
     rep("\r\n");
 
@@ -444,7 +445,7 @@ int main(void)
     if (station_id_valid()) {
         rep("Station ID: valid, the new firmware keeps it\r\n");
     } else {
-        rep("Station ID: none found (not 4-6 digits at 0x1000): the new firmware starts with its default ID. Set it from the keypad afterwards\r\n");
+        rep("Station ID: none found (not 4-8 digits at 0x1000): the new firmware starts with its default ID. Set it from the keypad afterwards\r\n");
         lcd_show("NO OLD STN ID", "DEFAULT ID USED");
         hal_delay_ms(4000);
     }

@@ -20,10 +20,34 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.31"
+#define FIRMWARE_VERSION "v6.9.37"
 
-/* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. Set to 0 before deploying. */
+/* THE production switch. 1 = field build:
+ *   - MENU > KEY TEST hidden (and TEST SEND can't be switched on)
+ *   - debug log on the card off, unless the card holds DEBUGLOG.ON (see SD_DEBUG_LOG_DEFAULT)
+ *   - no NXP driver parameter checks: build.sh reads this line and leaves out -DDEBUG
+ *     (with it, a bad driver parameter stops the unit in check_failed() until the watchdog)
+ * 0 = bench build: KEY TEST in the menu, debug log always on, driver parameter checks on.
+ * Keep the "#define PRODUCTION_BUILD" line as it is: build.sh greps it. */
+#define PRODUCTION_BUILD    1
+
+/* TESTING: debug log on by default in a production build, on every unit and card, until testing
+ * is signed off (user, 2026-11-12). Set to 0 for the production release: the log then needs
+ * DEBUGLOG.ON on the card. build.sh greps this line too and says which way it is. */
+#define TESTING_DEBUG_LOG   1
+
+/* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. */
 #define ENABLE_TEST_SEND    0
+#if PRODUCTION_BUILD && ENABLE_TEST_SEND
+#error "TEST SEND is a bench tool: not in a production build"
+#endif
+/* MENU > KEY TEST (shows each key's code). Bench builds with TEST_FAULTS need it: the fault
+ * tests run from that screen. */
+#if !PRODUCTION_BUILD || defined(TEST_FAULTS)
+#define ENABLE_KEY_TEST     1
+#else
+#define ENABLE_KEY_TEST     0
+#endif
 #if (UNIT_CFG == KSNDMC_TRG)
 #define TEST_STATION_ID     "1001"
 #elif (UNIT_CFG == BIHAR_TRG)
@@ -32,6 +56,14 @@
 #define TEST_STATION_ID     "1002"
 #endif
 #define STATION_ID_DEFAULT  "001061"
+/* Station ID length on the server, the LCD and in file names: Bihar uses 8 digits, KSNDMC 6.
+ * Shorter stored IDs are zero-padded to this; flash holds up to STATION_ID_MAX digits. */
+#if (UNIT_CFG == BIHAR_TRG)
+#define STATION_ID_DIGITS   8
+#else
+#define STATION_ID_DIGITS   6
+#endif
+#define STATION_ID_MAX      8
 
 /* Status SMS Destination & Network Identifiers */
 #if (UNIT_CFG == BIHAR_TRG)
@@ -43,8 +75,12 @@
 #define STATUS_SMS_NETWORK_NAME   "KSNDMC"
 #endif
 
-/* Debug Dump Engine Settings */
-#define SDC_DEBUG_DUMP_DEFAULT  1       /* 1 = verbose debug dump enabled by default */
+/* Debug log on the card (LOG/YYMMDD.TXT, HTTPLOG.TXT): about 1 MB a day of card writes.
+ * Production: off unless the card holds DEBUGLOG.ON at its root (checked at every boot, so every slot):
+ * a unit in the field can be switched on and off with the card alone. Errors are kept either way
+ * (flash error log, copied to ERRORS.TXT), and SLOTS.CSV, DATA/, UPDATE.TXT are always written. */
+#define SD_DEBUG_LOG_DEFAULT    (!PRODUCTION_BUILD || TESTING_DEBUG_LOG)
+#define DEBUG_LOG_ON_FILENAME   "DEBUGLOG.ON"
 #define DEBUG_LOG_FILENAME      "DEBUG.TXT"
 #define HTTP_LOG_FILENAME       "HTTPLOG.TXT"
 #define SLOT_LOG_FILENAME       "SLOTS.CSV"

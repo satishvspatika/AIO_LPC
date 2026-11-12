@@ -222,9 +222,9 @@ static bool clean_settings(int type, const char *unit_dir, m2_note_fn note)
     memset(page, 0xFF, sizeof(page));
     const char *old = (const char *)0x1000;
     int n = 0;
-    while (n < 7 && old[n] >= '0' && old[n] <= '9') n++;
-    if (n >= 4 && n <= 6) {
-        memset(page, 0, 8);
+    while (n < 8 && old[n] >= '0' && old[n] <= '9') n++;
+    if (n >= 4) {   /* 4-8 digits, as production v6.9.32 reads it (Bihar: 8) */
+        memset(page, 0, 12);
         memcpy(page, old, (size_t)n);
     }
     char *tag = (char *)page + (M2_TAG_ADDR - 0x1000UL);
@@ -242,7 +242,7 @@ static bool clean_settings(int type, const char *unit_dir, m2_note_fn note)
         note("settings sector does not read back");
         return false;
     }
-    note(n >= 4 && n <= 6 ? "settings sector: station ID only (old server login and settings cleared)"
+    note(n >= 4 ? "settings sector: station ID only (old server login and settings cleared)"
                           : "settings sector: cleared (no valid old ID: the new firmware uses its default)");
     return true;
 }

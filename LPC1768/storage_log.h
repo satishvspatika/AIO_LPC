@@ -19,7 +19,12 @@ void storage_log_power_off_mark(void);
 
 /* Verbose debug logger */
 void storage_log_debug(const char *tag, const char *msg);
+/* Debug log on or off (SD_DEBUG_LOG_DEFAULT or DEBUGLOG.ON): read once the card is mounted */
+void storage_debug_log_decide(void);
+bool storage_debug_log_on(void);
 void storage_log_http(const char *entry);
+/* Renames DATA/<old_day_file>.TXT to DATA/<day_file>.TXT if only the old one exists */
+void storage_archive_adopt(const char *day_file, const char *old_day_file);
 
 /* One CSV line per 15-minute slot in SLOTS.CSV, for auditing gaps */
 void storage_log_slot(const char *csv_line);

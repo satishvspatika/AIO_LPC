@@ -18,7 +18,10 @@
 
 static FATFS s_fatfs;
 static bool s_fs_mounted = false;
-static bool s_debug_dump_enabled = SDC_DEBUG_DUMP_DEFAULT;
+/* Until the card is mounted the switch isn't known: lines are kept in the ring meanwhile, and
+ * thrown away if the log turns out to be off */
+static volatile bool s_debug_dump_enabled = true;
+static volatile bool s_debug_decided = false;
 
 static char s_ring_buffer[RING_BUFFER_SIZE];
 static volatile uint16_t s_head = 0;
@@ -56,6 +59,10 @@ static FIL s_drain_file;
 static FIL s_http_file;
 static FIL s_archive_file;
 static FIL s_backlog_file;
+/* Firmware files (fw_file_*) keep this one open across many calls while an update reads them. It
+ * used s_backlog_file until v6.9.35: a slot touching the backlog meanwhile reopened that object
+ * under the reader, and the update stopped with SD READ ERROR (bench, 2026-11-12 14:54). */
+static FIL s_fw_file;
 
 void storage_log_init(void)
 {
@@ -75,6 +82,34 @@ void storage_log_mount(void)
     if (s_fs_mounted) {
         storage_backlog_init();
     }
+    storage_debug_log_decide();
+}
+
+/* SD_DEBUG_LOG_DEFAULT, or DEBUGLOG.ON on the card */
+void storage_debug_log_decide(void)
+{
+    bool on = SD_DEBUG_LOG_DEFAULT;
+    if (!on && s_fs_mounted) {
+        fs_lock();
+        if (f_open(&s_http_file, DEBUG_LOG_ON_FILENAME, FA_OPEN_EXISTING | FA_READ) == FR_OK) {
+            f_close(&s_http_file);
+            on = true;
+        }
+        fs_unlock();
+    }
+    taskENTER_CRITICAL();
+    s_debug_dump_enabled = on;
+    s_debug_decided = true;
+    if (!on) {
+        s_tail = s_head;        /* Boot lines kept so far are not wanted */
+        s_dropped_lines = 0;
+    }
+    taskEXIT_CRITICAL();
+}
+
+bool storage_debug_log_on(void)
+{
+    return s_debug_dump_enabled;
 }
 
 void storage_log_timer_step_10ms(void)
@@ -180,7 +215,7 @@ void storage_log_debug(const char *tag, const char *msg)
 
 void storage_log_http(const char *entry)
 {
-    if (!entry) return;
+    if (!entry || !s_debug_dump_enabled) return;
 
     fs_lock();
     /* Ensure volume is mounted */
@@ -302,6 +337,8 @@ bool storage_sd_is_ok(void)
  * shows whether this write itself survived. Fixed length, so no older text is left behind. */
 void storage_power_off_mark(void)
 {
+    /* Written with the debug log off too: then the card's last write would otherwise be a state
+     * file (LASTSLOT.DAT, FLASHSYN.DAT, LASTLOG.DAT) or SLOTS.CSV, which BIHAR's card could lose */
     char ts[36];
     char text[40];
     format_log_time(ts, sizeof(ts));
@@ -372,6 +409,7 @@ static void log_write_failed(FRESULT res, portTickType retry_ticks)
 void storage_log_drain_step(void)
 {
     if (s_head == s_tail) return; /* No data to flush */
+    if (!s_debug_decided || !s_debug_dump_enabled) return;  /* Not written before the switch is read */
     if (s_next_log_retry_tick != 0) {
         if ((long)(xTaskGetTickCount() - s_next_log_retry_tick) < 0) {
             return;
@@ -469,6 +507,9 @@ void storage_log_drain_step(void)
 /* Runs before power is cut, so it can't wait out the retry delay */
 void storage_log_flush(void)
 {
+    if (!s_debug_decided || !s_debug_dump_enabled) {
+        return;     /* Nothing will be written: don't wait for it */
+    }
     int failed_tries = 0;
     for (int i = 0; i < 16 && s_tail != s_head && failed_tries < 3; i++) {
         uint16_t before = s_tail;
@@ -486,6 +527,30 @@ static bool s_card_full;
 bool storage_card_full(void)
 {
     return s_card_full;
+}
+
+/* v6.9.32 lengthened Bihar day-file names (DATA/001923_<date> to DATA/00001923_<date>). A day
+ * file is one MET day, 08:45 to 08:30, named by the date it closes on: the first record after the
+ * update renames that day's file, so the day stays in one file. Nothing happens if the old name
+ * isn't there (the usual case) or the new one already is. */
+void storage_archive_adopt(const char *day_file, const char *old_day_file)
+{
+    if (!day_file || !old_day_file || strcmp(day_file, old_day_file) == 0) return;
+    char from[32], to[32];
+    snprintf(from, sizeof(from), "DATA/%s.TXT", old_day_file);
+    snprintf(to, sizeof(to), "DATA/%s.TXT", day_file);
+    fs_lock();
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    FRESULT r = f_rename(from, to);
+    fs_unlock();
+    if (r == FR_OK) {
+        char line[80];
+        snprintf(line, sizeof(line), "Day file %s renamed to %s (8-digit station ID)", from, to);
+        storage_log_debug("SD", line);
+    }
 }
 
 bool storage_archive_slot(const char *day_file, const char *record)
@@ -772,9 +837,9 @@ bool fw_file_open(const char *name, uint32_t *out_size)
         f_mount(0, &s_fatfs);
         s_fs_mounted = true;
     }
-    bool ok = (f_open(&s_backlog_file, name, FA_OPEN_EXISTING | FA_READ) == FR_OK);
+    bool ok = (f_open(&s_fw_file, name, FA_OPEN_EXISTING | FA_READ) == FR_OK);
     if (ok && out_size) {
-        *out_size = (uint32_t)s_backlog_file.fsize;
+        *out_size = (uint32_t)s_fw_file.fsize;
     }
     fs_unlock();
     return ok;
@@ -784,7 +849,7 @@ int fw_file_read(void *buf, uint32_t len)
 {
     UINT got = 0;
     fs_lock();
-    FRESULT r = f_read(&s_backlog_file, buf, len, &got);
+    FRESULT r = f_read(&s_fw_file, buf, len, &got);
     fs_unlock();
     return (r == FR_OK) ? (int)got : -1;
 }
@@ -792,7 +857,7 @@ int fw_file_read(void *buf, uint32_t len)
 void fw_file_close(void)
 {
     fs_lock();
-    f_close(&s_backlog_file);
+    f_close(&s_fw_file);
     fs_unlock();
 }
 

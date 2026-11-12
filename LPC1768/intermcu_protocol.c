@@ -14,6 +14,13 @@ static bool s_in_frame = false;
 
 static telemetry_data_t s_latest_telemetry = {0};
 
+/* Clock shown and used here: the LPC845's RTC, from its status frame once a second. A second is only
+ * added locally (intermcu_tick_second) in a second with no frame, else the two fought and the
+ * seconds went 00, 01, 00 (v6.9.34 bench). Right after a clock set, frames already on their way
+ * still carry the old time: the next two frames' times are skipped. */
+static volatile uint32_t s_frame_time_count = 0;
+static volatile uint8_t s_frame_time_skip = 0;
+
 /* The newest reply to a firmware update command */
 static char s_u_reply[40];
 static volatile bool s_u_reply_ready = false;
@@ -245,6 +252,12 @@ bool intermcu_parse_server_time(const char *http_response, char *out_ts14, size_
 #define RAIN_CLOSE_SLOT 34  /* Slot of the day for 08:30 */
 
 static volatile int s_845_total_restored = -1; /* 0: LPC845 restarted and wants its rain total back */
+static volatile int s_845_rtc_state = -1;      /* 0 RTC (or a CTRL before v1.11), 1 software clock (RTC silent), 2 (RTC stuck) */
+
+int intermcu_845_rtc_state(void)
+{
+    return s_845_rtc_state;
+}
 static volatile int s_845_system = -1; /* -1 until a frame from current LPC845 firmware */
 
 bool intermcu_845_wants_rain_total(void)
@@ -255,6 +268,21 @@ bool intermcu_845_wants_rain_total(void)
 int intermcu_get_845_system(void)
 {
     return s_845_system;
+}
+
+bool intermcu_ts14_believable(const char *ts)
+{
+    static const int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (!ts14_valid(ts)) {
+        return false;
+    }
+    int yr = digits2(ts) * 100 + digits2(ts + 2);
+    int mo = digits2(ts + 4), da = digits2(ts + 6);
+    if (yr < 2024 || yr > 2079 || mo < 1 || mo > 12) {
+        return false;
+    }
+    int mdays = (mo == 2 && (yr % 4) == 0) ? 29 : days_in_month[mo];
+    return da >= 1 && da <= mdays && digits2(ts + 8) <= 23 && digits2(ts + 10) <= 59 && digits2(ts + 12) <= 59;
 }
 
 bool intermcu_rain_close_date(const char *timestamp, char *date_out, size_t size)
@@ -511,8 +539,13 @@ static void parse_d_packet(const char *frame)
             int p_mo = (present_time[4]-'0')*10 + (present_time[5]-'0');
             int p_da = (present_time[6]-'0')*10 + (present_time[7]-'0');
             if (p_yr >= 2024 && p_mo >= 1 && p_mo <= 12 && p_da >= 1 && p_da <= 31) {
-                strncpy(s_latest_telemetry.present_time, present_time, 15);
-                s_latest_telemetry.present_time[15] = '\0';
+                if (s_frame_time_skip > 0) {
+                    s_frame_time_skip--;
+                } else {
+                    strncpy(s_latest_telemetry.present_time, present_time, 15);
+                    s_latest_telemetry.present_time[15] = '\0';
+                    s_frame_time_count++;
+                }
             }
         } else if (strlen(s_latest_telemetry.present_time) < 14) {
             strncpy(s_latest_telemetry.present_time, present_time, 15);
@@ -530,7 +563,12 @@ static void parse_d_packet(const char *frame)
             s_845_system = lpc845_system;
             s_845_total_restored = total_restored;
             s_845_wake = wake_reason;
-            s_845_reset_status = reset_status;
+            /* CTRL v1.11 puts its clock state in bits 8-9 (the frame can't gain a field: every
+             * LPC1768 firmware checks for exactly 27 commas). Earlier CTRLs send the reset bits only. */
+            s_845_reset_status = reset_status & 0xFF;
+            if (reset_status >= 0) {
+                s_845_rtc_state = (reset_status >> 8) & 0x03;
+            }
             s_latest_telemetry.rf_cum_mm = rain_day_tips * RF_BUCKET_RESOLUTION;
         }
 
@@ -654,10 +692,16 @@ void intermcu_update_time(const char *timestamp14)
     strncpy(s_latest_telemetry.present_time, timestamp14, 15);
     s_latest_telemetry.present_time[15] = '\0';
     s_latest_telemetry.is_valid = true;
+    s_frame_time_skip = 2;
 }
 
 void intermcu_tick_second(void)
 {
+    static uint32_t s_seen = 0;
+    if (s_frame_time_count != s_seen) {
+        s_seen = s_frame_time_count;    /* A frame brought the time this second */
+        return;
+    }
     if (!s_latest_telemetry.is_valid || strlen(s_latest_telemetry.present_time) < 14) return;
 
     int yr = 0, mo = 0, da = 0, hr = 0, mi = 0, se = 0;

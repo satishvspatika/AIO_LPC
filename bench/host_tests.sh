@@ -16,4 +16,7 @@ for pair in "${KSN_TRG_HEX:-}:0:KSNDMC_TRG" "${KSN_TWS_HEX:-}:2:KSNDMC_TWS"; do
         echo "SKIPPED $name update test: set ${name/KSNDMC_/KSN_}_HEX to its fw_*.hex"
     fi
 done
+cc $F -DFW_TARGET_LPC845 -I$R/LPC1768 -I$R/LPC1768/boot -o $O/cit $R/LPC1768/tests/ctrl_isp_test.c $R/LPC1768/ctrl_isp_core.c $R/LPC1768/fw_update.c $R/LPC1768/boot/boot_core.c $R/LPC1768/boot/fw_journal.c && $O/cit $R/LPC845/ctrl.hex $R/LPC845/LPC845_BOOT.bin $R/LPC845/LPC845_TWS.bin | tail -1
+python3 $R/bench/frame_compat_test.py $R | tail -1
+for t in 0 1 2; do cc $F -DUNIT_CFG=$t -I$R/LPC1768 -o $O/sid$t $R/LPC1768/tests/station_id_test.c $R/LPC1768/telemetry_formatter.c && $O/sid$t | tail -1; done
 cc $F -I$R/LPC1768 -o $O/npt $R/LPC1768/tests/net_policy_test.c $R/LPC1768/net_policy.c && $O/npt | tail -1

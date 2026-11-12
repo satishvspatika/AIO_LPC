@@ -48,6 +48,8 @@ int chr1,chr2, chr3;
 
 //////////////////////////////////////////////
 
+extern volatile uint32_t soft_clock_ticks;	//CTRL v1.11 software clock, defined with the RTC watch
+
 void SysTick_Handler(void)
 {
 	/* if TICKRATE_HZ is (1000)	i.e., 1000 ticks per second
@@ -99,6 +101,7 @@ void SysTick_Handler(void)
 		tc2_1s = TC2_MAX_1S;
 		read_pulse_counts_in_1sec();
 		timer2_ovf_uart = 1;
+		soft_clock_ticks++;			//CTRL v1.11: seconds for the software clock
 	}
 
 }
@@ -1136,6 +1139,53 @@ void read_th_val(void)
 static volatile uint8_t s_rtc_raw_sec = 0;	//last raw seconds register, halt bit included
 static volatile uint16_t s_rtc_last_ok_ticks = 0;	//100 ms ticks since the last good RTC read
 volatile uint32_t rtc_kicks = 0;			//times a stopped RTC was started again (read by probe)
+
+/* Software clock (CTRL v1.11). Bench 2026-11-12: an old CTRL board's RTC never ran (time frozen at
+ * every set), so no slot boundary ever came. When the RTC doesn't answer for 3 s, or its seconds
+ * stay still through two restarts, this chip keeps the time itself from its 1 s SysTick count and
+ * says so in its status frame (bits 8-9 of the reset-status field). Present_Date_Time is then set by
+ * $S as before and moved on here; the RTC is still read, kicked once a minute, and taken back (with
+ * this time written into it) once its seconds have moved 10 times running. The SysTick comes from
+ * the internal FRO (about +-1%): up to about 9 s per slot, which the LPC1768 corrects from the
+ * server whenever it is 90 s or more off. */
+#define RTC_OK				0
+#define RTC_FAULT_NO_ANSWER	1		//no good read for 3 s
+#define RTC_FAULT_STUCK		2		//answers, but its seconds don't move after two restarts
+#define RTC_BACK_SECS		10U		//seconds seen moving in a row before the RTC is trusted again
+#define RTC_FAULT_KICK_TICKS	600U	//in fault: restart attempts once a minute, not every 3 s
+volatile uint8_t rtc_state = RTC_OK;
+volatile uint32_t soft_clock_ticks = 0;	//SysTick seconds (written in the interrupt)
+volatile uint32_t soft_clock_secs = 0;	//seconds kept by the software clock (read by probe)
+volatile uint32_t rtc_faults = 0;		//times the software clock took over (read by probe)
+static uint32_t s_soft_ticks_used = 0;
+static uint8_t s_stuck_kicks = 0;		//restarts in a row that didn't get the seconds moving
+static uint8_t s_rtc_good_secs = 0;		//in fault: RTC second changes seen in a row
+
+/* The software clock's time lives only in RAM. Like the rain count (rain_keep), a copy with a check
+ * value carries it across a restart that keeps RAM: a CTRL update, the watchdog, a crash. Not
+ * across power loss or a brown-out (RAM is gone), nor a reset-pin restart (the ROM loader route or
+ * a probe: the copy could be minutes old). The fault state comes back with it, so the dead RTC's
+ * frozen time is never copied over it in the 3-6 s before the fault would be found again. The time
+ * comes back short by the restart itself (about 9 s for an update): the server corrects that. */
+#define CLOCK_KEEP_MAGIC 0x434C4B31UL		//'CLK1'
+typedef struct {
+	uint32_t magic;
+	xDateTime_def time;
+	uint8_t state;
+	uint32_t check;
+} clock_keep_t;
+__attribute__((section(".noinit"))) static clock_keep_t s_clock_keep;
+volatile uint32_t clock_keeps_restored = 0;	//restarts that took the software time back (read by probe)
+
+static uint32_t clock_keep_check(const clock_keep_t *k)
+{
+	const uint8_t *t = (const uint8_t *)&k->time;
+	uint32_t sum = k->magic ^ ((uint32_t)k->state * 0x9E3779B1UL);
+	for(uint32_t i = 0; i < sizeof(k->time); i++){
+		sum = (sum * 31U) + t[i];
+	}
+	return ~sum;
+}
 volatile uint32_t bad_clock_wakes = 0;		//safety-net wakes with an invalid clock (read by probe)
 
 /* Late slot wake (845-v1.7). The slot is still closed at the boundary (store_data), but an LPC1768
@@ -1289,6 +1339,67 @@ static void rtc_kick(void)
 	}
 }
 
+/* One second on, with the carries (Next_Date for the day, month and year) */
+static void clock_add_second(xDateTime_def *t)
+{
+	if(++t->sec < 60){
+		return;
+	}
+	t->sec = 0;
+	if(++t->minute < 60){
+		return;
+	}
+	t->minute = 0;
+	if(++t->hour < 24){
+		return;
+	}
+	t->hour = 0;
+	Next_Date(&t->date, &t->month, &t->year);
+	if(t->year > 99){
+		t->year = 0;
+		t->century++;
+	}
+}
+
+/* From the 100 ms block: while the RTC is out, the seconds counted by SysTick move the time on */
+static void soft_clock_100ms(void)
+{
+	uint32_t now = soft_clock_ticks;
+	uint32_t n = now - s_soft_ticks_used;
+	s_soft_ticks_used = now;
+	if(rtc_state == RTC_OK || Present_Date_Time.year < 24){
+		s_clock_keep.magic = 0;		//RTC in charge (it keeps the time over a restart), or nothing to keep
+		return;		//RTC in charge, or no time to keep yet (the safety-net wake gets one)
+	}
+	while(n-- > 0){
+		clock_add_second(&Present_Date_Time);
+		soft_clock_secs++;
+	}
+	clock_keep_t k;
+	k.magic = CLOCK_KEEP_MAGIC;
+	k.time = Present_Date_Time;
+	k.state = rtc_state;
+	k.check = clock_keep_check(&k);
+	s_clock_keep = k;
+}
+
+/* At start-up, after init_ext_rtc's first read. reset_bits: SYSRSTSTAT (POR 0x01, EXTRST 0x02,
+ * BOD 0x08 mean RAM can't be trusted for the time) */
+static void clock_keep_restore(uint32_t reset_bits)
+{
+	clock_keep_t k = s_clock_keep;
+	s_clock_keep.magic = 0;
+	if((reset_bits & 0x0BU) != 0 || k.magic != CLOCK_KEEP_MAGIC || k.check != clock_keep_check(&k) ||
+			k.time.year < 24 || k.time.year > 99 || k.time.month < 1 || k.time.month > 12 ||
+			k.time.date < 1 || k.time.date > 31 || k.time.hour > 23 || k.time.minute > 59 || k.time.sec > 59 ||
+			(k.state != RTC_FAULT_NO_ANSWER && k.state != RTC_FAULT_STUCK)){
+		return;
+	}
+	Present_Date_Time = k.time;
+	rtc_state = k.state;
+	clock_keeps_restored++;
+}
+
 static void rtc_watch_100ms(void)
 {
 	static uint8_t last_raw_sec = 0xFF;
@@ -1303,24 +1414,68 @@ static void rtc_watch_100ms(void)
 	if(s_rtc_last_ok_ticks < 0xFFFF){
 		s_rtc_last_ok_ticks++;		//cleared by every good read
 	}
+	static uint16_t same_ticks_long = 0;	//same_ticks stops at 255: the once-a-minute limit needs more
 	if(read_ok){
 		if(s_rtc_raw_sec != last_raw_sec){
+			if(last_raw_sec != 0xFF && !(s_rtc_raw_sec & 0x80)){
+				s_stuck_kicks = 0;			//moving: any earlier restart worked
+				if(rtc_state != RTC_OK && s_rtc_good_secs < 255){
+					s_rtc_good_secs++;
+				}
+			}
 			last_raw_sec = s_rtc_raw_sec;
 			same_ticks = 0;
+			same_ticks_long = 0;
 		}
-		else if(same_ticks < 255){
-			same_ticks++;
+		else{
+			if(same_ticks < 255){
+				same_ticks++;
+			}
+			if(same_ticks_long < 0xFFFF){
+				same_ticks_long++;
+			}
+			if(same_ticks >= RTC_STUCK_TICKS){
+				s_rtc_good_secs = 0;
+			}
 		}
-		if((s_rtc_raw_sec & 0x80) || (same_ticks >= RTC_STUCK_TICKS)){
+		bool want_kick = (s_rtc_raw_sec & 0x80) || (same_ticks >= RTC_STUCK_TICKS);
+		if(want_kick && (rtc_state == RTC_OK || same_ticks_long >= RTC_FAULT_KICK_TICKS)){
 			rtc_kick();
 			rtc_kicks++;
 			same_ticks = 0;
+			same_ticks_long = 0;
 			last_raw_sec = 0xFF;
+			if(s_stuck_kicks < 255){
+				s_stuck_kicks++;
+			}
+			if(rtc_state == RTC_OK && s_stuck_kicks >= 2){
+				rtc_state = RTC_FAULT_STUCK;
+				rtc_faults++;
+			}
+		}
+	}
+	else{
+		s_rtc_good_secs = 0;
+		if(rtc_state == RTC_OK && s_rtc_last_ok_ticks >= RTC_STUCK_TICKS){
+			rtc_state = RTC_FAULT_NO_ANSWER;
+			rtc_faults++;
 		}
 	}
 
-	//Safety-net wake: only while the clock is invalid and the LPC1768 is off
-	bool clock_bad = (Present_Date_Time.year < 24) || (s_rtc_last_ok_ticks >= RTC_NO_READ_TICKS);
+	//The RTC works again: it takes over, carrying on from the software clock's time
+	if(rtc_state != RTC_OK && s_rtc_good_secs >= RTC_BACK_SECS){
+		s_rtc_good_secs = 0;
+		s_stuck_kicks = 0;
+		if(Present_Date_Time.year >= 24){
+			Set_Date_Time = Present_Date_Time;
+			Set_Time();
+		}
+		rtc_state = RTC_OK;
+	}
+
+	//Safety-net wake: only while there is no valid time at all (the software clock keeps one, v1.11)
+	bool clock_bad = (Present_Date_Time.year < 24) ||
+			(rtc_state == RTC_OK && s_rtc_last_ok_ticks >= RTC_NO_READ_TICKS);
 	if(clock_bad && GPIO_PinRead(GPIO, LPC845_PORT, LPC1768_PWR_STDN)){
 		if(++bad_clock_ticks >= BAD_CLOCK_WAKE_TICKS){
 			bad_clock_ticks = 0;
@@ -1352,6 +1507,9 @@ void Get_Time()
 
 	if(!Get_Cur_Date_Time(&rtc_read_date)){
 		return;		//keep the last good time; I2C0 was reset for the next read
+	}
+	if(rtc_state != RTC_OK){
+		return;		//software clock in charge: the read only feeds rtc_watch_100ms (v1.11)
 	}
 
 
@@ -2238,6 +2396,7 @@ int main(void)
 	reset_status = SYSCON->SYSRSTSTAT;
 	SYSCON->SYSRSTSTAT = reset_status;	//writing the bits back clears them for the next restart
 	rain_keep_restore(reset_status);
+	clock_keep_restore(reset_status);	//v1.11: software clock time, if the RTC was out
 	pckt_recvd = 0;
 
 	GPIO_PortClear(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);
@@ -2361,6 +2520,7 @@ int main(void)
 			}
 			Get_Time();
 			rtc_watch_100ms();
+			soft_clock_100ms();
 			//Late slot wake. Anything else that powered the LPC1768 meanwhile (DSP key, safety wake)
 			//runs the slot itself, so the pending wake is dropped.
 			if(late_wake_pending){
@@ -2532,7 +2692,10 @@ int main(void)
 					(int)rain_day_tips,
 					LPC845_FW_TYPE,
 					wake_reason,
-					(int)reset_status,
+					//v1.11: the clock state rides in bits 8-9 of this field (0 RTC, 1 software clock
+					//as the RTC is silent, 2 as it is stuck). The frame must keep exactly 27 commas:
+					//every LPC1768 firmware drops a frame with any other count (frame_checksum_ok)
+					(int)((reset_status & 0xFFU) | ((uint32_t)rtc_state << 8)),
 					(int)rf_val,	//Tips so far in this slot, for the LCD
 					(int)rain_total_restored);
 

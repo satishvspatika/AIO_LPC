@@ -1,9 +1,11 @@
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h"
 #include "hal_power.h"
 #include "intermcu_protocol.h"
 #include "telemetry_formatter.h"
 #include "sim7600_driver.h"
+#include "ctrl_isp.h"
 #include "ui_display.h"
 #include "storage_log.h"
 #include "fw_app.h"
@@ -86,6 +88,7 @@ static void wait_for_clock(void)
 
 static void log_previous_crash(void)
 {
+    ctrl_isp_log_result();
     if ((s_reset_reason & 0x04) || LPC_RTC->GPREG0 == CRASH_MAGIC || LPC_RTC->GPREG0 == STUCK_MAGIC ||
         LPC_RTC->GPREG0 == STACK_CRASH_MAGIC) {
         wait_for_clock();
@@ -184,6 +187,9 @@ typedef enum {
 static xTaskHandle s_ui_task, s_modem_task, s_main_task, s_disk_task;
 static bool s_restart_loop = false; /* Restarted by a fault 3 times running */
 static volatile int32_t s_last_slot_id = -1;
+/* The main loop reads the clock and decides on a slot holding this; a time set by hand changes the
+ * clock and the last slot holding it. Neither then sees half of the other's change. */
+static xSemaphoreHandle s_sched_lock = NULL;
 static volatile bool s_slot_armed = false;
 static volatile bool s_waiting_for_clock = false;
 static uint32_t s_reset_reason = 0;
@@ -264,8 +270,8 @@ static bool write_record_to_sd(const char *record)
 {
     char ts[16];
     char close_date[12];
-    char station[8];
-    char day_file[24];
+    char station[STATION_ID_MAX + 1];
+    char day_file[32];
 
     if (strlen(record) < 19) {
         return false;
@@ -276,6 +282,16 @@ static bool write_record_to_sd(const char *record)
     }
     format_station_id(station, sizeof(station), flash_nvram_get_station_id());
     snprintf(day_file, sizeof(day_file), "%s_%s", station, close_date);
+#if (STATION_ID_DIGITS > 6)
+    /* Up to v6.9.31 the same day file was named with the ID in 6 digits (001923_, not 00001923_):
+     * on the update day, keep one file for the MET day */
+    size_t extra = (size_t)(STATION_ID_DIGITS - 6);
+    if (strncmp(station, "00000000", extra) == 0) {
+        char old_day_file[32];
+        snprintf(old_day_file, sizeof(old_day_file), "%s_%s", station + extra, close_date);
+        storage_archive_adopt(day_file, old_day_file);
+    }
+#endif
     return storage_archive_slot(day_file, record);
 }
 
@@ -713,6 +729,19 @@ static void step_back_days(int *yr, int *mo, int *da, int days)
     }
 }
 
+/* The newest record, as a source for this rain day's total: none if it is from before the rain
+ * total was last restarted by hand (SET DATE/TIME). A mark above the newest seq is from before an
+ * Erase Data that missed clearing it, and is ignored. */
+static const flash_log_page_t *newest_record_for_rain(void)
+{
+    const flash_log_page_t *rec = flash_log_newest_record();
+    uint32_t reset_seq = flash_nvram_get_rain_reset_seq();
+    if (rec && reset_seq != 0 && reset_seq <= flash_log_newest_seq() && rec->seq <= reset_seq) {
+        return NULL;
+    }
+    return rec;
+}
+
 static void save_last_slot(int32_t slot_id)
 {
     char line[16];
@@ -720,6 +749,48 @@ static void save_last_slot(int32_t slot_id)
     if (!storage_state_save(LAST_SLOT_FILENAME, line)) {
         storage_log_debug("ERROR", "Could not save last slot to SD card");
     }
+}
+
+/* MENU > SET DATE/TIME (v6.9.34). A time set by hand starts afresh: the LPC845's rain-day total
+ * restarts at 0, records made before no longer carry CUM_RF forward (never-dip rule, restore after
+ * an LPC845 restart, gap fill), and the scheduler waits for the next boundary of the new time, so
+ * the jump is neither run as a slot at once nor gap-filled. Called from the UI task while no slot is
+ * running or due. Returns the flash-log seq marked. */
+uint32_t clock_set_by_hand(const char *ts14)
+{
+    static telemetry_data_t t;          /* UI task stack is short: not on it */
+    int min = 0, sec = 0;
+    int32_t id = 0;
+    int32_t done = -1;
+
+    /* The scheduler's last slot from the new time itself. As when it arms: set on a boundary
+     * minute, that slot is due now. */
+    memset(&t, 0, sizeof(t));
+    strncpy(t.present_time, ts14, sizeof(t.present_time) - 1);
+    if (parse_slot_clock(&t, &min, &sec, &id)) {
+        done = ((min % 15) == 0) ? (id - 1) : id;
+    }
+
+    /* The clock copy and the last slot change together: the main task never pairs the new time with
+     * the old last slot or the other way round, which would run a slot at once */
+    xSemaphoreTake(s_sched_lock, portMAX_DELAY);
+    hal_power_sync_rtc(ts14);           /* $S, then $R: the LPC845 runs them in order */
+    intermcu_update_time(ts14);
+    if (done >= 0) {
+        s_last_slot_id = done;
+        s_slot_armed = true;
+    }
+    xSemaphoreGive(s_sched_lock);
+    intermcu_reset_cumulative_rain();
+
+    uint32_t seq = flash_log_newest_seq();
+    if (seq != 0 && !flash_nvram_set_rain_reset_seq(seq)) {
+        storage_log_debug("ERROR", "Rain total restart could not be saved to flash");
+    }
+    if (done >= 0) {
+        save_last_slot(done);
+    }
+    return seq;
 }
 
 static int32_t load_last_slot(void)
@@ -856,7 +927,7 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
     char current_close[12] = "";
     float known_cum_mm = 0.0f;
     float known_bat = 0.0f;
-    const flash_log_page_t *newest = flash_log_newest_record();
+    const flash_log_page_t *newest = newest_record_for_rain();
     unsigned long known_tips = 0;
     char known_ts[16];
 #if (UNIT_CFG == KSNDMC_TWS)
@@ -1010,7 +1081,7 @@ static void rain_total_restore_step(const telemetry_data_t *telem)
 
     unsigned long tips = 0;
 #if (UNIT_CFG != KSNDMC_TWS)
-    const flash_log_page_t *rec = flash_log_newest_record();
+    const flash_log_page_t *rec = newest_record_for_rain();
     char ts[16], stored_close[12], current_close[12];
     if (rec && parse_record_total(rec->record, ts, sizeof(ts), &tips) &&
         intermcu_rain_close_date(ts, stored_close, sizeof(stored_close)) &&
@@ -1118,7 +1189,7 @@ static void __attribute__((noinline)) keep_cum_from_dipping(telemetry_data_t *te
 {
     unsigned long tips = 0;
     char ts[16], stored_close[12], current_close[12];
-    const flash_log_page_t *rec = flash_log_newest_record();
+    const flash_log_page_t *rec = newest_record_for_rain();
     if (!rec || !parse_record_total(rec->record, ts, sizeof(ts), &tips) ||
         !intermcu_rain_close_date(ts, stored_close, sizeof(stored_close)) ||
         !intermcu_rain_close_date(telem->present_time, current_close, sizeof(current_close)) ||
@@ -1142,9 +1213,24 @@ static void __attribute__((noinline)) keep_cum_from_dipping(telemetry_data_t *te
 #endif
 
 /* Runs one slot from start to finish. The UI cannot power down while this is running. */
+/* Once a boot, in a slot: the CTRL's clock chip has failed and the CTRL keeps the time itself
+ * (CTRL v1.11). Same text each time, so the error log counts repeats instead of filling up. */
+static void note_ctrl_clock(void)
+{
+    static bool s_noted = false;
+    int st = intermcu_845_rtc_state();
+    if (s_noted || st <= 0) {
+        return;
+    }
+    s_noted = true;
+    storage_log_debug("ERROR", st == 1 ? "CTRL clock chip (RTC) not answering: CTRL keeps the time itself, about 1% accurate. Repair the RTC"
+                                       : "CTRL clock chip (RTC) not running: CTRL keeps the time itself, about 1% accurate. Repair the RTC");
+}
+
 static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
 {
     ui_set_slot_busy(true);
+    note_ctrl_clock();
 
     s_last_slot_id = slot_id;
     const portTickType slot_begin = xTaskGetTickCount();
@@ -1366,6 +1452,8 @@ static void vMain_Task(void *pvParameters)
 
         telemetry_data_t telem;
         memset(&telem, 0, sizeof(telem));
+        bool run_now = false, sleep_now = false;
+        xSemaphoreTake(s_sched_lock, portMAX_DELAY);    /* Released before a slot runs */
         intermcu_get_telemetry(&telem);
 
         int min = 0, sec = 0;
@@ -1394,7 +1482,7 @@ static void vMain_Task(void *pvParameters)
                     storage_log_debug("SLOT", "Clock moved backwards, scheduler re-aligned");
                     s_last_slot_id = slot_id;
                 } else if (slot_id > s_last_slot_id) {
-                    run_slot(&telem, min, sec, slot_id);
+                    run_now = true;
                 }
             } else if (ui_was_scheduled_boot() && !ui_is_display_active()) {
                 /* No valid clock: let the modem supervisor try to get network time */
@@ -1405,9 +1493,15 @@ static void vMain_Task(void *pvParameters)
                 if (clock_wait_is_over()) {
                     storage_log_debug("ERROR", "Clock still invalid: SLOT LOST, entering sleep");
                     storage_log_slot("NO_CLOCK,NO_CLOCK,LOST,INVALID_CLOCK,0,-113,0,0.00,SCHEDULED,0");
-                    ui_enter_sleep();
+                    sleep_now = true;
                 }
             }
+        }
+        xSemaphoreGive(s_sched_lock);
+        if (run_now) {
+            run_slot(&telem, min, sec, slot_id);
+        } else if (sleep_now) {
+            ui_enter_sleep();
         }
 
         vTaskDelay(1000 / portTICK_RATE_MS);
@@ -1452,6 +1546,9 @@ int main(void)
     ui_display_init();
     intermcu_protocol_init();
     storage_log_init();
+    s_sched_lock = xSemaphoreCreateMutex();
+    /* CTRL F/W asked for the CTRL bootloader through the ROM loader: does it, then restarts */
+    ctrl_isp_boot_check();
     sim7600_init();
 
     /* Create FreeRTOS Tasks */

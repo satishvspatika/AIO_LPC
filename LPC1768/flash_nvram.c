@@ -115,7 +115,7 @@ nvram_init_state_t flash_nvram_init_state(void)
 }
 
 /* The ID as every payload format carries it: KSNDMC_TRG stn_id=, BIHAR_TRG "StnNo":", KSNDMC_TWS stn_no= */
-static bool station_id_from_records(char out[8])
+static bool station_id_from_records(char out[STATION_ID_MAX + 1])
 {
     static const char *const keys[] = { "stn_id=", "\"StnNo\":\"", "stn_no=" };
     const flash_log_page_t *rec = flash_log_newest_record();
@@ -129,7 +129,7 @@ static bool station_id_from_records(char out[8])
         }
         at += strlen(keys[k]);
         int n = 0;
-        while (n < 6 && at[n] >= '0' && at[n] <= '9') {
+        while (n < STATION_ID_MAX && at[n] >= '0' && at[n] <= '9') {
             out[n] = at[n];
             n++;
         }
@@ -142,14 +142,15 @@ static bool station_id_from_records(char out[8])
 void flash_nvram_init(void)
 {
     const char *flash_str = (const char *)PARAM_SECTOR_ADDR;
-    /* Legacy / Factory layout: offset 0 contains station ID string (e.g. "001061") */
+    /* Legacy / Factory layout: offset 0 contains station ID string (e.g. "001061"), 4 to 8 digits
+     * (8 for Bihar; the old units' field is 8 bytes, no NUL when full) */
     if (flash_str[0] >= '0' && flash_str[0] <= '9') {
         int len = 0;
-        while (len < 6 && flash_str[len] >= '0' && flash_str[len] <= '9') {
+        while (len < STATION_ID_MAX && flash_str[len] >= '0' && flash_str[len] <= '9') {
             len++;
         }
         if (len >= 4) {
-            char temp_id[8] = "";
+            char temp_id[STATION_ID_MAX + 1] = "";
             strncpy(temp_id, flash_str, len);
             temp_id[len] = '\0';
 
@@ -161,7 +162,7 @@ void flash_nvram_init(void)
         /* Blank: a new unit, or power lost between erasing and rewriting this sector (it has one copy
          * and no spare sector for a second). The newest stored record still carries the station ID,
          * so a unit in service keeps its own ID instead of sending as the build default. */
-        char found[8];
+        char found[STATION_ID_MAX + 1];
         const char *id = STATION_ID_DEFAULT;
         if (station_id_from_records(found)) {
             id = found;
@@ -239,6 +240,30 @@ bool flash_nvram_set_profile(int profile)
     uint32_t tag = FW_PROFILE_TAG | ((uint32_t)profile & 0xFFUL);
     memcpy(sector_buf, (const void *)PARAM_SECTOR_ADDR, 256);
     memcpy(sector_buf + offsetof(station_nvram_params_t, profile_tag), &tag, sizeof(tag));
+    return iap_write_sector1(sector_buf, 256);
+}
+
+#define RAIN_RESET_TAG 0x52535452UL /* 'RTSR' */
+
+uint32_t flash_nvram_get_rain_reset_seq(void)
+{
+    const station_nvram_params_t *p = (const station_nvram_params_t *)PARAM_SECTOR_ADDR;
+    uint32_t tag, seq;
+    memcpy(&tag, &p->rain_reset_tag, sizeof(tag));
+    memcpy(&seq, &p->rain_reset_seq, sizeof(seq));
+    return (tag == RAIN_RESET_TAG) ? seq : 0;
+}
+
+bool flash_nvram_set_rain_reset_seq(uint32_t seq)
+{
+    if (flash_nvram_get_rain_reset_seq() == seq) {
+        return true;    /* Nothing to write: spares the sector */
+    }
+    static uint8_t sector_buf[256] __attribute__((aligned(4)));   /* Static: called from the UI task */
+    uint32_t tag = RAIN_RESET_TAG;
+    memcpy(sector_buf, (const void *)PARAM_SECTOR_ADDR, 256);
+    memcpy(sector_buf + offsetof(station_nvram_params_t, rain_reset_tag), &tag, sizeof(tag));
+    memcpy(sector_buf + offsetof(station_nvram_params_t, rain_reset_seq), &seq, sizeof(seq));
     return iap_write_sector1(sector_buf, 256);
 }
 
@@ -320,10 +345,10 @@ bool flash_nvram_set_station_id(const char *new_id)
     /* Read existing 256 bytes from Sector 1 to preserve other station parameters */
     memcpy(sector_buf, (const void *)PARAM_SECTOR_ADDR, 256);
 
-    /* Update station ID at offset 0 */
-    memset(sector_buf, 0, 8);
+    /* Update station ID at offset 0: up to 8 digits and a NUL, in bytes 0-11 (nothing else there) */
+    memset(sector_buf, 0, 12);
     size_t id_len = strlen(new_id);
-    if (id_len > 6) id_len = 6;
+    if (id_len > STATION_ID_MAX) id_len = STATION_ID_MAX;
     strncpy((char *)sector_buf, new_id, id_len);
     sector_buf[id_len] = '\0';
 
@@ -353,7 +378,7 @@ bool flash_nvram_read(station_nvram_params_t *out_params)
     out_params->system_type = (UNIT_CFG == KSNDMC_TWS) ? 1 : 0;
     out_params->unit_cfg = UNIT_CFG;
     out_params->rf_resolution = RF_BUCKET_RESOLUTION;
-    out_params->sd_debug_dump = SDC_DEBUG_DUMP_DEFAULT;
+    out_params->sd_debug_dump = SD_DEBUG_LOG_DEFAULT;
     return false;
 }
 

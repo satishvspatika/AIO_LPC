@@ -9,6 +9,7 @@
 #include "fw_update.h"
 #include "fw_ctrl.h"
 #include "fw_app.h"
+#include "ctrl_isp.h"
 #include "boot/fw_journal.h"
 #include "user_config.h"
 #include "lpc17xx_gpio.h"
@@ -160,6 +161,7 @@ static const screen_type_t s_screens[] = {
 typedef enum {
     UI_MODE_BROWSE = 0,
     UI_MODE_EDIT_STN_ID,
+    UI_MODE_EDIT_TIME,
     UI_MODE_CALIB,
     UI_MODE_ERASE_CONFIRM,
     UI_MODE_MENU,
@@ -175,7 +177,9 @@ typedef enum {
     MENU_GOTO_SCREEN = 0,
     MENU_KEY_TEST,
     MENU_SET_STATION,
+    MENU_SET_TIME,
     MENU_GPS_UPDATE,
+    MENU_SEND_GPS,
     MENU_TEST_SEND,
     MENU_FW_UPDATE
 } menu_action_t;
@@ -191,11 +195,15 @@ static const menu_item_t s_menu_items[] = {
     { "TEST SEND",       MENU_TEST_SEND,   SCR_STATION_ID },
     #endif
     { "SEND STATUS SMS", MENU_GOTO_SCREEN, SCR_SEND_STATUS },
+    { "SEND GPS SMS",    MENU_SEND_GPS,    SCR_LOCATION },
     { "GPS UPDATE",      MENU_GPS_UPDATE,  SCR_LOCATION },
+    #if ENABLE_KEY_TEST
     { "KEY TEST",        MENU_KEY_TEST,    SCR_STATION_ID },
+    #endif
     { "ERASE DATA",      MENU_GOTO_SCREEN, SCR_ERASE_DATA },
     { "FIRMWARE UPDATE", MENU_FW_UPDATE,   SCR_STATION_ID },
-    { "SET STATION ID",  MENU_SET_STATION, SCR_STATION_ID }
+    { "SET STATION ID",  MENU_SET_STATION, SCR_STATION_ID },
+    { "SET DATE/TIME",   MENU_SET_TIME,    SCR_DATETIME }
 };
 #define NUM_MENU_ITEMS (sizeof(s_menu_items) / sizeof(s_menu_items[0]))
 
@@ -224,15 +232,32 @@ static uint32_t s_inactivity_ticks = 0; /* 50ms ticks */
 static size_t s_current_screen_idx = 0;
 
 static ui_mode_t s_ui_mode = UI_MODE_BROWSE;
-static char s_edit_stn_id[8] = "000000";
+static char s_edit_stn_id[STATION_ID_MAX + 1] = "";
 static int s_edit_pos = 0;
-static int s_edit_first_pos = 0; /* 2 hides a leading "00": the stored ID stays 6 digits */
+static int s_edit_first_pos = 0; /* KSNDMC: 2 hides a leading "00", the stored ID stays 6 digits */
 
-/* ESP32 display rule: a 6-digit ID starting "00" shows as its last 4 digits */
+/* The ID padded to STATION_ID_DIGITS. Bihar shows all 8 digits; KSNDMC keeps the ESP32 rule,
+ * a 6-digit ID starting "00" shows as its last 4 digits */
 static const char *station_id_for_display(const char *id)
 {
-    return (strlen(id) == 6 && strncmp(id, "00", 2) == 0) ? (id + 2) : id;
+    static char padded[STATION_ID_MAX + 1];
+    format_station_id(padded, sizeof(padded), id);
+    if (STATION_ID_DIGITS == 6 && strncmp(padded, "00", 2) == 0) {
+        return padded + 2;
+    }
+    return padded;
 }
+/* MENU > SET DATE/TIME (v6.9.34): DDMMYYYYHHMM, a digit at a time like the station ID, shown as
+ * DD-MM-YYYY HH:MM. For sites with no network time (no SIM or coverage, a freshly converted unit).
+ * Setting it starts afresh (user, 2026-11-12): rain-day total from 0, see clock_set_by_hand().
+ * The server still corrects the clock on the next delivery if it is 90 s or more off. */
+static char s_edit_time[13] = "";
+static int s_time_pos = 0;
+static const uint8_t s_time_col[12] = { 0, 1, 3, 4, 6, 7, 8, 9, 11, 12, 14, 15 };
+
+/* A digit editor with the hardware cursor showing */
+static bool ui_cursor_mode(void);
+
 static size_t s_menu_pos = 0;
 static ui_mode_t s_mode_before_confirm = UI_MODE_BROWSE;
 static uint32_t s_mode_timeout_ticks = 0;
@@ -580,6 +605,15 @@ static void test_send_key(key_code_t key)
 /* LOCATION screen: EN searches now. Shares the SMS task slot, as both use the modem. */
 static volatile bool s_gps_running = false;
 static const char *volatile s_gps_status = NULL;
+static volatile bool s_gps_send_sms = false;            /* MENU > SEND GPS SMS: send after the search */
+static volatile portTickType s_gps_status_tick = 0;     /* When s_gps_status was set */
+#define GPS_STATUS_SHOW_TICKS (3000 / portTICK_RATE_MS)  /* With a position saved, LAT/LON come back after this */
+
+static void gps_status_set(const char *text)
+{
+    s_gps_status_tick = xTaskGetTickCount();
+    s_gps_status = text;
+}
 static char s_gps_today[12] = "";
 
 static void vGps_Task(void *pvParameters)
@@ -587,18 +621,27 @@ static void vGps_Task(void *pvParameters)
     (void)pvParameters;
 
     if (!sim7600_acquire(3000)) {
-        s_gps_status = "MODEM BUSY";
+        gps_status_set("MODEM BUSY");
     } else {
         sim7600_clear_cancel();
         if (!sim7600_power_on()) {
-            s_gps_status = "MODEM FAIL";
+            gps_status_set("MODEM FAIL");
         } else {
             switch (sim7600_gps_update(s_gps_today)) {
-            case GPS_NEW_POSITION:  s_gps_status = "POSITION SAVED"; break;
-            case GPS_MOVED:         s_gps_status = "MOVED: UPDATED"; break;
-            case GPS_SAME_POSITION: s_gps_status = "SAME POSITION"; break;
-            case GPS_NOT_AVAILABLE: s_gps_status = "GPS NOT AVAIL"; break;
-            default:                s_gps_status = "NO FIX: EN=RETRY"; break;
+            case GPS_NEW_POSITION:  gps_status_set("POSITION SAVED"); break;
+            case GPS_MOVED:         gps_status_set("MOVED: UPDATED"); break;
+            case GPS_SAME_POSITION: gps_status_set("SAME POSITION"); break;
+            case GPS_NOT_AVAILABLE: gps_status_set("GPS NOT AVAIL"); break;
+            default:                gps_status_set("NO FIX: EN=RETRY"); break;
+            }
+            if (s_gps_send_sms) {
+                /* As the ESP32's SEND GPS: a fresh fix if there is one, else the saved position */
+                static telemetry_data_t t;      /* GPS task stack is short */
+                memset(&t, 0, sizeof(t));
+                intermcu_get_telemetry(&t);
+                strncpy(s_status_sms_substep, "SENDING GPS SMS ", sizeof(s_status_sms_substep) - 1);
+                bool sent = sim7600_send_sms(STATUS_SMS_DEST_NUMBER, sim7600_build_gps_sms('F', t.present_time));
+                gps_status_set(sent ? "GPS SMS SENT" : "GPS SMS FAILED");
             }
         }
         sim7600_release();
@@ -609,17 +652,18 @@ static void vGps_Task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-static void gps_fetch_start(const telemetry_data_t *telemetry)
+static void gps_fetch_start(const telemetry_data_t *telemetry, bool send_sms)
 {
     if (s_gps_running) {
         return;
     }
+    s_gps_send_sms = send_sms;
     if (s_slot_busy || slot_scheduler_is_due()) {
-        s_gps_status = "SLOT DUE, WAIT";
+        gps_status_set("SLOT DUE, WAIT");
         return;
     }
     if (s_sms_task_handle != NULL) {
-        s_gps_status = "MODEM BUSY";
+        gps_status_set("MODEM BUSY");
         return;
     }
     const char *t = telemetry->present_time;
@@ -630,7 +674,7 @@ static void gps_fetch_start(const telemetry_data_t *telemetry)
     if (xTaskCreate(vGps_Task, (const signed char *)"GpsTask", 896, NULL, 1, &s_sms_task_handle) != pdPASS) {
         s_sms_task_handle = NULL;
         s_gps_running = false;
-        s_gps_status = "NO MEMORY";
+        gps_status_set("NO MEMORY");
         storage_log_debug("ERROR", "Not enough memory to start the GPS task");
     }
 }
@@ -639,8 +683,8 @@ static void gps_fetch_start(const telemetry_data_t *telemetry)
  * and pressed EN. Shares the SMS task slot, as nothing else should use the modem or card meanwhile. */
 #define FW_MIN_SECONDS_TO_SLOT 180
 
-typedef enum { FW_UI_MENU = 0, FW_UI_BUSY, FW_UI_CONFIRM_TYPE, FW_UI_CONFIRM_MAIN, FW_UI_CONFIRM_REVERT, FW_UI_CONFIRM_CTRL, FW_UI_MESSAGE } fw_ui_state_t;
-typedef enum { FW_OP_CHECK_MAIN = 0, FW_OP_CHECK_CTRL, FW_OP_CHECK_REVERT, FW_OP_CHECK_TYPE, FW_OP_INSTALL_MAIN, FW_OP_INSTALL_CTRL, FW_OP_DO_REVERT } fw_task_op_t;
+typedef enum { FW_UI_MENU = 0, FW_UI_BUSY, FW_UI_CONFIRM_TYPE, FW_UI_CONFIRM_MAIN, FW_UI_CONFIRM_REVERT, FW_UI_CONFIRM_CTRL, FW_UI_CONFIRM_ISP, FW_UI_MESSAGE } fw_ui_state_t;
+typedef enum { FW_OP_CHECK_MAIN = 0, FW_OP_CHECK_CTRL, FW_OP_CHECK_REVERT, FW_OP_CHECK_TYPE, FW_OP_INSTALL_MAIN, FW_OP_INSTALL_CTRL, FW_OP_DO_REVERT, FW_OP_CTRL_ISP } fw_task_op_t;
 
 static const char *const s_fw_menu[] = { "MAIN F/W", "CTRL F/W", "REVERT F/W", "CHANGE TYPE" };
 
@@ -760,8 +804,10 @@ static void vFwUpdate_Task(void *pvParameters)
             storage_log_debug("ERROR", fw_update_error_text(r));
             fw_show(FW_UI_MESSAGE, "UPDATE REFUSED", fw_update_error_text(r));
         } else if (!fw_ctrl_query(&state)) {
-            /* Firmware from before the bootloader: this needs MCU-Link */
-            fw_show(FW_UI_MESSAGE, "CTRL CANT UPDATE", "NO BOOTLOADER");
+            /* No CTRL bootloader (a replaced board, blank or old firmware): it goes on through the
+             * LPC845's ROM loader with JP1 + JP2 fitted, at the next boot (ctrl_isp.c) */
+            storage_log_debug("FW", "CTRL chip doesn't answer: offering the ROM loader route (JP1+JP2)");
+            fw_show(FW_UI_CONFIRM_ISP, "NO CTRL BOOTLDR", "FIT JP1+JP2, EN");
         } else if (state.state == FW_J_TRIAL_BOOT) {
             fw_show(FW_UI_MESSAGE, "CTRL ON TRIAL", "TRY AGAIN SOON");
         } else if (s_fw_info.crc32 == state.crc32) {
@@ -771,6 +817,14 @@ static void vFwUpdate_Task(void *pvParameters)
             snprintf(line, sizeof(line), "CTRL %.6s FOUND", s_fw_info.version);
             fw_show(FW_UI_CONFIRM_CTRL, line, "EN=YES  BACK=NO");
         }
+        break;
+    }
+    case FW_OP_CTRL_ISP: {
+        /* Done at the next boot, before the RTOS starts (ctrl_isp.c) */
+        char msg[80];
+        snprintf(msg, sizeof(msg), "CTRL bootloader + %s by the ROM loader: restarting to do it", s_fw_info.version);
+        ctrl_isp_request(s_fw_info.crc32);
+        fw_restart_for_install(msg);
         break;
     }
     case FW_OP_INSTALL_CTRL: {
@@ -927,6 +981,17 @@ static void fw_key(key_code_t key, const telemetry_data_t *telemetry)
             storage_log_debug("FW", msg);
         } else if (key == KEY_BACK) {
             fw_start_task(FW_OP_CHECK_TYPE, "SEARCHING...");
+        }
+        break;
+    case FW_UI_CONFIRM_ISP:
+        if (key == KEY_EN) {
+            if (!ctrl_isp_jumpers_fitted()) {
+                fw_show(FW_UI_CONFIRM_ISP, "JP1+JP2 NOT ON", "FIT BOTH, EN");
+            } else if (fw_safe_to_install(telemetry)) {
+                fw_start_task(FW_OP_CTRL_ISP, "RESTARTING...");
+            }
+        } else if (key == KEY_BACK) {
+            s_fw_ui = FW_UI_MENU;
         }
         break;
     case FW_UI_CONFIRM_MAIN:
@@ -1442,7 +1507,7 @@ void ui_enter_sleep(void)
     s_kbd_tail = 0;
 
     /* 3. Turn off cursor if in edit mode */
-    if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+    if (s_ui_mode == UI_MODE_EDIT_STN_ID || s_ui_mode == UI_MODE_EDIT_TIME) {
         lcd_command(0x0C);
     }
     s_ui_mode = UI_MODE_BROWSE;
@@ -1547,7 +1612,11 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
 
     if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
         snprintf(line1, sizeof(line1), "SET STATION ID  ");
-        snprintf(line2, sizeof(line2), "ID: %-6.6s      ", s_edit_stn_id + s_edit_first_pos);
+        snprintf(line2, sizeof(line2), "ID: %-12.12s", s_edit_stn_id + s_edit_first_pos);
+    } else if (s_ui_mode == UI_MODE_EDIT_TIME) {
+        snprintf(line1, sizeof(line1), "SET DATE/TIME   ");
+        snprintf(line2, sizeof(line2), "%.2s-%.2s-%.4s %.2s:%.2s", s_edit_time, s_edit_time + 2,
+                 s_edit_time + 4, s_edit_time + 8, s_edit_time + 10);
     } else if (s_ui_mode == UI_MODE_CALIB) {
         int tips = intermcu_get_calib_tips();
         fmt_fixed(num, sizeof(num), tips * RF_BUCKET_RESOLUTION, 4, 2);
@@ -1606,15 +1675,12 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 #else
                 const char *cfg = "KSNDMC - TWS";
                 #endif
+                /* Landing page: type on row 1, station ID on row 2, both centred. Both chips'
+                 * versions are on the next screen (SCR_FIRMWARE). */
                 snprintf(line1, sizeof(line1), "%*s%s", (int)(16 - strlen(cfg)) / 2, "", cfg);
-                /* The whole version always shows, at the right. "ID:" only if the ID leaves room. */
-                const char *id = station_id_for_display(flash_nvram_get_station_id());
-                int room = 16 - (int)strlen(FIRMWARE_VERSION);
-                if ((int)strlen(id) + 4 <= room) {
-                    snprintf(line2, sizeof(line2), "ID:%-*s%s", room - 3, id, FIRMWARE_VERSION);
-                } else {
-                    snprintf(line2, sizeof(line2), "%-*.*s%s", room, room - 1, id, FIRMWARE_VERSION);
-                }
+                char id_text[17];
+                snprintf(id_text, sizeof(id_text), "ID: %s", station_id_for_display(flash_nvram_get_station_id()));
+                snprintf(line2, sizeof(line2), "%*s%s", (int)(16 - strlen(id_text)) / 2, "", id_text);
                 break;
             }
 
@@ -1631,8 +1697,14 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 if (strlen(telemetry->present_time) >= 14 && strncmp(telemetry->present_time, "20", 2) == 0) {
                     snprintf(line1, sizeof(line1), "DATE: %.2s/%.2s/%.4s",
                         telemetry->present_time + 6, telemetry->present_time + 4, telemetry->present_time);
-                    snprintf(line2, sizeof(line2), "TIME: %.2s:%.2s:%.2s",
-                        telemetry->present_time + 8, telemetry->present_time + 10, telemetry->present_time + 12);
+                    if (intermcu_845_rtc_state() > 0) {
+                        /* CTRL v1.11 keeps the time itself: its clock chip (RTC) needs repair */
+                        snprintf(line2, sizeof(line2), "%.2s:%.2s:%.2s RTC BAD",
+                            telemetry->present_time + 8, telemetry->present_time + 10, telemetry->present_time + 12);
+                    } else {
+                        snprintf(line2, sizeof(line2), "TIME: %.2s:%.2s:%.2s",
+                            telemetry->present_time + 8, telemetry->present_time + 10, telemetry->present_time + 12);
+                    }
                 } else {
                     snprintf(line1, sizeof(line1), "DATE: NOT SYNCED");
                     snprintf(line2, sizeof(line2), "TIME: WAITING... ");
@@ -1709,11 +1781,12 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                     snprintf(line1, sizeof(line1), "LOCATION        ");
                     snprintf(line2, sizeof(line2), "%-16.16s", s_status_sms_substep);
                 } else if (flash_nvram_get_location(&lat, &lon)) {
-                    /* Five decimals is about 1 m. A result shows on line 2 until the next key. */
+                    /* Five decimals is about 1 m */
                     int32_t a = (lat < 0) ? -lat : lat;
                     int32_t o = (lon < 0) ? -lon : lon;
                     snprintf(line1, sizeof(line1), "LAT:%3ld.%05ld %c", (long)(a / 1000000), (long)((a % 1000000) / 10), (lat < 0) ? 'S' : 'N');
-                    if (s_gps_status) {
+                    /* A result shows for 3 s, then LON again (user, 2026-11-12) */
+                    if (s_gps_status && (xTaskGetTickCount() - s_gps_status_tick) < GPS_STATUS_SHOW_TICKS) {
                         snprintf(line2, sizeof(line2), "%-16.16s", s_gps_status);
                     } else {
                         snprintf(line2, sizeof(line2), "LON:%3ld.%05ld %c", (long)(o / 1000000), (long)((o % 1000000) / 10), (lon < 0) ? 'W' : 'E');
@@ -1814,7 +1887,14 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
     if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
         /* Line 2 format: "ID: 1922        " -> digits start at col 4 */
         lcd_set_cursor(1, 4 + s_edit_pos - s_edit_first_pos);
+    } else if (s_ui_mode == UI_MODE_EDIT_TIME) {
+        lcd_set_cursor(1, s_time_col[s_time_pos]);
     }
+}
+
+static bool ui_cursor_mode(void)
+{
+    return s_ui_mode == UI_MODE_EDIT_STN_ID || s_ui_mode == UI_MODE_EDIT_TIME;
 }
 
 /* Operator asked for power save: if a slot is running, power down once it has finished */
@@ -1891,7 +1971,7 @@ static void calib_finish(const telemetry_data_t *telemetry)
 /* Show the power save prompt, remembering the mode to return to if the operator declines */
 static void sleep_confirm_open(void)
 {
-    if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+    if (ui_cursor_mode()) {
         lcd_command(0x0C); /* Hide edit cursor while the prompt is showing */
     }
     s_mode_before_confirm = (s_ui_mode == UI_MODE_ERASE_CONFIRM) ? UI_MODE_BROWSE : s_ui_mode;
@@ -1903,7 +1983,7 @@ static void sleep_confirm_open(void)
 static void sleep_confirm_cancel(void)
 {
     s_ui_mode = s_mode_before_confirm;
-    if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+    if (ui_cursor_mode()) {
         lcd_command(0x0F); /* Restore edit cursor */
     }
     s_force_redraw = true;
@@ -1931,24 +2011,72 @@ static int __attribute__((noinline)) test_eat_stack(int depth)
 }
 #endif
 
+static void time_edit_open(const telemetry_data_t *telemetry)
+{
+    char ts[15] = "20260101000000";
+    if (telemetry && intermcu_ts14_believable(telemetry->present_time)) {
+        memcpy(ts, telemetry->present_time, 14);
+    }
+    /* YYYYMMDDHHMMSS -> DDMMYYYYHHMM */
+    memcpy(s_edit_time, ts + 6, 2);
+    memcpy(s_edit_time + 2, ts + 4, 2);
+    memcpy(s_edit_time + 4, ts, 4);
+    memcpy(s_edit_time + 8, ts + 8, 4);
+    s_edit_time[12] = '\0';
+    s_time_pos = 0;
+    s_ui_mode = UI_MODE_EDIT_TIME;
+    lcd_command(0x0F);
+}
+
+static void time_edit_message(const char *line2)
+{
+    lcd_command(0x0C);
+    lcd_command(0x80);
+    lcd_print("SET DATE/TIME   ");
+    lcd_command(0xC0);
+    lcd_print(line2);       /* 16 characters */
+    vTaskDelay(1500 / portTICK_RATE_MS);
+    s_force_redraw = true;
+}
+
+/* EN on the editor */
+static void time_edit_save(const telemetry_data_t *telemetry)
+{
+    static char ts[15], line[96], history[160];   /* UI task only */
+    snprintf(ts, sizeof(ts), "%.4s%.2s%.2s%.4s00", s_edit_time + 4, s_edit_time + 2, s_edit_time, s_edit_time + 8);
+
+    if (!intermcu_ts14_believable(ts)) {
+        time_edit_message("NOT A VALID DATE");
+        lcd_command(0x0F);
+        return;
+    }
+    /* A slot running now takes its name and rain day from the clock */
+    if (s_slot_busy || slot_scheduler_is_due()) {
+        time_edit_message("UNIT BUSY: LATER");
+        lcd_command(0x0F);
+        return;
+    }
+    bool old_ok = intermcu_ts14_believable(telemetry->present_time);
+    snprintf(line, sizeof(line), "Clock set by hand: %.14s -> %s, rain total from 0",
+             old_ok ? telemetry->present_time : "(no valid time)", ts);
+    uint32_t seq = clock_set_by_hand(ts);
+    storage_log_debug("RTC", line);
+    /* The unit's service history: kept with the debug log off too */
+    snprintf(history, sizeof(history), "Station %s: %s (after record #%lu)", flash_nvram_get_station_id(),
+             line, (unsigned long)seq);
+    storage_append_stamped(FW_HISTORY_FILENAME, history);
+
+    time_edit_message("TIME SET, RF 0  ");
+    s_ui_mode = UI_MODE_BROWSE;
+}
+
 static void stn_edit_open(void)
 {
     s_ui_mode = UI_MODE_EDIT_STN_ID;
-    const char *cur = flash_nvram_get_station_id();
-    memset(s_edit_stn_id, '0', 6);
-    s_edit_stn_id[6] = '\0';
-    if (cur) {
-        size_t len = strlen(cur);
-        if (len > 6) len = 6;
-        /* Right-aligned: a stored "1922" is 001922, not 192200 */
-        for (size_t i = 0; i < len; i++) {
-            if (cur[i] >= '0' && cur[i] <= '9') {
-                s_edit_stn_id[6 - len + i] = cur[i];
-            }
-        }
-    }
-    /* A longer real ID keeps all its digits editable */
-    s_edit_first_pos = (strncmp(s_edit_stn_id, "00", 2) == 0) ? 2 : 0;
+    /* Right-aligned and padded: a stored "1922" is 001922 (KSNDMC) or 00001922 (Bihar) */
+    format_station_id(s_edit_stn_id, sizeof(s_edit_stn_id), flash_nvram_get_station_id());
+    /* KSNDMC: a longer real ID keeps all its digits editable. Bihar: all 8 always */
+    s_edit_first_pos = (STATION_ID_DIGITS == 6 && strncmp(s_edit_stn_id, "00", 2) == 0) ? 2 : 0;
     s_edit_pos = s_edit_first_pos;
     lcd_command(0x0F); /* Turn ON blinking hardware cursor */
 }
@@ -1996,7 +2124,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             storage_log_debug("UI", "LCD rail was off while in use: restoring it");
             hal_power_lcd_on();
             lcd_init_hw();
-            if (s_ui_mode == UI_MODE_EDIT_STN_ID) {
+            if (ui_cursor_mode()) {
                 lcd_command(0x0F);
             }
         }
@@ -2267,9 +2395,9 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                     s_edit_stn_id[s_edit_pos] = '9';
                 }
             } else if (key == KEY_LEFT) {
-                s_edit_pos = (s_edit_pos > s_edit_first_pos) ? (s_edit_pos - 1) : 5;
+                s_edit_pos = (s_edit_pos > s_edit_first_pos) ? (s_edit_pos - 1) : (STATION_ID_DIGITS - 1);
             } else if (key == KEY_RIGHT) {
-                s_edit_pos = (s_edit_pos < 5) ? (s_edit_pos + 1) : s_edit_first_pos;
+                s_edit_pos = (s_edit_pos < STATION_ID_DIGITS - 1) ? (s_edit_pos + 1) : s_edit_first_pos;
             } else if (key == KEY_BACK) {
                 /* Leave without saving */
                 lcd_command(0x0C);
@@ -2297,6 +2425,26 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             return;
         }
 
+        /* --- Mode: Set Date/Time --- */
+        if (s_ui_mode == UI_MODE_EDIT_TIME) {
+            char *d = &s_edit_time[s_time_pos];
+            if (key == KEY_UP) {
+                *d = (*d >= '9' || *d < '0') ? '0' : (char)(*d + 1);
+            } else if (key == KEY_DOWN) {
+                *d = (*d <= '0' || *d > '9') ? '9' : (char)(*d - 1);
+            } else if (key == KEY_LEFT) {
+                s_time_pos = (s_time_pos > 0) ? (s_time_pos - 1) : 11;
+            } else if (key == KEY_RIGHT) {
+                s_time_pos = (s_time_pos < 11) ? (s_time_pos + 1) : 0;
+            } else if (key == KEY_BACK) {
+                lcd_command(0x0C);              /* Leave without setting */
+                s_ui_mode = UI_MODE_BROWSE;
+            } else if (key == KEY_EN) {
+                time_edit_save(telemetry);
+            }
+            return;
+        }
+
         /* --- Mode: MENU Shortcuts --- */
         if (s_ui_mode == UI_MODE_MENU) {
             if (key == KEY_DOWN || key == KEY_RIGHT) {
@@ -2313,13 +2461,21 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 } else if (item->action == MENU_SET_STATION) {
                     goto_screen(SCR_STATION_ID);
                     stn_edit_open();
+                } else if (item->action == MENU_SET_TIME) {
+                    goto_screen(SCR_DATETIME);
+                    time_edit_open(telemetry);
                 } else if (item->action == MENU_GPS_UPDATE) {
                     goto_screen(SCR_LOCATION);
-                    gps_fetch_start(telemetry);
+                    gps_fetch_start(telemetry, false);
+                } else if (item->action == MENU_SEND_GPS) {
+                    goto_screen(SCR_LOCATION);
+                    gps_fetch_start(telemetry, true);
+                #if ENABLE_KEY_TEST
                 } else if (item->action == MENU_KEY_TEST) {
                     s_key_test_last = KEY_NONE;
                     s_mode_timeout_ticks = KEY_TEST_TIMEOUT_TICKS;
                     s_ui_mode = UI_MODE_KEY_TEST;
+                #endif
                 } else if (item->action == MENU_FW_UPDATE) {
                     fw_open();
                 #if ENABLE_TEST_SEND

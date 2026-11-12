@@ -2544,6 +2544,57 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     return ok;
 }
 
+/* GPS SMS, as the ESP32's SEND GPS (gprs_health.ino get_lat_long_date_time):
+ *   <NETWORK>,<STATION_TYPE>,STAT_AD-<F|C>,<STATION_ID>,<YYYY-MM-DDTHH:MM>,SIM_1,<CSQ_DBM>,<LAT>,<LON>,0.0
+ * F = asked from the keypad, C = asked by SMS. The position is the saved one (the GPS job saves a new
+ * fix first); none saved yet sends 0.000000 as the ESP32 does. The modem must be on. */
+static void fmt_udeg(char *out, size_t size, int32_t udeg)
+{
+    uint32_t a = (udeg < 0) ? (uint32_t)(-(int64_t)udeg) : (uint32_t)udeg;
+    snprintf(out, size, "%s%lu.%06lu", (udeg < 0) ? "-" : "", (unsigned long)(a / 1000000UL), (unsigned long)(a % 1000000UL));
+}
+
+/* Builds the message only, and returns: callers send it with sim7600_send_sms() at their own
+ * level, so this frame isn't added on top of that deep path (the modem task's stack is short) */
+const char *sim7600_build_gps_sms(char kind, const char *present_time)
+{
+    /* Static: the modem task's stack is the shortest. Both callers hold the modem, so never at once. */
+    static char msg[160], lat_s[16], lon_s[16], time_iso[24], csq_cap[64];
+    int32_t lat = 0, lon = 0;
+    if (!flash_nvram_get_location(&lat, &lon)) {
+        lat = 0;
+        lon = 0;
+    }
+    fmt_udeg(lat_s, sizeof(lat_s), lat);
+    fmt_udeg(lon_s, sizeof(lon_s), lon);
+
+    const char *stn_id = flash_nvram_get_station_id();
+    while (stn_id[0] == '0' && stn_id[1] != '\0') {
+        stn_id++;   /* Without leading zeros, as the status SMS */
+    }
+    strcpy(time_iso, "2026-01-01T00:00");
+    if (present_time && strlen(present_time) >= 12) {
+        snprintf(time_iso, sizeof(time_iso), "%.4s-%.2s-%.2sT%.2s:%.2s",
+                 present_time, present_time + 4, present_time + 6, present_time + 8, present_time + 10);
+    }
+
+    clear_rx();
+    send_raw("AT+CSQ\r\n");
+    if (wait_response("+CSQ:", 2000, csq_cap, sizeof(csq_cap))) {
+        int csq = 99;
+        char *p = strstr(csq_cap, "+CSQ:");
+        if (p && sscanf(p + 5, "%d", &csq) == 1) {
+            s_modem_status.csq_dbm = (csq == 99) ? -113 : (-113 + 2 * csq);
+        }
+    }
+
+    snprintf(msg, sizeof(msg), "%s,%s,STAT_AD-%c,%s,%s,SIM_1,%04d,%s,%s,0.0\r\n",
+             STATUS_SMS_NETWORK_NAME, (UNIT_CFG == KSNDMC_TWS) ? "TWS" : "TRG", kind, stn_id, time_iso,
+             s_modem_status.csq_dbm, lat_s, lon_s);
+    storage_log_debug("SMS", msg);
+    return msg;
+}
+
 void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
 {
     /* Polled every few seconds with the LCD on: wait for the end of the list, and log only a message */
@@ -2590,6 +2641,11 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
 
             const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
             sim7600_send_sms(target, reply);
+        } else if (strstr(s_sms_capture, "#GPS") || strstr(s_sms_capture, "GET_GPS")) {
+            /* Old 1768 GET_GPS / ESP32 SEND GPS by SMS: the saved position, at once (a fresh fix can
+             * take minutes; MENU > SEND GPS SMS gets one first) */
+            const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
+            sim7600_send_sms(target, sim7600_build_gps_sms('C', telemetry->present_time));
         } else if (strstr(s_sms_capture, "#TIME=") || strstr(s_sms_capture, "#SET_TIME=")) {
             /* Operator manual time set: #TIME=YYYYMMDDHHMMSS */
             char *tp = strstr(s_sms_capture, "#TIME=");
@@ -2598,13 +2654,20 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
                 tp = strchr(tp, '=');
                 if (tp && strlen(tp + 1) >= 14) {
                     char ts[16];
+                    char reply[80];
                     strncpy(ts, tp + 1, 14);
                     ts[14] = '\0';
-                    hal_power_sync_rtc(ts);
-                    storage_log_debug("RTC", "DS1338 RTC manually updated via SMS");
-
-                    char reply[80];
-                    snprintf(reply, sizeof(reply), "AIO STN:%s\nRTC SET OK: %.14s", flash_nvram_get_station_id(), ts);
+                    if (intermcu_ts14_believable(ts)) {
+                        hal_power_sync_rtc(ts);
+                        intermcu_update_time(ts);
+                        snprintf(reply, sizeof(reply), "Clock set by SMS #TIME= to %s", ts);  /* Buffer reused: modem stack */
+                        storage_log_debug("RTC", reply);
+                        snprintf(reply, sizeof(reply), "AIO STN:%s\nRTC SET OK: %.14s", flash_nvram_get_station_id(), ts);
+                    } else {
+                        /* The LPC845 takes whatever it is sent: a mistyped SMS must not reach it */
+                        storage_log_debug("ERROR", "SMS #TIME= refused: not a valid YYYYMMDDHHMMSS");
+                        snprintf(reply, sizeof(reply), "AIO STN:%s\nRTC NOT SET: use #TIME=YYYYMMDDHHMMSS", flash_nvram_get_station_id());
+                    }
                     const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
                     sim7600_send_sms(target, reply);
                 }
