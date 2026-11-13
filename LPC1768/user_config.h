@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.46"
+#define FIRMWARE_VERSION "v6.9.54"
 
 /* THE production switch. 1 = field build:
  *   - MENU > KEY TEST hidden (and TEST SEND can't be switched on)
@@ -34,7 +34,7 @@
 /* TESTING: debug log on by default in a production build, on every unit and card, until testing
  * is signed off (user, 2026-11-12). Set to 0 for the production release: the log then needs
  * DEBUGLOG.ON on the card. build.sh greps this line too and says which way it is. */
-#define TESTING_DEBUG_LOG   1
+#define TESTING_DEBUG_LOG   0
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. */
 #define ENABLE_TEST_SEND    0
@@ -83,14 +83,22 @@
 
 /* SMS listening window (v6.9.44; v6.9.45 automatic radio mode first, as 4G-only gets no SMS on BSNL):
  * on listening slots the modem stays on until this long after it registered for SMS, checking every 5 s, so commands sent while it was off can arrive (the network delivers
- * them 10-30 s after registration). Other slots check once. About 20 s more modem time per
- * listening slot. Testing: every slot. Later (user, 2026-11-13): 3-4 slots only, set as hours
- * (hh:00 slots), e.g. SMS_LISTEN_ALL_SLOTS 0 with SMS_LISTEN_HOURS 6, 10, 14, 18 */
+ * them 10-30 s after registration). About 20 s more modem time per
+ * listening slot (no check at all on other slots). Listening slots are the hh:00 slots of SMS_LISTEN_HOURS (unit's local time):
+ * 11:00 and 17:00 only (user, 2026-11-13, v6.9.50). */
 #define SMS_LISTEN_SEC            25
+/* Each SMS taken keeps listening this much longer, to SMS_LISTEN_MAX_SEC in all (v6.9.47) */
+#define SMS_LISTEN_MORE_SEC       20
+#define SMS_LISTEN_MAX_SEC        90
+/* No window with less of the slot's time left than this (the SIM is still read once). Setting up
+ * the window (fresh registration) can take about 90 s at worst (review, v6.9.52) */
+#define SMS_LISTEN_MIN_BUDGET_SEC 120
 /* A command sent longer ago than this is deleted unrun (old messages on field SIMs, v6.9.46) */
-#define SMS_MAX_AGE_MIN           (24 * 60)
-#define SMS_LISTEN_ALL_SLOTS      1
-#define SMS_LISTEN_HOURS          6, 10, 14, 18
+#define SMS_MAX_AGE_MIN           (48 * 60)   /* v6.9.50: 24 h, with 2 listening slots a day, could drop a command unrun */
+/* SET_TIME older than this is refused: it would set an old time (v6.9.51) */
+#define SMS_SET_TIME_MAX_AGE_MIN  15
+#define SMS_LISTEN_ALL_SLOTS      0
+#define SMS_LISTEN_HOURS          11, 17
 
 /* Debug log on the card (LOG/YYMMDD.TXT, HTTPLOG.TXT): about 1 MB a day of card writes.
  * Production: off unless the card holds DEBUGLOG.ON at its root (checked at every boot, so every slot):
@@ -147,6 +155,9 @@
  * speed 10% low and direction offset. */
 #define WS_CALIBRATION_FACTOR  0.5f    /* With 2 pulses per revolution: 0.25 m/s per pulse a second */
 #define WIND_TEETH_COUNT       2.0f
+/* Highest believable 15-min average (user, 2026-11-13). Above it the record says 0.0 and ERRORS.TXT
+ * keeps the value read: 001903 read 55.6 and 53.0 with a mains supply connected (pulse noise). */
+#define WS_AVG_MAX_MPS         30.0f
 #define WIND_DIR_ADC_MIN       0
 #define WIND_DIR_ADC_MAX       4095
 

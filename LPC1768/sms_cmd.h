@@ -23,7 +23,10 @@ typedef enum {
     SMS_CMD_SET_SERVER_2,
     SMS_CMD_SET_SERVER_MODE,
     SMS_CMD_ADD_NUM,
-    SMS_CMD_DEL_NUM
+    SMS_CMD_DEL_NUM,
+    SMS_CMD_STOP,           /* Stop all HTTP sends (junk values): records kept on the card */
+    SMS_CMD_RESUME,
+    SMS_CMD_ERASE_DATA      /* ERASE_DATA <station ID>: the ID guards against a message for another unit */
 } sms_cmd_t;
 
 /* Finds the command in a message body. arg gets the value (trimmed, may be empty). */

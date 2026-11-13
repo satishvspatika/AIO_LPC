@@ -30,6 +30,13 @@ int main(void)
     T(P("VARSHA SET_SERVER_MODE 2", "2") == SMS_CMD_SET_SERVER_MODE);
     T(P("VARSHA ADD_NUM 9741391102", "9741391102") == SMS_CMD_ADD_NUM);
     T(P("VARSHA GET_CONFIG", "") == SMS_CMD_GET_CONFIG);
+    T(P("VARSHA STOP", "") == SMS_CMD_STOP);
+    T(P("varsha resume", "") == SMS_CMD_RESUME);
+    T(P("VARSHA STOP_SENDING", "") == SMS_CMD_STOP);
+    T(P("VARSHA STOPX", NULL) == SMS_CMD_UNKNOWN);
+    T(P("VARSHA ERASE_DATA 1903", "1903") == SMS_CMD_ERASE_DATA);
+    T(sms_cmd_needs_office(SMS_CMD_ERASE_DATA));
+    T(sms_cmd_needs_office(SMS_CMD_STOP) && sms_cmd_needs_office(SMS_CMD_RESUME));
     T(P("VARSHA SEND_FTP_DAILY_DATA", NULL) == SMS_CMD_UNKNOWN);
     T(P("VARSHA", NULL) == SMS_CMD_UNKNOWN);
     /* Older LPC form */

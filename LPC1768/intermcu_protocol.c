@@ -2,6 +2,8 @@
 #include "user_config.h"
 #include "lpc17xx_uart.h"
 #include "hal_power.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -71,7 +73,9 @@ static float pulses_to_wind_speed(int pulses, int seconds)
         return 0.0f;
     }
     float speed = WS_CALIBRATION_FACTOR * (((float)pulses / (float)seconds) / WIND_TEETH_COUNT);
-    return speed > 60.0f ? 0.0f : speed; /* Beyond this is noise, as on the ESP32 */
+    /* Not limited here: the slot code checks the 15-min average against WS_AVG_MAX_MPS and logs the
+     * value it drops, and the LCD shows live readings as counted, so pulse noise can be seen. */
+    return speed;
 }
 
 static uint16_t adc_to_wind_dir(int adc)
@@ -585,6 +589,20 @@ static void parse_d_packet(const char *frame)
         s_latest_telemetry.wind_speed_avg = pulses_to_wind_speed(lws_raw, lws_sec);
         s_latest_telemetry.wind_dir_deg = adc_to_wind_dir(lwd_raw);
         s_latest_telemetry.wind_speed_inst = pulses_to_wind_speed(iws_raw, 1);
+        /* The LCD's wind: the last 3 s of pulses, so it follows the cups and shows 0.0 about 3 s
+         * after they stop. live_wind_speed is the average since the slot began (it falls slowly,
+         * 0.2 then 0.1 for minutes on 001903, 13 Nov) and stays for a slot after a CTRL restart. */
+        {
+            static int s_iws_ring[3];
+            static uint8_t s_iws_at, s_iws_n;
+            s_iws_ring[s_iws_at] = (iws_raw > 0) ? iws_raw : 0;
+            s_iws_at = (uint8_t)((s_iws_at + 1) % 3);
+            if (s_iws_n < 3) {
+                s_iws_n++;
+            }
+            int sum = s_iws_ring[0] + s_iws_ring[1] + s_iws_ring[2];
+            s_latest_telemetry.lcd_wind_speed = pulses_to_wind_speed(sum, s_iws_n);
+        }
         s_latest_telemetry.wind_valid_sec = (uint16_t)lws_sec;
 
         s_latest_telemetry.live_temp_c = raw_to_temp_c(ptemp_raw);
@@ -651,7 +669,12 @@ bool intermcu_take_u_reply(char *out, size_t size)
 bool intermcu_get_telemetry(telemetry_data_t *out_data)
 {
     if (!out_data || !s_latest_telemetry.is_valid) return false;
+    /* One frame's values, never half of two: the UART3 interrupt (masked here) and the clock tick
+     * write it. A torn time such as "...161000" at 16:19:59->16:20:00 moved the scheduler back a
+     * slot and ran one again (review, v6.9.51). */
+    taskENTER_CRITICAL();
     memcpy(out_data, &s_latest_telemetry, sizeof(telemetry_data_t));
+    taskEXIT_CRITICAL();
     return true;
 }
 
@@ -680,10 +703,12 @@ uint32_t intermcu_get_fat_time(void)
 void intermcu_update_time(const char *timestamp14)
 {
     if (!timestamp14 || strlen(timestamp14) < 14) return;
+    taskENTER_CRITICAL();
     strncpy(s_latest_telemetry.present_time, timestamp14, 15);
     s_latest_telemetry.present_time[15] = '\0';
     s_latest_telemetry.is_valid = true;
     s_frame_time_skip = 2;
+    taskEXIT_CRITICAL();
 }
 
 void intermcu_tick_second(void)
@@ -741,8 +766,11 @@ void intermcu_tick_second(void)
         }
     }
 
-    snprintf(s_latest_telemetry.present_time, sizeof(s_latest_telemetry.present_time),
-             "%04d%02d%02d%02d%02d%02d", yr, mo, da, hr, mi, se);
+    char next[sizeof(s_latest_telemetry.present_time)];
+    snprintf(next, sizeof(next), "%04d%02d%02d%02d%02d%02d", yr, mo, da, hr, mi, se);
+    taskENTER_CRITICAL();
+    memcpy(s_latest_telemetry.present_time, next, sizeof(next));
+    taskEXIT_CRITICAL();
 }
 
 bool intermcu_is_rails_active(void)

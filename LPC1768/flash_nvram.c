@@ -4,10 +4,10 @@
 #include "LPC17xx.h"
 #include <string.h>
 #include <stddef.h>
-#ifdef TEST_FAULTS
-#include "hal_power.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#ifdef TEST_FAULTS
+#include "hal_power.h"
 /* Bench test build only (KEY TEST, LEFT): cut power with the settings sector erased, not rewritten */
 volatile int g_test_cut_after_erase = 0;
 #endif
@@ -33,21 +33,32 @@ static uint32_t s_sector_src[128];
 
 static bool iap_write_sector1_pages(void);
 
+/* Writers run in the UI, modem and main tasks (review, v6.9.51). With the scheduler suspended from
+ * the copy of the other page to the end of the write, no task can copy the sector while it is
+ * erased (it would write the blank page back: station ID, office numbers, STOP lost), share
+ * s_sector_src, or read blank settings meanwhile. Interrupts still run; the waits are busy loops.
+ * Before the scheduler starts this only counts up and down. */
 /* Settings page (0x1000) */
 static bool iap_write_sector1(const void *src_buf, size_t len)
 {
     if (!src_buf || len != 256) return false;
+    vTaskSuspendAll();
     memcpy(s_sector_src, src_buf, 256);
     memcpy((uint8_t *)s_sector_src + 256, (const void *)REMOTE_PAGE_ADDR, 256);
-    return iap_write_sector1_pages();
+    bool ok = iap_write_sector1_pages();
+    xTaskResumeAll();
+    return ok;
 }
 
 /* Remote settings page (0x1100) */
 static bool iap_write_remote_page(const void *src_buf)
 {
+    vTaskSuspendAll();
     memcpy(s_sector_src, (const void *)PARAM_SECTOR_ADDR, 256);
     memcpy((uint8_t *)s_sector_src + 256, src_buf, 256);
-    return iap_write_sector1_pages();
+    bool ok = iap_write_sector1_pages();
+    xTaskResumeAll();
+    return ok;
 }
 
 static bool iap_write_sector1_pages(void)
@@ -138,7 +149,7 @@ nvram_init_state_t flash_nvram_init_state(void)
 static bool station_id_from_records(char out[STATION_ID_MAX + 1])
 {
     static const char *const keys[] = { "stn_id=", "\"StnNo\":\"", "stn_no=" };
-    const flash_log_page_t *rec = flash_log_newest_record();
+    const flash_log_page_t *rec = flash_log_newest_with_payload();   /* A stopped record has no payload */
     if (!rec) {
         return false;
     }

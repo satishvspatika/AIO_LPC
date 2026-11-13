@@ -51,11 +51,39 @@ int chr1,chr2, chr3;
 extern volatile uint32_t soft_clock_ticks;	//CTRL v1.11 software clock, defined with the RTC watch
 static volatile uint8_t s_time_unconfirmed;	//CTRL v1.12, defined with the RTC watch
 
+/* Wind pulses (CTRL v1.14). Up to v1.13 the SCT counted every rising edge on PIO0_19 in hardware,
+ * however short. On 001903 (13 Nov) with a mains supply connected and the cups still, it counted
+ * about 200,000 a slot (55-85 m/s) while the debounced rain count on the same pin saw 0: the
+ * "pulses" were spikes of well under a millisecond. Now the pin is sampled every 1 ms and a new level
+ * counts only once it has been seen WIND_DEBOUNCE_MS samples running; a pulse is a confirmed rise.
+ * The fastest real wind (30 m/s = 120 pulses/s, 2 per revolution) gives levels of about 4 ms, so
+ * real pulses are all counted; anything shorter than about 1 ms is not. */
+#define WIND_DEBOUNCE_MS	2
+static volatile uint32_t s_wind_pulses;
+static uint8_t s_wind_level, s_wind_seen;
+
+static inline void wind_sample_1ms(void)
+{
+	uint8_t now = (uint8_t)GPIO_PinRead(GPIO, LPC845_PORT, RF_PIN);
+	if(now == s_wind_level){
+		s_wind_seen = 0;
+	}
+	else if(++s_wind_seen >= WIND_DEBOUNCE_MS){
+		s_wind_level = now;
+		s_wind_seen = 0;
+		if(now){
+			s_wind_pulses++;
+		}
+	}
+}
+
 void SysTick_Handler(void)
 {
 	/* if TICKRATE_HZ is (1000)	i.e., 1000 ticks per second
 	 *   this handler will be activated every 1 ms
 	 *   in other words, the time base is 1 ms	 */
+
+	wind_sample_1ms();
 
 	if(!timer0_ovf_2ms_tx_en){
 		tc0_2ms--;
@@ -2189,11 +2217,11 @@ void read_pulse_counts_in_1sec(void){
 	present_ws_sec_cnt++;
 
 
-	// Read the L counter, halt it, reset it, restart it
-	inst_ws = SCT0->COUNT;      // Read
-	SCT0->CTRL |= (1<<Halt_L);      // Halt
-	SCT0->CTRL |= (1<<CLRCTR_L);    // Reset
-	SCT0->CTRL &= ~(1<<Halt_L);     // Restart
+	// v1.14: the debounced count (wind_sample_1ms), taken and cleared as one step
+	__disable_irq();
+	inst_ws = s_wind_pulses;
+	s_wind_pulses = 0;
+	__enable_irq();
 
 	//	printf("Number of pulses in the last second = %d \r\n", inst_ws);
 	//printf("Number of pulses in the last second1 = %d\n\n\r", pulse_count);

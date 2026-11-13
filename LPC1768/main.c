@@ -182,7 +182,8 @@ static void vUi_Task(void *pvParameters)
 typedef enum {
     SLOT_SENT = 0,
     SLOT_BACKLOG,
-    SLOT_LOST
+    SLOT_LOST,
+    SLOT_STOPPED    /* VARSHA STOP: not sent, not queued, kept on the card */
 } slot_result_t;
 
 static xTaskHandle s_ui_task, s_modem_task, s_main_task, s_disk_task;
@@ -195,6 +196,11 @@ static volatile bool s_slot_armed = false;
 static volatile bool s_waiting_for_clock = false;
 static uint32_t s_reset_reason = 0;
 static char s_slot_line[160]; /* Used by vMain_Task only */
+#if (UNIT_CFG == KSNDMC_TWS)
+static void limit_wind_speed(telemetry_data_t *telem);
+#endif
+static void sms_only_session(const telemetry_data_t *telem, int32_t slot_id);
+static bool lpc845_link_alive(void);
 
 /* Parses YYYYMMDDHHMMSS. Slot ID = days since year 0 * 96 + slot of the day. */
 static bool parse_slot_clock(const telemetry_data_t *t, int *out_min, int *out_sec, int32_t *out_id)
@@ -481,7 +487,7 @@ static void __attribute__((noinline)) gps_auto_step(const telemetry_data_t *tele
 /* An SMS sent while the modem was off is held by the network and delivered 10-30 s after the next
  * registration. The slot used to check about 4 s after registering and power off (001903,
  * 2026-11-13 12:30: four commands waiting, "No SMS waiting"). So, on listening slots, the modem stays
- * on until SMS_LISTEN_SEC after registration, checking every 5 s; other slots check once. */
+ * on until SMS_LISTEN_SEC after registration, checking every 5 s; other slots don't check (v6.9.50). */
 static int slot_of_day(int32_t slot_id)
 {
     return (int)(slot_id % 96);
@@ -506,13 +512,32 @@ static bool is_listening_slot(int slot)
 static void __attribute__((noinline)) sms_listen(const telemetry_data_t *telem, portTickType registered_at,
                                                  portTickType budget_end, int slot)
 {
-    if (is_listening_slot(slot)) {
-        (void)registered_at;
+    /* Other slots: no SMS check at all, so no extra modem time (user, 2026-11-13). In 4G-only mode
+     * BSNL delivers none anyway; anything waiting on the SIM is read at the next listening slot or
+     * with the LCD on. */
+    if (!is_listening_slot(slot)) {
+        return;
+    }
+    (void)registered_at;
+    /* The window only with SMS_LISTEN_MIN_BUDGET_SEC of the slot's time left: the fresh registration
+     * alone can take about 50 s. With less, the SIM is still read once below (a backlog that used
+     * the slot's time must not keep an office command waiting another 6-18 h). */
+    if ((long)(budget_end - xTaskGetTickCount()) > (long)(SMS_LISTEN_MIN_BUDGET_SEC * 1000 / portTICK_RATE_MS)) {
         /* Counted from SMS registration: in 4G-only mode (the slot's data) none is delivered at all */
         sim7600_prepare_sms_listen();
-        const portTickType until = xTaskGetTickCount() + (SMS_LISTEN_SEC * 1000 / portTICK_RATE_MS);
+        const portTickType start = xTaskGetTickCount();
+        const portTickType latest = start + (SMS_LISTEN_MAX_SEC * 1000 / portTICK_RATE_MS);
+        portTickType until = start + (SMS_LISTEN_SEC * 1000 / portTICK_RATE_MS);
         while ((long)(until - xTaskGetTickCount()) > 0 && (long)(budget_end - xTaskGetTickCount()) > 0) {
-            sim7600_check_incoming_sms(telem, false);
+            /* An SMS centre hands queued messages over one at a time, seconds apart: each one taken
+             * keeps the window open SMS_LISTEN_MORE_SEC more (001903, 13 Nov: of 4 queued Jio
+             * commands one came per window) */
+            if (sim7600_check_incoming_sms(telem, false) > 0) {
+                portTickType more = xTaskGetTickCount() + (SMS_LISTEN_MORE_SEC * 1000 / portTICK_RATE_MS);
+                if ((long)(more - until) > 0) {
+                    until = ((long)(more - latest) > 0) ? latest : more;
+                }
+            }
             hal_power_heartbeat();
             vTaskDelay(5000 / portTICK_RATE_MS);
         }
@@ -590,6 +615,83 @@ static bool post_backlog_record(const http_endpoint_t *endpoint, const char *pay
     return post_to(endpoint, payload, route);
 }
 
+/* ERASE DATA: the keypad's, and VARSHA ERASE_DATA <ID> by SMS (v6.9.48) */
+void data_erase_all(void)
+{
+    intermcu_reset_cumulative_rain();
+    storage_backlog_clear_all();
+    flash_log_erase_all();
+    storage_state_delete(LAST_LOGGED_FILENAME);
+    flash_nvram_note_last_logged("NO DATA YET");
+}
+
+/* By SMS the erase waits for the slot to finish and be recorded: erased part way through, the slot
+ * would rebuild what was just wiped. With no slot running it is done at once. */
+static volatile bool s_erase_requested = false;
+static volatile bool s_erasing = false;     /* From taking the request to the end of the erase */
+
+void data_erase_request(void)
+{
+    s_erase_requested = true;
+}
+
+static void do_requested_erase(void)
+{
+    /* Taken and cleared in one step: the UI task (before a sleep) and this task can both get here */
+    taskENTER_CRITICAL();
+    bool asked = s_erase_requested;
+    s_erase_requested = false;
+    s_erasing = asked;      /* The UI holds its power save until the erase is over (review, v6.9.53) */
+    taskEXIT_CRITICAL();
+    if (!asked) {
+        return;
+    }
+    /* The erase restarts CTRL's rain total too: with CTRL silent that would be lost, and its old
+     * total would come back on the next record without the records behind it (review, v6.9.50) */
+    if (!lpc845_link_alive()) {
+        storage_log_debug("ERROR", "VARSHA ERASE_DATA not done: CTRL not answering. Send it again");
+        s_erasing = false;
+        return;
+    }
+    storage_log_debug("ERROR", "All data erased by SMS (VARSHA ERASE_DATA)");
+    data_erase_all();
+    s_erasing = false;
+}
+
+/* The UI holds its power save while this is set, so an erase asked with the LCD on isn't dropped
+ * with the RAM flag; the main task does it (review, v6.9.50/52) */
+bool data_erase_pending(void)
+{
+    return s_erase_requested || s_erasing;
+}
+
+/* VARSHA STOP (v6.9.48, user: junk values from a unit): no HTTP sends at all, nothing queued for
+ * later, so nothing of that time is ever sent. The record is still written to the card to look at, and
+ * the modem still comes on and listens, so VARSHA RESUME and the GET commands keep working. */
+static bool sending_stopped(void)
+{
+    flash_nvram_get_remote(&s_remote);
+    return s_remote.sending_stopped != 0;
+}
+
+static void __attribute__((noinline)) keep_stopped_record(const telemetry_data_t *telem, int csq_dbm)
+{
+    /* Flash as well as the card (review, v6.9.50): the flash log is what names the last slot when
+     * there is no card, so without it a RESUME would gap-fill, and send, the whole stopped time.
+     * No payload is stored and no delivery noted, so nothing here is ever queued or sent. */
+    const flash_log_page_t *newest = flash_log_newest_record();
+    if (!newest || newest->slot_id != s_archive_slot_id) {
+        char record[FLASH_LOG_RECORD_SIZE];
+        format_sd_record(record, sizeof(record), telem, csq_dbm);
+        s_last_record_seq = flash_log_append(s_archive_slot_id, record, "");
+        if (s_last_record_seq == 0 && !write_record_to_sd(record)) {
+            storage_log_debug("ERROR", "RECORD NOT STORED: flash and SD card both failed");
+        }
+    }
+    sync_flash_records_to_sd();
+    storage_log_debug("SLOT", "Sending stopped by SMS: record kept, not sent or queued");
+}
+
 static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out_attempts, int *out_csq, const char **out_reason)
 {
     char payload[512] = "";
@@ -597,6 +699,15 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
 
     *out_attempts = 0;
     *out_csq = -113;
+
+    /* VARSHA STOP: the record is kept and nothing is sent. The modem comes on only on listening slots,
+     * for SMS (so RESUME gets through), not on every slot (review, v6.9.50) */
+    if (sending_stopped()) {
+        keep_stopped_record(telem, -113);
+        *out_reason = "STOPPED_BY_SMS";
+        sms_only_session(telem, s_archive_slot_id);
+        return SLOT_STOPPED;
+    }
 
     /* An SMS or the modem supervisor may hold the modem: wait instead of dropping the slot */
     bool acquired = false;
@@ -960,6 +1071,9 @@ uint32_t clock_set_by_hand(const char *ts14)
         s_slot_armed = true;
     }
     xSemaphoreGive(s_sched_lock);
+    /* The CTRL ignores a command that arrives while it is still decoding the previous one: $R right
+     * after $S was lost if it was busy reading a sensor (about 100 ms; review, v6.9.51) */
+    vTaskDelay(300 / portTICK_RATE_MS);
     intermcu_reset_cumulative_rain();
 
     uint32_t seq = flash_log_newest_seq();
@@ -1152,6 +1266,9 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
             storage_log_debug("GAP", s_slot_line);
             not_held++;
             continue;
+        }
+        if (state == 1) {
+            limit_wind_speed(&s_gap_record);
         }
 #endif
         if (state == 1) {
@@ -1356,13 +1473,47 @@ static bool __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data
         int da = (st[6]-'0')*10 + (st[7]-'0');
         valid = yr >= 2024 && mo >= 1 && mo <= 12 && da >= 1 && da <= 31;
     }
-    if (valid) {
+    if (valid && strncmp(st, own_name, 12) == 0) {
         return false;
     }
     char was[16];
     strncpy(was, st, sizeof(was) - 1);
     was[sizeof(was) - 1] = '\0';
     snprintf(telem->slot_time, sizeof(telem->slot_time), "%.14s", own_name);
+    if (valid) {
+        /* A good name, but another slot's (review, v6.9.51; 001903 13 Nov: 15:30 stored as a second
+         * 15:15). CTRL closes a slot only when it sees the boundary minute.
+         * - CTRL's record is for a LATER slot (a gap fill and hold ran past the next boundary): CTRL
+         *   has this slot's own sample stored, so it is asked for it ($G), as a gap fill does, and the
+         *   slot gets its own rain and CUM_RF (review, v6.9.52).
+         * - Otherwise (an EARLIER slot: a clock set forward over the boundary minute skipped the close,
+         *   or CTRL has no sample): the slot keeps this clock's name and no 15-min rain of its own.
+         *   Tips CTRL hasn't closed come in a later slot and CUM_RF stays CTRL's total, so the day's
+         *   rain is not lost or counted twice. TWS uses the live readings (the caller). */
+        if (strncmp(was, own_name, 12) > 0) {
+            intermcu_request_record(own_name);
+            memcpy(&s_gap_record, telem, sizeof(s_gap_record));
+            int state = 0;
+            for (int waited = 0; waited < GAP_REPLY_WAIT_MS && state == 0; waited += 20) {
+                vTaskDelay(20 / portTICK_RATE_MS);
+                state = intermcu_poll_record(&s_gap_record);
+            }
+            if (state == 1) {
+                memcpy(telem, &s_gap_record, sizeof(*telem));
+                snprintf(telem->slot_time, sizeof(telem->slot_time), "%.14s", own_name);
+                snprintf(s_slot_line, sizeof(s_slot_line), "CTRL's record is for later slot %.12s: this slot's own sample used for %.12s",
+                         was, telem->slot_time);
+                storage_log_debug("ERROR", s_slot_line);
+                return false;
+            }
+        }
+        telem->rf_15m_mm = 0.0f;
+        telem->rf_tips_15m = 0;
+        snprintf(s_slot_line, sizeof(s_slot_line), "CTRL's record is for slot %.12s, not %.12s: slot named from this clock, no 15-min rain of its own",
+                 was, telem->slot_time);
+        storage_log_debug("ERROR", s_slot_line);
+        return true;
+    }
     snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 clock was lost or not yet set (its slot %.14s): slot named %.14s from this clock",
              was[0] ? was : "none", telem->slot_time);
     storage_log_debug("ERROR", s_slot_line);
@@ -1396,6 +1547,22 @@ static void __attribute__((noinline)) note_values_out_of_range(const telemetry_d
     }
 #endif
 }
+
+#if (UNIT_CFG == KSNDMC_TWS)
+/* A 15-min average above WS_AVG_MAX_MPS is pulse noise (a mains supply on 001903, 2026-11-13), not
+ * wind: the record says 0.0 and ERRORS.TXT keeps what was read. */
+static void __attribute__((noinline)) limit_wind_speed(telemetry_data_t *telem)
+{
+    if (telem->wind_speed_avg > WS_AVG_MAX_MPS) {
+        char v[10];
+        fmt_fixed(v, sizeof(v), telem->wind_speed_avg, 5, 1);
+        snprintf(s_slot_line, sizeof(s_slot_line), "Wind speed %s m/s for %.12s is beyond any real 15-min average: sent as 0.0. Check the supply and wind cable",
+                 v, telem->slot_time);
+        storage_log_debug("ERROR", s_slot_line);
+        telem->wind_speed_avg = 0.0f;
+    }
+}
+#endif
 
 #if (UNIT_CFG != KSNDMC_TWS)
 /* CUM_RF never drops within a rain day, whatever went wrong elsewhere. Normally the LPC845's total
@@ -1442,6 +1609,35 @@ static void note_ctrl_clock(void)
                                        : "CTRL clock chip (RTC) not running: CTRL keeps the time itself, about 1% accurate. Repair the RTC");
 }
 
+/* A slot that sends nothing (CTRL silent, or TWS with no temperature/humidity) still listens for SMS
+ * on listening slots: a unit with a broken sensor is just the one the office must reach (VARSHA STOP).
+ * The modem is switched off with everything else when the slot ends. */
+static void __attribute__((noinline)) sms_only_session(const telemetry_data_t *telem, int32_t slot_id)
+{
+    if (!is_listening_slot(slot_of_day(slot_id))) {
+        return;
+    }
+    bool acquired = false;
+    for (int waited = 0; waited < 60 && !acquired; waited += 5) {
+        acquired = sim7600_acquire(5000);
+    }
+    if (!acquired) {
+        storage_log_debug("SMS", "Modem busy: no SMS listening this slot");
+        return;
+    }
+    sim7600_clear_cancel();
+    const portTickType budget_end = xTaskGetTickCount() + (SLOT_SEND_BUDGET_SEC * 1000 / portTICK_RATE_MS);
+    storage_log_debug("SMS", "No record to send this slot: modem on for SMS only");
+    hal_power_heartbeat();
+    if (sim7600_power_on()) {
+        sms_listen(telem, xTaskGetTickCount(), budget_end, slot_of_day(slot_id));
+        /* No server answer corrects the clock in a session that sends nothing (VARSHA STOP, CTRL
+         * silent): the network's time does. After the window, so the modem has had it by then. */
+        sim7600_correct_clock_from_network();
+    }
+    sim7600_release();
+}
+
 static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
 {
     ui_set_slot_busy(true);
@@ -1460,6 +1656,8 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     if (!lpc845_link_alive()) {
         snprintf(s_slot_line, sizeof(s_slot_line), "No status frames from LPC845: no record for slot %ld", (long)slot_id);
         storage_log_debug("ERROR", s_slot_line);
+        sms_only_session(telem, slot_id);
+        do_requested_erase();   /* An ERASE_DATA heard just now, before the power-off */
         ui_set_slot_busy(false);
         if (!ui_is_display_active() && !ui_is_operator_touched()) {
             ui_enter_sleep();
@@ -1467,9 +1665,12 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         return;
     }
 
-    queue_unfinished_slot(slot_id);
-    /* Queue anything missed in the wait below, so it can't delay this slot's record */
-    fill_missed_slots(telem, slot_id);
+    /* Queue an unfinished slot and anything missed in the wait below, so they can't delay this slot's
+     * record. Not while sending is stopped: those would go out after VARSHA RESUME. */
+    if (!sending_stopped()) {
+        queue_unfinished_slot(slot_id);
+        fill_missed_slots(telem, slot_id);
+    }
     s_archive_slot_id = slot_id;
 
     /* Slot boundary guard: servers reject a record sent under 62s after its slot boundary.
@@ -1497,8 +1698,9 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         telem->humidity_pct = telem->live_humidity_pct;
         telem->wind_speed_avg = telem->live_wind_speed;
         telem->wind_dir_deg = telem->live_wind_dir_deg;
-        storage_log_debug("SLOT", "CTRL has no record for this slot (it restarted): its live readings are used");
+        storage_log_debug("SLOT", "CTRL has no record for this slot: its live readings are used");
     }
+    limit_wind_speed(telem);
 #else
     (void)ctrl_had_no_record;
 #endif
@@ -1518,6 +1720,8 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
                  telem->present_time, telem->slot_time, boot_mode, (unsigned int)ui_get_backlog_count());
         storage_log_debug("SLOT_END", s_slot_line);
         storage_log_slot(s_slot_line);
+        sms_only_session(telem, slot_id);
+        do_requested_erase();   /* An ERASE_DATA heard just now, before the power-off */
         ui_set_slot_busy(false);
         if (!ui_is_display_active() && !ui_is_operator_touched()) {
             ui_enter_sleep();
@@ -1540,7 +1744,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     slot_result_t result = execute_slot_transmission(telem, &attempts, &csq, &reason);
     unsigned int duration_sec = (unsigned int)((xTaskGetTickCount() - start_tick) / configTICK_RATE_HZ);
 
-    static const char *const result_names[] = {"SENT", "BACKLOG", "LOST"};
+    static const char *const result_names[] = {"SENT", "BACKLOG", "LOST", "STOPPED"};
     snprintf(s_slot_line, sizeof(s_slot_line), "%.14s,%.14s,%s,%s,%d,%d,%u,%s,%s,%u",
              telem->present_time, telem->slot_time, result_names[result], reason, attempts, csq,
              duration_sec, s_bat, boot_mode, (unsigned int)ui_get_backlog_count());
@@ -1566,6 +1770,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     /* Only now: a restart mid-slot refills this one rather than losing it */
     save_last_slot(slot_id);
     LPC_RTC->GPREG4 = 0;    /* A slot finished: any run of fault restarts is over */
+    do_requested_erase();   /* Before the power-off below */
 
     ui_set_slot_busy(false);
 
@@ -1753,6 +1958,8 @@ static void vMain_Task(void *pvParameters)
         xSemaphoreGive(s_sched_lock);
         if (run_now) {
             run_slot(&telem, min, sec, slot_id);
+        } else if (s_erase_requested) {
+            do_requested_erase();   /* Asked by SMS with the LCD on: slots run only here, so none is running */
         } else if (gps_now) {
             clock_from_gps();
         } else if (sleep_now) {

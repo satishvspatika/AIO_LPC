@@ -390,7 +390,15 @@ bool flash_log_note_rejected(uint32_t record_seq, int strikes_allowed)
     return false;
 }
 
-/* How many of the newest records, up to limit, were made with no network, newest first */
+/* A record kept while sending was stopped (VARSHA STOP) has no payload: it was never meant to be sent */
+static bool has_payload(const flash_log_page_t *p)
+{
+    return p->payload[0] != '\0' && p->payload[0] != (char)0xFF;
+}
+
+/* How many of the newest records, up to limit, were made with no network, newest first. A stopped
+ * record (no payload, signal -113 as the modem stayed off) ends the run: it says nothing about the
+ * network, and after VARSHA RESUME the slot gets its full modem tries (review, v6.9.52). */
 int flash_log_no_network_run(int limit)
 {
     int run = 0;
@@ -403,7 +411,7 @@ int flash_log_no_network_run(int limit)
                 best = p;
             }
         }
-        if (!best || strstr(best->record, ",-113,") == NULL) {
+        if (!best || !has_payload(best) || strstr(best->record, ",-113,") == NULL) {
             break;
         }
         run++;
@@ -412,15 +420,14 @@ int flash_log_no_network_run(int limit)
     return run;
 }
 
+/* Records kept while stopped were never sent: not "last logged" (review, v6.9.52) */
 const flash_log_page_t *flash_log_last_delivered(void)
 {
-    if (s_undelivered_from == 0) {
-        return flash_log_newest_record();
-    }
+    const uint32_t below = (s_undelivered_from == 0) ? 0xFFFFFFFFUL : s_undelivered_from;
     const flash_log_page_t *best = NULL;
     for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
         const flash_log_page_t *p = page_at(i);
-        if (page_valid(p) && p->type == TYPE_RECORD && p->seq < s_undelivered_from &&
+        if (page_valid(p) && p->type == TYPE_RECORD && p->seq < below && has_payload(p) &&
             (!best || p->seq > best->seq)) {
             best = p;
         }
@@ -567,4 +574,17 @@ void flash_log_erase_all(void)
     s_undelivered_from = 0;
     s_newest_outage = 0;
     s_drained_seq = 0;
+}
+
+/* The newest record that has a payload (one made to be sent): a stopped record has none */
+const flash_log_page_t *flash_log_newest_with_payload(void)
+{
+    const flash_log_page_t *best = NULL;
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (page_valid(p) && p->type == TYPE_RECORD && has_payload(p) && (!best || p->seq > best->seq)) {
+            best = p;
+        }
+    }
+    return best;
 }

@@ -22,6 +22,7 @@ typedef struct {
     float wind_speed_avg;      /* 15-min rolling average wind speed (m/s) */
     uint16_t wind_dir_deg;     /* Wind direction (0-359 degrees) */
     float wind_speed_inst;     /* Instantaneous wind speed (m/s) */
+    float lcd_wind_speed;      /* LCD only: average of the last 3 s of pulses (v6.9.54) */
     uint16_t wind_valid_sec;   /* Valid sampling seconds in 15m (up to 900s) */
     char gprs_power_flag;      /* GPRS rail flag ('Y'/'N' or 'G'/'g') */
     char usb_power_flag;       /* 5V LCD rail flag ('U' = ON, 'u' = OFF) */

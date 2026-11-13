@@ -1,4 +1,6 @@
 #include "hal_power.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include "fw_app.h"
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
@@ -48,7 +50,12 @@ void hal_power_init(void)
 
 static void send_intermcu_cmd(const char *cmd)
 {
+    /* Sent whole: UI, modem and main tasks all send, and two frames interleaved byte by byte are
+     * both lost on the CTRL ($S, $f7, $G; review, v6.9.51). Only task switches are held off, not
+     * interrupts, so frames from the CTRL still come in. About 20 ms at 9600 baud. */
+    vTaskSuspendAll();
     UART_Send(LPC_UART3, (uint8_t *)cmd, strlen(cmd), BLOCKING);
+    xTaskResumeAll();
 }
 
 void hal_power_lcd_on(void)

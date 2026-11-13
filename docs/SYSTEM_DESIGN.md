@@ -332,7 +332,7 @@ is deleted unrun (until v6.9.43 nothing was ever read or deleted, so field SIMs 
 valid clock means unknown age, and it runs. UCS2 bodies (hex in text mode, sent by phones with a Kannada/Hindi
 keyboard) are decoded when plain ASCII. Once a power-on the slot logs `SIM message store: used of total` (ERROR
 when full: the network can't deliver then). M2M plans that block person-to-person SMS can't be fixed in firmware:
-the log then shows `registered for SMS` with `No SMS waiting`. Replies go to the sender and start
+the log then shows `registered for SMS` with `No SMS waiting`. v6.9.47: the window registers afresh (`AT+COPS=2`, `AT+COPS=0`) so other operators' SMS centres hear the unit is back, and each SMS taken keeps it open 20 s more (90 s at most): an SMS centre hands queued messages over one at a time. v6.9.48: a slot that sends nothing (CTRL silent, TWS without temperature/humidity) still listens (`sms_only_session()`), and no window starts once the slot's 300 s are used. Replies go to the sender and start
 `STN <id>`. A sender that isn't a phone number (operator adverts) gets nothing.
 
 | Command | Who | Does |
@@ -345,6 +345,26 @@ the log then shows `registered for SMS` with `No SMS waiting`. Replies go to the
 | `SET_SERVER_2 host=..;port=..;path=/..;key=..` / `OFF` | office | server 2 (key optional: replaces the payload key for server 2) |
 | `SET_SERVER_MODE 0/1/2` | office | 0 server 1 only, 1 server 2 only (live + backlog), 2 both (server 2 gets one copy of the live record, no backlog, its clock not used) |
 | `ADD_NUM` / `DEL_NUM <number>`, `GET_NUM` | office | office number list (up to 5, last 10 digits; the last one can't be removed) |
+| `STOP` / `RESUME` (v6.9.48) | office | STOP: no HTTP sends at all, nothing queued (junk values are never sent, even after RESUME); the record is still written to the card; the modem still listens for SMS; while stopped the clock is corrected from network time (`AT+CCLK?`). Kept in flash (`sending_stopped`); SLOTS.CSV `STOPPED`, GET_CONFIG and the LCD backlog screen show it. RESUME: sending from the next slot |
+| `ERASE_DATA <station ID>` (v6.9.48) | office | The keypad's ERASE DATA (`data_erase_all()`). The ID must be this unit's (leading zeros ignored). Done by the main task only: after the slot is recorded, or at once with the LCD on (the UI holds its power save until the erase is over, v6.9.54). Not done with CTRL silent (its rain total would be left behind) |
+
+**v6.9.49 to v6.9.54 (13 Nov, first test-team production cut with CTRL v1.14 and MIG-1.9):**
+- Listening slots are 11:00 and 17:00 only (`SMS_LISTEN_ALL_SLOTS 0`, `SMS_LISTEN_HOURS 11, 17`). Other slots do no
+  SMS check at all (no extra modem time). A listening slot always reads the SIM once; the window itself only with
+  `SMS_LISTEN_MIN_BUDGET_SEC` (120 s) of the slot left. Commands live 48 h (`SMS_MAX_AGE_MIN`); `SET_TIME` is refused
+  when more than 15 min old by the network's time (`AT+CCLK?`), not this unit's clock.
+- STOP: decided first in the slot; the record goes to flash (empty payload: never sent, skipped by the no-network
+  run, Last Logged and station ID recovery) and the card; the modem comes on only on listening slots.
+- Slot name: the main board's own name (`own_name`, from its clock at slot start) wins. CTRL closes a slot only when
+  it sees the boundary minute, so a clock set forward over it skips the close. CTRL's record for a later slot: the
+  slot's own sample is asked for (`$G`); for an earlier slot (or none): no 15-min rain of its own, CUM_RF kept.
+- Settings sector writes and CTRL commands run with the scheduler suspended (no interleaving between tasks);
+  telemetry copy and clock writes in critical sections; modem acquire is one test-and-set; sleep never powers the
+  modem off or restarts under a started slot (it defers); backlog entries are kept whole on a full card.
+- TWS wind: CTRL v1.14 counts a pulse only when PIO0_19 holds its new level for 2 samples 1 ms apart
+  (`wind_sample_1ms()` in SysTick), not every SCT edge: sub-ms spikes from a mains supply had read 53-85 m/s with the
+  cups still. The main board still sends a 15-min average above `WS_AVG_MAX_MPS` (30) as 0.0 and logs it. The LCD
+  shows the last 3 s (`lcd_wind_speed`), not the slot average.
 
 Office numbers start as `SMS_OFFICE_NUMBERS` (user_config.h, = the status SMS number) and live, with server 2 and the
 mode, in the settings sector's second page 0x1100 (`remote_settings_t`, CRC; blank or damaged = defaults). Every

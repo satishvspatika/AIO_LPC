@@ -1513,6 +1513,12 @@ void ui_enter_sleep(void)
         s_inactivity_ticks = 0;
         return;
     }
+    /* An ERASE_DATA heard with the LCD on is done by the main task within a second (slots run only
+     * there, so it can't overlap one): power stays on until then (review, v6.9.52) */
+    if (data_erase_pending()) {
+        s_sleep_deferred = true;
+        return;
+    }
 
     bool was_display_active = s_display_active;
     storage_log_debug("PWR", "Entering sleep: shutting down UI, modem, and sending $f7;");
@@ -1551,8 +1557,17 @@ void ui_enter_sleep(void)
     lcd_command(0x08); /* Display OFF */
     LPC_GPIO2->FIOCLR = MASK_LCD_BL; /* Backlight OFF */
 
-    /* 6. Power off SIM7600 cellular modem completely */
+    /* 6. Power off SIM7600 cellular modem completely. Not under a slot that started meanwhile (it
+     * holds the modem): the power save waits for it instead (review, v6.9.52) */
+    if (s_slot_busy || !sim7600_acquire(0)) {
+        storage_log_debug("PWR", s_slot_busy ? "Slot started during shutdown: power save waits for it"
+                                             : "Modem busy during shutdown: power save waits for it");
+        s_system_asleep = false;
+        s_sleep_deferred = true;
+        return;
+    }
     sim7600_power_off();
+    sim7600_release();
 
     /* 7. Flush any pending logs to SD card */
     storage_log_flush();
@@ -1569,7 +1584,16 @@ void ui_enter_sleep(void)
     vTaskDelay(100 / portTICK_RATE_MS);
 
     /* Shutting down took a few seconds: if a slot came due meanwhile, $f7 would cut power
-     * until the next slot. Restart instead, and the scheduler will send this one. */
+     * until the next slot. Restart instead, and the scheduler will send this one. A slot that has
+     * already started (it marks itself done at once, so it no longer shows as due) is left to run:
+     * a restart could cut its send after the server took it, and it would be sent twice. The power
+     * save waits for it (review, v6.9.52). */
+    if (s_slot_busy) {
+        storage_log_debug("PWR", "Slot started during shutdown: power save waits for it");
+        s_system_asleep = false;
+        s_sleep_deferred = true;
+        return;
+    }
     if (slot_scheduler_is_due()) {
         storage_log_debug("PWR", "Slot came due during shutdown: restarting instead of sleeping");
         storage_log_flush();
@@ -1762,7 +1786,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 break;
 
             case SCR_WIND:
-                fmt_fixed(num, sizeof(num), telemetry->live_wind_speed, 4, 1);
+                fmt_fixed(num, sizeof(num), telemetry->lcd_wind_speed, 4, 1);   /* Last 3 s (v6.9.54) */
                 snprintf(line1, sizeof(line1), "WS: %s m/s", num);
                 snprintf(line2, sizeof(line2), "WD: %03d DEG", telemetry->live_wind_dir_deg);
                 break;
@@ -1815,8 +1839,12 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
 
             case SCR_BACKLOG: {
                 uint32_t bl = ui_get_backlog_count();
+                static remote_settings_t r;     /* UI stack is short */
+                flash_nvram_get_remote(&r);
                 snprintf(line1, sizeof(line1), "BACKLOG RECORDS ");
-                if (bl == 0) {
+                if (r.sending_stopped) {
+                    snprintf(line2, sizeof(line2), "STOPPED PEND%4d", (int)bl);   /* VARSHA STOP by SMS */
+                } else if (bl == 0) {
                     snprintf(line2, sizeof(line2), "ALL SYNCED (00) ");
                 } else {
                     snprintf(line2, sizeof(line2), "PENDING %4d PKT", (int)bl);
@@ -2377,11 +2405,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 lcd_command(0xC0);
                 lcd_print("PLEASE WAIT...  ");
 
-                intermcu_reset_cumulative_rain();
-                storage_backlog_clear_all();
-                flash_log_erase_all();
-                storage_state_delete(LAST_LOGGED_FILENAME);
-                flash_nvram_note_last_logged("NO DATA YET");
+                data_erase_all();
 
                 vTaskDelay(1500 / portTICK_RATE_MS);
                 lcd_command(0x80);

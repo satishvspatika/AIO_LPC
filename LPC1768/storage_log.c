@@ -640,6 +640,14 @@ bool storage_backlog_save(const char *slot_time, const char *payload)
 
     bool ok = false;
     if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
+        /* Whole entries only (review, v6.9.51): a short write left on a full card would shift every
+         * later entry, so none would read right and the file would be dropped as all sent. A part
+         * entry, from now or from an earlier cut, is cut off before this one is added. */
+        DWORD whole = (s_backlog_file.fsize / sizeof(storage_backlog_entry_t)) * sizeof(storage_backlog_entry_t);
+        if (whole != s_backlog_file.fsize) {
+            f_lseek(&s_backlog_file, whole);
+            f_truncate(&s_backlog_file);
+        }
         f_lseek(&s_backlog_file, s_backlog_file.fsize);
 
         storage_backlog_entry_t entry;
@@ -652,6 +660,10 @@ bool storage_backlog_save(const char *slot_time, const char *payload)
 
         UINT bw = 0;
         FRESULT r1 = f_write(&s_backlog_file, &entry, sizeof(entry), &bw);
+        if (r1 == FR_OK && bw != sizeof(entry) && bw != 0) {
+            f_lseek(&s_backlog_file, s_backlog_file.fsize - bw);
+            f_truncate(&s_backlog_file);
+        }
         FRESULT r2 = f_close(&s_backlog_file);
         ok = (r1 == FR_OK && r2 == FR_OK && bw == sizeof(entry));
     }

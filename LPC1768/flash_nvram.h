@@ -35,7 +35,7 @@ _Static_assert(sizeof(station_nvram_params_t) == 256, "settings sector layout mu
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint8_t server_mode;        /* 0 server 1 only, 1 server 2 only, 2 both (server 2 gets the live record) */
-    uint8_t reserved0;
+    uint8_t sending_stopped;    /* VARSHA STOP (v6.9.48): no HTTP sends until VARSHA RESUME */
     uint16_t s2_port;
     char s2_host[48];           /* Name or IP; empty: no server 2 */
     char s2_path[64];

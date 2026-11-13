@@ -43,6 +43,12 @@ void ui_set_slot_busy(bool busy);
 bool slot_scheduler_is_due(void);
 /* MENU > SET DATE/TIME: sets the clock, restarts the rain-day total at 0, re-arms the scheduler */
 uint32_t clock_set_by_hand(const char *ts14);
+/* ERASE DATA (keypad, and VARSHA ERASE_DATA <ID> by SMS): rain total, backlog, record log, Last Logged */
+void data_erase_all(void);
+/* VARSHA ERASE_DATA: done by the main task after the slot is recorded (or at once with no slot running) */
+void data_erase_request(void);
+/* An ERASE_DATA by SMS waiting for the main task: the UI holds its power save meanwhile */
+bool data_erase_pending(void);
 
 /* Backlog tracking */
 uint32_t ui_get_backlog_count(void);

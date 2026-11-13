@@ -32,6 +32,8 @@ uint32_t flash_log_append(int32_t slot_id, const char *record, const char *paylo
 /* Oldest record newer than after_seq, or NULL if there are none */
 const flash_log_page_t *flash_log_next_record(uint32_t after_seq);
 const flash_log_page_t *flash_log_newest_record(void);
+/* The newest record with a payload: records kept while sending was stopped have none */
+const flash_log_page_t *flash_log_newest_with_payload(void);
 uint32_t flash_log_newest_seq(void);
 int32_t flash_log_newest_slot(void);
 uint32_t flash_log_record_count(void);

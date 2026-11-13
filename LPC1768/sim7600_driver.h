@@ -28,6 +28,8 @@ bool sim7600_modem_answered(void);
 void sim7600_set_server_clock_sync(bool on);
 /* After the slot's data: automatic radio mode so SMS can be delivered (BSNL: none in 4G-only) */
 bool sim7600_prepare_sms_listen(void);
+/* While sending is stopped: corrects the clock from the network's time, past the drift limit */
+void sim7600_correct_clock_from_network(void);
 
 /* The last post went out with no answer: don't repeat it until the next slot */
 bool sim7600_post_unanswered(void);
@@ -83,7 +85,8 @@ bool sim7600_send_sms(const char *dest_phone, const char *message);
  * The modem must be on; send it with sim7600_send_sms(). Static buffer: one caller at a time. */
 const char *sim7600_build_gps_sms(char kind, const char *present_time);
 bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm);
-void sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot);
+/* Reads and runs waiting SMS commands. Returns how many messages were taken. */
+int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot);
 
 #endif /* SIM7600_DRIVER_H */
 

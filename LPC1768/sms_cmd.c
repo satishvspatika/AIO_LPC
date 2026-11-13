@@ -55,6 +55,11 @@ static const cmd_name_t s_names[] = {
     { "SERVER_MODE",     SMS_CMD_SET_SERVER_MODE },
     { "ADD_NUM",         SMS_CMD_ADD_NUM },
     { "DEL_NUM",         SMS_CMD_DEL_NUM },
+    { "STOP_SENDING",    SMS_CMD_STOP },
+    { "STOP",            SMS_CMD_STOP },
+    { "RESUME_SENDING",  SMS_CMD_RESUME },
+    { "RESUME",          SMS_CMD_RESUME },
+    { "ERASE_DATA",      SMS_CMD_ERASE_DATA },
 };
 
 /* The command word at p (letters, digits, _), matched whole against the table */
@@ -141,6 +146,9 @@ bool sms_cmd_needs_office(sms_cmd_t cmd)
     case SMS_CMD_ADD_NUM:
     case SMS_CMD_DEL_NUM:
     case SMS_CMD_GET_NUM:   /* The list itself is only for the office */
+    case SMS_CMD_STOP:
+    case SMS_CMD_RESUME:
+    case SMS_CMD_ERASE_DATA:
         return true;
     default:
         return false;

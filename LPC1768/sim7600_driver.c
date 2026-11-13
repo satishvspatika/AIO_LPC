@@ -7,6 +7,7 @@
 #include "intermcu_protocol.h"
 #include "sms_cmd.h"
 #include "fw_app.h"
+#include "ui_display.h"
 #include "telemetry_formatter.h"
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
@@ -82,11 +83,15 @@ bool sim7600_acquire(uint32_t timeout_ms)
         vTaskDelay((50 + portTICK_RATE_MS - 1) / portTICK_RATE_MS);
         elapsed += 50;
     }
+    /* Tested and taken in one step: two tasks must never both get the modem (review, v6.9.51) */
+    bool got = false;
+    taskENTER_CRITICAL();
     if (!s_modem_busy) {
         s_modem_busy = true;
-        return true;
+        got = true;
     }
-    return false;
+    taskEXIT_CRITICAL();
+    return got;
 }
 
 void sim7600_release(void)
@@ -449,6 +454,56 @@ static bool sim7600_sync_time_step(void)
         }
     }
     return false;
+}
+
+/* While sending is stopped (VARSHA STOP) no server answer corrects the clock, and a CTRL keeping
+ * the time itself (RTC failed) gains about 6 s a slot. The network's time does it then, with the
+ * server's rule: only past the drift limit. Its year is checked: a modem that hasn't heard the
+ * network's time yet reads its own power-on default (1980/2000). */
+/* The network's time from the modem (CCLK), as YYYYMMDDHHMMSS. False when the modem hasn't had it
+ * yet: it then reads its own power-on default (1980/2000). */
+static bool read_network_ts14(char ts14[16])
+{
+    char capture[96];
+    clear_rx();
+    send_raw("AT+CCLK?\r\n");
+    if (!wait_response("+CCLK:", 2000, capture, sizeof(capture))) {
+        return false;
+    }
+    char *p = strstr(capture, "+CCLK: \"");
+    int yr = 0, mo = 0, da = 0, hr = 0, mi = 0, se = 0;
+    if (!p || sscanf(p + 8, "%d/%d/%d,%d:%d:%d", &yr, &mo, &da, &hr, &mi, &se) < 6) {
+        return false;
+    }
+    if (yr < 100) yr += 2000;
+    if (yr < 2024 || yr > 2079 || mo < 1 || mo > 12 || da < 1 || da > 31 || hr > 23 || mi > 59 || se > 59) {
+        return false;
+    }
+    snprintf(ts14, 16, "%04d%02d%02d%02d%02d%02d", yr, mo, da, hr, mi, se);
+    return true;
+}
+
+void sim7600_correct_clock_from_network(void)
+{
+    char msg[80];
+    char ts14[16];
+    if (!read_network_ts14(ts14)) {
+        storage_log_debug("RTC", "No network time yet: clock not checked");
+        return;
+    }
+    telemetry_data_t t;
+    bool have_clock = intermcu_get_telemetry(&t);
+    long drift = have_clock ? intermcu_clock_drift_sec(t.present_time, ts14) : -1;
+    if (drift >= 0 && drift < clock_drift_limit(false)) {
+        snprintf(msg, sizeof(msg), "Clock %lds from network time, no change", drift);
+        storage_log_debug("RTC", msg);
+        return;
+    }
+    snprintf(msg, sizeof(msg), "Clock corrected from network time: %.14s -> %s (drift %lds)",
+             have_clock ? t.present_time : "none", ts14, drift);
+    storage_log_debug("RTC", msg);
+    hal_power_sync_rtc(ts14);
+    intermcu_update_time(ts14);
 }
 
 static void sim7600_ntp_sync_step(void)
@@ -2652,7 +2707,29 @@ bool sim7600_prepare_sms_listen(void)
     clear_rx();
     send_raw("AT+CNMP=2\r\n");
     wait_response("OK", 2000, NULL, 0);
-    for (int i = 0; i < 10; i++) {
+    /* v6.9.47: register afresh, as at a power-on. Switching an LTE-only registration to automatic
+     * only updates it, and SMS waiting at another operator's SMS centre stayed there (001903,
+     * 13 Nov: Jio SMS waited across slots; delivered 34 s after a power-on in automatic mode at
+     * 12:51). A new attach is what tells the network, and so the SMS centres, the phone is back. */
+    clear_rx();
+    send_raw("AT+COPS=2\r\n");
+    wait_response("OK", 10000, NULL, 0);
+    delay_ms(1000);
+    /* Checked and tried again: a modem left in COPS=2 has no network at all until power-off, which
+     * with the LCD on can be a long time (review, v6.9.50) */
+    bool auto_ok = false;
+    for (int t = 0; t < 2 && !auto_ok; t++) {
+        if (t) {
+            delay_ms(2000);
+        }
+        clear_rx();
+        send_raw("AT+COPS=0\r\n");
+        auto_ok = wait_response("OK", 20000, NULL, 0);
+    }
+    if (!auto_ok) {
+        storage_log_debug("ERROR", "Modem did not take automatic network selection (COPS=0) after 2 tries");
+    }
+    for (int i = 0; i < 20; i++) {
         clear_rx();
         send_raw("AT+CREG?\r\n");
         if (wait_response("+CREG: ", 1000, cap, sizeof(cap)) && (strstr(cap, ",1") || strstr(cap, ",5"))) {
@@ -2661,7 +2738,7 @@ bool sim7600_prepare_sms_listen(void)
         }
         delay_ms(1000);
     }
-    storage_log_debug("SMS", "Listening: automatic mode, no SMS registration after 10 s");
+    storage_log_debug("SMS", "Listening: automatic mode, no SMS registration after 20 checks");
     return false;
 }
 
@@ -2816,10 +2893,10 @@ static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
         if (r.s2_host[0]) {
             snprintf(s2, sizeof(s2), "%.40s:%u", r.s2_host, (unsigned)r.s2_port);
         }
-        snprintf(out, osz, "STN %s %s MAIN %s CTRL %s MODE %u S2 %s%.40s NUMS %d",
+        snprintf(out, osz, "STN %s %s MAIN %s CTRL %s MODE %u S2 %s%.40s NUMS %d%s",
                  stn, (UNIT_CFG == KSNDMC_TRG) ? "KSNDMC_TRG" : (UNIT_CFG == BIHAR_TRG) ? "BIHAR_TRG" : "KSNDMC_TWS",
                  FIRMWARE_VERSION, (v845 && v845[0]) ? v845 : "----", (unsigned)r.server_mode, s2,
-                 r.s2_host[0] ? r.s2_path : "", office_count(&r));
+                 r.s2_host[0] ? r.s2_path : "", office_count(&r), r.sending_stopped ? " SENDING STOPPED" : "");
         break;
     }
     case SMS_CMD_GET_NUM: {
@@ -2834,7 +2911,16 @@ static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
     case SMS_CMD_SET_TIME: {
         /* As the server's clock correction: the time only, the rain-day total is kept */
         char ts[15];
-        if (sms_parse_time(arg, ts) && intermcu_ts14_believable(ts)) {
+        /* Only a fresh one (review, v6.9.51): an SMS can wait hours for a listening slot, and an old
+         * time set now moves the clock back over slots already sent. Its age is measured against the
+         * network's time, not this unit's clock, which may be the very thing that is wrong (a fast
+         * clock refused every SET_TIME; review, v6.9.52). No network time: it runs. */
+        long set_age = 0;
+        char net_ts[16];
+        if (read_network_ts14(net_ts) && sms_age_minutes(m->ts, net_ts, &set_age) &&
+            set_age > SMS_SET_TIME_MAX_AGE_MIN) {
+            snprintf(out, osz, "STN %s TIME NOT SET: SMS was %ld min old. Send it again", stn, set_age);
+        } else if (sms_parse_time(arg, ts) && intermcu_ts14_believable(ts)) {
             hal_power_sync_rtc(ts);
             intermcu_update_time(ts);
             snprintf(out, osz, "STN %s TIME SET %.14s", stn, ts);
@@ -2933,6 +3019,43 @@ static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
         }
         break;
     }
+    case SMS_CMD_ERASE_DATA: {
+        /* The ID must match this unit's, padded or not (1903 or 001903) */
+        char id[12] = "";
+        /* Compared without leading zeros: a stored ID may be unpadded (Bihar 1923 vs 00001923) */
+        const char *a = id, *b = stn;
+        bool ok = sms_parse_station_id(arg, STATION_ID_DIGITS, id, sizeof(id));
+        if (ok) {
+            while (*a == '0' && a[1]) a++;
+            while (*b == '0' && b[1]) b++;
+        }
+        if (!ok || strcmp(a, b) != 0) {
+            snprintf(out, osz, "STN %s NOT ERASED: send VARSHA ERASE_DATA %s (this unit's ID)", stn, stn);
+            break;
+        }
+        data_erase_request();
+        snprintf(out, osz, "STN %s ERASING ALL DATA (records, backlog, rain total)", stn);
+        break;
+    }
+    case SMS_CMD_STOP:
+    case SMS_CMD_RESUME: {
+        uint8_t stop = (cmd == SMS_CMD_STOP) ? 1 : 0;
+        if (r.sending_stopped == stop) {
+            snprintf(out, osz, stop ? "STN %s SENDING ALREADY STOPPED" : "STN %s ALREADY SENDING", stn);
+            break;
+        }
+        r.sending_stopped = stop;
+        if (!flash_nvram_set_remote(&r)) {
+            snprintf(out, osz, "STN %s NOT CHANGED: flash write failed", stn);
+        } else if (stop) {
+            storage_log_debug("ERROR", "Sending stopped by SMS (VARSHA STOP): records kept on the card only");
+            snprintf(out, osz, "STN %s SENDING STOPPED. Records kept on card, SMS still answered. VARSHA RESUME to restart", stn);
+        } else {
+            storage_log_debug("ERROR", "Sending resumed by SMS (VARSHA RESUME)");
+            snprintf(out, osz, "STN %s SENDING RESUMED from the next slot", stn);
+        }
+        break;
+    }
     default:
         snprintf(out, osz, "STN %s UNKNOWN COMMAND. VARSHA GET_STATUS GET_GPS GET_CONFIG SET_TIME SET_STN_ID SET_SERVER_2 SET_SERVER_MODE ADD_NUM DEL_NUM GET_NUM", stn);
         break;
@@ -2940,7 +3063,7 @@ static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
     reply(m->from, out);
 }
 
-void sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
+int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
 {
     static bool s_list_error_logged = false;
     /* Polled every few seconds with the LCD on: wait for the end of the list, and log only a message */
@@ -2965,7 +3088,7 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
             snprintf(msg, sizeof(msg), "Could not list SMS: %.60s", s_sms_capture[0] ? s_sms_capture : "no answer");
             storage_log_debug("ERROR", msg);
         }
-        return;
+        return 0;
     }
     /* Once a power-on: how full the SIM's message store is. Full (M2M SIMs hold few), the network
      * can't deliver new commands; this check then empties it 4 at a time. */
@@ -2996,7 +3119,7 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
         if (in_slot) {
             storage_log_debug("SMS", "No SMS waiting");
         }
-        return;
+        return 0;
     }
     storage_log_debug("SMS", s_sms_capture);
     /* Copied out first: the replies reuse the capture buffer. Each message has its own sender. */
@@ -3015,4 +3138,5 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
         hal_power_heartbeat();
         sms_run(&s_inbox[i], telemetry);
     }
+    return n;
 }
