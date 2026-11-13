@@ -1,0 +1,93 @@
+<!doctype html><html><head><meta charset='utf-8'><title>AIO Data Logger: Release v6.9.38</title><style>
+body { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 10.5pt;
+       color: #1a1a1a; line-height: 1.45; margin: 0; }
+h1 { font-size: 19pt; margin: 0 0 6pt; color: #0b3d63; }
+h2 { font-size: 13.5pt; margin: 16pt 0 6pt; color: #0b3d63; border-bottom: 1.5px solid #0b3d63; padding-bottom: 2pt; }
+h3 { font-size: 11.5pt; margin: 12pt 0 4pt; }
+p { margin: 4pt 0; }
+ul, ol { margin: 3pt 0 6pt; padding-left: 18pt; }
+li { margin: 2pt 0; }
+table { border-collapse: collapse; width: 100%; margin: 6pt 0 8pt; font-size: 9.5pt; }
+th, td { border: 1px solid #b8c4ce; padding: 3pt 6pt; text-align: left; vertical-align: top; }
+th { background: #e8eef3; }
+code { font-family: Menlo, Consolas, monospace; font-size: 9pt; background: #f1f3f5; padding: 0 2pt; border-radius: 2pt; }
+hr { border: 0; border-top: 1px solid #ccd5dc; margin: 12pt 0; }
+@page { size: A4; margin: 16mm 15mm; }
+</style></head><body><h1>AIO Data Logger: Release v6.9.38</h1>
+<p><strong>Release date:</strong> 13 November 2026</p>
+<p><strong>Type:</strong> Testing release (the debug log on the SD card is on by default)</p>
+<p><strong>For:</strong> Test team, bench and field test units</p>
+<table><tr><th>Part</th><th>Version</th><th>File on the SD card</th></tr>
+<tr><td>Main firmware, KSNDMC rain gauge (TRG)</td><td>v6.9.38</td><td><code>fw_ksn_trg.hex</code></td></tr>
+<tr><td>Main firmware, Bihar rain gauge (TRG)</td><td>v6.9.38</td><td><code>fw_bihar.hex</code></td></tr>
+<tr><td>Main firmware, KSNDMC weather station (TWS)</td><td>v6.9.38</td><td><code>fw_ksn_tws.hex</code></td></tr>
+<tr><td>CTRL firmware (all unit types)</td><td>v1.12</td><td><code>ctrl.hex</code></td></tr>
+<tr><td>Old-unit conversion image</td><td>MIG-1.7</td><td><code>fw.hex</code></td></tr>
+</table>
+<hr>
+<h2>1. What is new in this release</h2>
+<h3>Weather station (TWS): no more zero readings sent to the server</h3>
+<ul>
+<li><strong>A slot with temperature or humidity at 0 is no longer sent or stored.</strong> A 0 always means the reading is missing (sensor, cable, or a CTRL that has just restarted), never a real value. SLOTS.CSV shows the slot as <code>SKIPPED,NO_TEMP_HUMID</code> and ERRORS.TXT says why.</li>
+<li>The same rule applies to slots filled in later from the CTRL&#x27;s stored samples, and to records still waiting in the backlog from older firmware. Those are moved to <code>REJECTED.TXT</code> instead of being sent.</li>
+<li><strong>A slot that runs a second time (after a restart) resends exactly what was stored the first time,</strong> never new readings. Before this fix, a repeat send could put zeros over a good record on the server (seen on unit 1903, 12 Nov 16:34).</li>
+</ul>
+<h3>Clock: a unit with a failed clock chip (RTC) no longer jumps back in time</h3>
+<ul>
+<li>After a power cut, a CTRL with a failed RTC used to report the time the RTC had frozen at (43 minutes back on unit 1903). <strong>CTRL v1.12 gives no time after power-on until it sees the RTC actually ticking.</strong> If the RTC is dead, the unit takes the time from the network or GPS instead.</li>
+<li>If the RTC had stopped while the unit was off (backup cell flat), its old time is not trusted either: the unit waits for the network or GPS time.</li>
+<li>On a unit whose CTRL is keeping the time itself (RTC failed, CTRL v1.11 and later), the server time now corrects it once it is 15 s off instead of 90 s, so slots stay on time to within about 15 s.</li>
+</ul>
+<h3>Error log (ERRORS.TXT)</h3>
+<ul>
+<li>The same error is written <strong>at most once a day.</strong> A unit with a failed RTC used to write the same line every slot (96 a day), which pushed real faults out of the 48-entry error memory within about 12 hours.</li>
+</ul>
+<h3>Old-unit conversion</h3>
+<ul>
+<li><strong>MIG-1.7</strong> is MIG-1.6 with CTRL v1.12 inside. Nothing else changed in the conversion steps.</li>
+</ul>
+<hr>
+<h2>2. How to install</h2>
+<h3>Units already on the new firmware (v6.9.x)</h3>
+<ol>
+<li>Copy everything from the <code>SD_CARD</code> folder in the zip to the root of the unit&#x27;s SD card (replace the old files). Keep the card&#x27;s other files and folders.</li>
+<li>Insert the card and power the unit on. On the LCD: <strong>MENU &gt; FIRMWARE UPDATE &gt; CTRL F/W</strong>. Wait for <code>CTRL UPDATE OK</code> (about 1 minute). The LCD then shows <strong>v1.12</strong> for CTRL.</li>
+<li><strong>MENU &gt; FIRMWARE UPDATE &gt; MAIN F/W.</strong> The unit restarts into v6.9.38 and confirms it after about 30 seconds. <code>UPDATE.TXT</code> on the card shows <code>UPDATE OK, now running v6.9.38</code>.</li>
+</ol>
+<p>The two updates can be done in either order; both orders work with the other part&#x27;s old version.</p>
+<h3>Old units (original firmware with the old SD-card bootloader)</h3>
+<p>Same steps as MIG-1.6:</p>
+<ol>
+<li>Copy the <code>SD_CARD</code> files to the root of a card. The unit chooses the <code>fw_*.hex</code> for its own type.</li>
+<li>With the unit <strong>off</strong>, fit caps on <strong>JP1 and JP2</strong> on the CTRL board, insert the card, power on.</li>
+<li>The LCD shows <code>CONVERTING UNIT  MIG-1.7</code> and works through the steps. When it shows <code>REMOVE JP1+JP2</code>, take both caps off. The unit finishes and starts on v6.9.38.</li>
+<li>Check the station ID and unit type on the LCD; set them from the keypad if asked.</li>
+</ol>
+<hr>
+<h2>3. What to test</h2>
+<table><tr><th>#</th><th>Test</th><th>Expected</th></tr>
+<tr><td>1</td><td>Update CTRL then MAIN as above, on each unit type</td><td><code>UPDATE OK</code> for both; LCD shows v6.9.38 / CTRL v1.12</td></tr>
+<tr><td>2</td><td>Normal running for 24 hours</td><td>Every slot in SLOTS.CSV <code>SENT</code>, no gaps; 08:45 rain-day change on TRG</td></tr>
+<tr><td>3</td><td><strong>Power cut</strong>: remove power for 1 minute during the day, then restore</td><td>Correct time on the LCD after power-on (never an old time); next slot sent normally</td></tr>
+<tr><td>4</td><td>TWS only: unplug the temperature/humidity sensor for one slot, then plug it back</td><td>That slot <code>SKIPPED,NO_TEMP_HUMID</code>, <strong>nothing sent with 000.0</strong>; next slot normal</td></tr>
+<tr><td>5</td><td>TWS only: restart the unit (power cycle) within a minute after a slot was sent</td><td>No second send of that slot with different values on the server</td></tr>
+<tr><td>6</td><td>Unit with a failed RTC (LCD shows RTC BAD), if available</td><td>Time stays right; HTTPLOG/LOG show corrections at about 15 s; one RTC line a day in ERRORS.TXT</td></tr>
+<tr><td>7</td><td>Old unit conversion with MIG-1.7</td><td>Conversion completes; CTRL v1.12 on the LCD</td></tr>
+</table>
+<p>Please send back the whole SD card contents (or at least <code>SLOTS.CSV</code>, <code>ERRORS.TXT</code>, <code>UPDATE.TXT</code>, <code>HTTPLOG.TXT</code> and the <code>LOG</code> folder) with the station ID and what was done when.</p>
+<hr>
+<h2>4. Known limits in this release</h2>
+<ul>
+<li><strong>A unit with a failed RTC that loses power while it has no network</strong> records no slots until the network returns (it has no trustworthy time). Older versions recorded them under a wrong time. A GPS-time fallback is planned. The real fix for such a unit is to repair its RTC.</li>
+<li><strong>TWS:</strong> the first slot right after the CTRL restarts is skipped (the CTRL has not yet read the sensor). A fix is planned.</li>
+<li>This is a <strong>testing build</strong>: the debug log (LOG folder, HTTPLOG.TXT) is written to the SD card on every unit. Production builds will switch it off.</li>
+</ul>
+<hr>
+<h2>5. Checks done before release</h2>
+<ul>
+<li>All three unit types and the CTRL built from the same source; images are 121.9 to 122.6 KB of 128 KB.</li>
+<li>Host test suite: all pass (firmware update power-cut simulations: 4,619 and 4,914 scenarios with no image lost; CTRL update; CTRL repair by ROM loader; frame compatibility between main and CTRL; station ID; network policy).</li>
+<li>Worst-case stack use checked for every task on all three types: all within limits.</li>
+<li>The new zero-reading and once-a-day error checks were tested on the bench PC with real lines from unit 1903.</li>
+<li>Bench unit 1903 (TWS) ran v6.9.37 overnight 12-13 Nov: 71 of 71 slots sent first try. <strong>v6.9.38 itself has not yet run on a unit:</strong> the test team&#x27;s run is its first field test.</li>
+</ul></body></html>
