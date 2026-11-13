@@ -2641,11 +2641,36 @@ const char *sim7600_build_gps_sms(char kind, const char *present_time)
     return msg;
 }
 
+/* SMS listening (v6.9.45). A slot registers in 4G-only mode (CNMP=38) for data; on BSNL that leaves
+ * no voice/SMS registration, so SMS sent to the unit are never delivered (001903, 2026-11-13: none
+ * arrived in any slot; at 12:16 with the LCD on, in automatic mode, on LTE with +CREG: 0,1, both came at
+ * once). After the slot's data, automatic mode (CNMP=2) for the listening window, until CREG shows
+ * voice/SMS registration (10 s at most). True if registered for SMS. */
+bool sim7600_prepare_sms_listen(void)
+{
+    char cap[48];
+    clear_rx();
+    send_raw("AT+CNMP=2\r\n");
+    wait_response("OK", 2000, NULL, 0);
+    for (int i = 0; i < 10; i++) {
+        clear_rx();
+        send_raw("AT+CREG?\r\n");
+        if (wait_response("+CREG: ", 1000, cap, sizeof(cap)) && (strstr(cap, ",1") || strstr(cap, ",5"))) {
+            storage_log_debug("SMS", "Listening: automatic mode, registered for SMS");
+            return true;
+        }
+        delay_ms(1000);
+    }
+    storage_log_debug("SMS", "Listening: automatic mode, no SMS registration after 10 s");
+    return false;
+}
+
 /* ---- SMS commands (v6.9.41, sms_cmd.c) ---- */
 #define SMS_INBOX_MAX 4
 typedef struct {
     int index;          /* Its place in the SIM's store, to delete just this one */
     char from[24];
+    char ts[24];        /* SMS centre time stamp "yy/MM/dd,hh:mm:ss+zz" */
     char body[168];
 } sms_in_t;
 static sms_in_t s_inbox[SMS_INBOX_MAX];     /* Static: runs in the slot, on the main task's stack */
@@ -2660,7 +2685,7 @@ static int split_inbox(const char *list)
     const char *p = strstr(list, "+CMGL: ");
     while (p && n < SMS_INBOX_MAX) {
         sms_in_t *m = &s_inbox[n];
-        m->from[0] = m->body[0] = '\0';
+        m->from[0] = m->body[0] = m->ts[0] = '\0';
         m->index = atoi(p + 7);
         const char *line_end = strstr(p, "\r\n");
         if (!line_end) {
@@ -2679,6 +2704,15 @@ static int split_inbox(const char *list)
             if (e && e < line_end && (size_t)(e - q - 1) < sizeof(m->from)) {
                 memcpy(m->from, q + 1, (size_t)(e - q - 1));
                 m->from[e - q - 1] = '\0';
+            }
+            /* Then "" (name) and the time stamp */
+            const char *t = e ? strchr(e + 1, '"') : NULL;
+            t = (t && t < line_end) ? strchr(t + 1, '"') : NULL;
+            t = (t && t < line_end) ? strchr(t + 1, '"') : NULL;
+            const char *te = (t && t < line_end) ? strchr(t + 1, '"') : NULL;
+            if (te && te < line_end && (size_t)(te - t - 1) < sizeof(m->ts)) {
+                memcpy(m->ts, t + 1, (size_t)(te - t - 1));
+                m->ts[te - t - 1] = '\0';
             }
         }
         const char *body = line_end + 2;
@@ -2729,12 +2763,26 @@ static void reply(const char *to, const char *text)
 }
 
 /* One command from one sender. The reply goes to the sender, starting with the station ID. */
-static void sms_run(const sms_in_t *m, const telemetry_data_t *telemetry)
+static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
 {
     static char arg[96];
     static remote_settings_t r;
+    /* Some phones send UCS2 (a Kannada or Hindi keyboard, a special character): hex in text mode */
+    if (sms_decode_ucs2(m->body)) {
+        storage_log_debug("SMS", "UCS2 message decoded");
+    }
     sms_cmd_t cmd = sms_cmd_parse(m->body, arg, sizeof(arg));
     if (cmd == SMS_CMD_NONE) {
+        return;
+    }
+    /* A SIM in the field can hold commands from long ago: until v6.9.43 none was ever read or deleted.
+     * One sent more than SMS_MAX_AGE_MIN ago is dropped unrun (an old SET_TIME would set a wrong time).
+     * With no valid clock the age is unknown and it runs. */
+    long age = 0;
+    if (sms_age_minutes(m->ts, telemetry->present_time, &age) && age > SMS_MAX_AGE_MIN) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "SMS command sent %ld min ago (%.17s): too old, not run", age, m->ts);
+        storage_log_debug("SMS", msg);
         return;
     }
     char from10[11];
@@ -2918,6 +2966,31 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
             storage_log_debug("ERROR", msg);
         }
         return;
+    }
+    /* Once a power-on: how full the SIM's message store is. Full (M2M SIMs hold few), the network
+     * can't deliver new commands; this check then empties it 4 at a time. */
+    static bool s_store_logged = false;
+    if (!s_store_logged && in_slot) {
+        static char cpms[96];
+        s_store_logged = true;
+        s_log_quiet = true;
+        clear_rx();
+        send_raw("AT+CPMS?\r\n");
+        bool got = wait_response("OK", 1500, cpms, sizeof(cpms));
+        s_log_quiet = false;
+        const char *c = got ? strstr(cpms, "+CPMS: ") : NULL;
+        int used = -1, total = -1;
+        if (c) {
+            const char *q = strchr(c, ',');
+            if (q) {
+                used = atoi(q + 1);
+                q = strchr(q + 1, ',');
+                total = q ? atoi(q + 1) : -1;
+            }
+        }
+        char msg[64];
+        snprintf(msg, sizeof(msg), "SIM message store: %d of %d used", used, total);
+        storage_log_debug((used >= 0 && total > 0 && used >= total) ? "ERROR" : "SMS", msg);
     }
     if (strstr(s_sms_capture, "+CMGL: ") == NULL) {
         if (in_slot) {

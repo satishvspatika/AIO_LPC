@@ -26,6 +26,8 @@ bool sim7600_sim_missing(void);
 bool sim7600_modem_answered(void);
 /* Server time sets the clock (default on). Off for server 2's copy in mode 2. */
 void sim7600_set_server_clock_sync(bool on);
+/* After the slot's data: automatic radio mode so SMS can be delivered (BSNL: none in 4G-only) */
+bool sim7600_prepare_sms_listen(void);
 
 /* The last post went out with no answer: don't repeat it until the next slot */
 bool sim7600_post_unanswered(void);

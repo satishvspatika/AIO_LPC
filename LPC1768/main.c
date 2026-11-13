@@ -478,6 +478,48 @@ static void __attribute__((noinline)) gps_auto_step(const telemetry_data_t *tele
  * a repeat could duplicate it), a lost network or a used-up slot. 2G sometimes fails one socket
  * open straight after another and takes the next (1922, 2026-11-09): one failure used to leave
  * the rest of the backlog to the next slot. */
+/* An SMS sent while the modem was off is held by the network and delivered 10-30 s after the next
+ * registration. The slot used to check about 4 s after registering and power off (001903,
+ * 2026-11-13 12:30: four commands waiting, "No SMS waiting"). So, on listening slots, the modem stays
+ * on until SMS_LISTEN_SEC after registration, checking every 5 s; other slots check once. */
+static int slot_of_day(int32_t slot_id)
+{
+    return (int)(slot_id % 96);
+}
+
+static bool is_listening_slot(int slot)
+{
+#if SMS_LISTEN_ALL_SLOTS
+    (void)slot;
+    return true;
+#else
+    static const uint8_t hours[] = { SMS_LISTEN_HOURS };
+    for (size_t i = 0; i < sizeof(hours); i++) {
+        if (slot == hours[i] * 4) {     /* The slot at hh:00 */
+            return true;
+        }
+    }
+    return false;
+#endif
+}
+
+static void __attribute__((noinline)) sms_listen(const telemetry_data_t *telem, portTickType registered_at,
+                                                 portTickType budget_end, int slot)
+{
+    if (is_listening_slot(slot)) {
+        (void)registered_at;
+        /* Counted from SMS registration: in 4G-only mode (the slot's data) none is delivered at all */
+        sim7600_prepare_sms_listen();
+        const portTickType until = xTaskGetTickCount() + (SMS_LISTEN_SEC * 1000 / portTICK_RATE_MS);
+        while ((long)(until - xTaskGetTickCount()) > 0 && (long)(budget_end - xTaskGetTickCount()) > 0) {
+            sim7600_check_incoming_sms(telem, false);
+            hal_power_heartbeat();
+            vTaskDelay(5000 / portTICK_RATE_MS);
+        }
+    }
+    sim7600_check_incoming_sms(telem, true);
+}
+
 /* Server 2 (v6.9.41, set by SMS): mode 0 server 1 only, 1 server 2 only (live and backlog), 2 both
  * (server 2 gets one copy of the live record; the backlog stays with server 1, so a dead server 2
  * never holds anything up). Same payload; its key replaced when server 2 has its own. */
@@ -607,6 +649,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
     }
 
     if (modem_up) {
+        const portTickType registered_at = xTaskGetTickCount();
         modem_status_t status;
         sim7600_get_status(&status);
         *out_csq = status.csq_dbm;
@@ -828,7 +871,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
 #endif
 
         /* Check and process incoming operator SMS */
-        sim7600_check_incoming_sms(telem, true);
+        sms_listen(telem, registered_at, budget_end, slot_of_day(s_archive_slot_id));
     } else {
         storage_log_debug("MODEM", "Modem has no network after all tries! Saving to backlog.");
         format_slot_payload(payload, sizeof(payload), telem, -113);

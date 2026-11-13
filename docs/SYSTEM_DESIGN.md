@@ -320,7 +320,19 @@ Jams come only while the unit is awake, about 1-7 per slot on 1922 (the modem is
 `sms_cmd.c` (host test `tests/sms_cmd_test.c`), run in `sim7600_check_incoming_sms()` after each slot's send (and every
 few seconds while the LCD is on). `AT+CMGL="ALL"` (1 KB copy); up to 4 whole messages per slot, each with its own sender,
 each deleted by its index (`AT+CMGD=<i>`) before it runs. More, or one cut off at the end of the copy, stay on the SIM
-for the next slot (v6.9.42; v6.9.41 deleted everything after 4, cut ones included). Replies go to the sender and start
+for the next slot (v6.9.42; v6.9.41 deleted everything after 4, cut ones included). SMS sent while the modem is off are held by
+the network and delivered 10-30 s after the next registration, so since v6.9.44 a listening slot keeps the modem on
+until `SMS_LISTEN_SEC` (25 s) after registration, checking every 5 s (`sms_listen()` in main.c). Testing: every slot
+(`SMS_LISTEN_ALL_SLOTS 1`); later only the hh:00 slots in `SMS_LISTEN_HOURS` (3-4 a day, user 2026-11-13). v6.9.45:
+the window first sets automatic radio mode (`AT+CNMP=2`, `sim7600_prepare_sms_listen()`) and waits for `+CREG` voice/SMS
+registration (10 s at most): slots register 4G-only (`CNMP=38`) for data, and BSNL then delivers no SMS at all (001903,
+2026-11-13 12:30 and 12:45 windows got nothing; in automatic mode on LTE with `+CREG: 0,1` SMS arrive at once). v6.9.46 (field
+and M2M SIMs): a command whose SMS-centre time stamp is more than `SMS_MAX_AGE_MIN` (24 h) older than the unit's clock
+is deleted unrun (until v6.9.43 nothing was ever read or deleted, so field SIMs can hold old `#TIME=` commands); no
+valid clock means unknown age, and it runs. UCS2 bodies (hex in text mode, sent by phones with a Kannada/Hindi
+keyboard) are decoded when plain ASCII. Once a power-on the slot logs `SIM message store: used of total` (ERROR
+when full: the network can't deliver then). M2M plans that block person-to-person SMS can't be fixed in firmware:
+the log then shows `registered for SMS` with `No SMS waiting`. Replies go to the sender and start
 `STN <id>`. A sender that isn't a phone number (operator adverts) gets nothing.
 
 | Command | Who | Does |

@@ -306,3 +306,82 @@ bool sms_payload_with_key(const char *payload, const char *key, char *out, size_
     memcpy(out + head + klen, end, tail + 1);
     return true;
 }
+
+/* Days since 2000-03-01 style civil count (any fixed origin works: only differences are used) */
+static long days_from_civil(int y, int m, int d)
+{
+    y -= (m <= 2);
+    long era = y / 400;
+    long yoe = y - era * 400;
+    long doy = (153L * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe;
+}
+
+static bool two(const char *p, int *out)
+{
+    if (p[0] < '0' || p[0] > '9' || p[1] < '0' || p[1] > '9') {
+        return false;
+    }
+    *out = (p[0] - '0') * 10 + (p[1] - '0');
+    return true;
+}
+
+bool sms_age_minutes(const char *sms_ts, const char *now14, long *out_minutes)
+{
+    int yy, mo, dd, hh, mi, ss;
+    /* "yy/MM/dd,hh:mm:ss" */
+    if (!sms_ts || strlen(sms_ts) < 17 || sms_ts[2] != '/' || sms_ts[5] != '/' || sms_ts[8] != ',' ||
+        !two(sms_ts, &yy) || !two(sms_ts + 3, &mo) || !two(sms_ts + 6, &dd) ||
+        !two(sms_ts + 9, &hh) || !two(sms_ts + 12, &mi) || !two(sms_ts + 15, &ss)) {
+        return false;
+    }
+    if (!now14 || strlen(now14) < 12) {
+        return false;
+    }
+    int nc, ny, nmo, nd, nh, nmi;
+    if (!two(now14, &nc) || !two(now14 + 2, &ny) || !two(now14 + 4, &nmo) || !two(now14 + 6, &nd) ||
+        !two(now14 + 8, &nh) || !two(now14 + 10, &nmi) || nc != 20 || ny < 24) {
+        return false;   /* No valid clock (lost, year 2000): the age is unknown, not huge */
+    }
+    if (mo < 1 || mo > 12 || dd < 1 || dd > 31 || nmo < 1 || nmo > 12 || nd < 1 || nd > 31) {
+        return false;
+    }
+    long a = days_from_civil(2000 + yy, mo, dd) * 1440L + hh * 60L + mi;
+    long b = days_from_civil(2000 + ny, nmo, nd) * 1440L + nh * 60L + nmi;
+    *out_minutes = b - a;
+    return true;
+}
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+bool sms_decode_ucs2(char *body)
+{
+    size_t n = 0;
+    while (body[n] && body[n] != '\r' && body[n] != '\n') {
+        if (hexval(body[n]) < 0) {
+            return false;
+        }
+        n++;
+    }
+    if (n < 8 || (n % 4) != 0) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i += 4) {
+        if (body[i] != '0' || body[i + 1] != '0' || hexval(body[i + 2]) > 7) {
+            return false;   /* Not plain ASCII: left as it is */
+        }
+    }
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        body[o++] = (char)(hexval(body[i + 2]) * 16 + hexval(body[i + 3]));
+    }
+    body[o] = '\0';
+    return true;
+}

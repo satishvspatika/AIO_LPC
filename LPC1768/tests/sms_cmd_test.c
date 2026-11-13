@@ -98,6 +98,30 @@ int main(void)
     T(!sms_payload_with_key("no key here", "zz", out, sizeof(out)));
     T(!sms_payload_with_key("a=1&key=x", "zz", out, 5));
 
+    long age = 0;
+    T(sms_age_minutes("26/11/13,12:16:17+22", "20261113123000", &age) && age == 14);
+    T(sms_age_minutes("26/11/12,12:30:00+22", "20261113123000", &age) && age == 1440);
+    T(sms_age_minutes("26/02/28,23:50:00+22", "20260301001000", &age) && age == 20);
+    T(sms_age_minutes("25/12/31,23:59:00+22", "20260101000100", &age) && age == 2);
+    T(sms_age_minutes("26/11/13,12:40:00+22", "20261113123000", &age) && age == -10);
+    T(!sms_age_minutes("garbage", "20261113123000", &age));
+    T(!sms_age_minutes("26/11/13,12:16:17+22", "20001113123000", &age));
+    T(!sms_age_minutes("26/11/13,12:16:17+22", "", &age));
+
+    char u[64];
+    strcpy(u, "00560041005200530048004100200047004500540053");
+    T(sms_decode_ucs2(u) && strcmp(u, "VARSHA GETS") == 0);
+    strcpy(u, "005600410052\r\n");
+    T(sms_decode_ucs2(u) && strcmp(u, "VAR") == 0);
+    strcpy(u, "0C950C96");             /* Kannada: left as it is */
+    T(!sms_decode_ucs2(u) && strcmp(u, "0C950C96") == 0);
+    strcpy(u, "VARSHA GET_STATUS");
+    T(!sms_decode_ucs2(u));
+    strcpy(u, "1234");                 /* Too short to be a command */
+    T(!sms_decode_ucs2(u));
+    strcpy(u, "12345678");             /* Hex but not 00xx */
+    T(!sms_decode_ucs2(u));
+
     printf(s_fail ? "FAILED: %d\n" : "ALL PASS\n", s_fail);
     return s_fail != 0;
 }

@@ -54,4 +54,12 @@ bool sms_parse_server2(const char *arg, char *host, size_t host_size, uint16_t *
  * unchanged) if the payload has no key or out is too small. */
 bool sms_payload_with_key(const char *payload, const char *key, char *out, size_t out_size);
 
+/* Minutes from an SMS centre time stamp ("26/11/13,12:16:17+22", local time as sent by the network)
+ * to the unit's time (YYYYMMDDhhmmss). False if either can't be read. Negative: the SMS is "newer". */
+bool sms_age_minutes(const char *sms_ts, const char *now14, long *out_minutes);
+
+/* A body sent as UCS2 shows as hex in text mode ("0056004100520053...": VARS...). Decoded in place to
+ * plain text when every character is plain ASCII; anything else is left as it is. True if decoded. */
+bool sms_decode_ucs2(char *body);
+
 #endif /* SMS_CMD_H */
