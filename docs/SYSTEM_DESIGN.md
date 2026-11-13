@@ -317,8 +317,10 @@ Jams come only while the unit is awake, about 1-7 per slot on 1922 (the modem is
 ### 7.4b SMS commands (v6.9.41)
 
 `VARSHA <CMD> [value]` (as the ESP32 fleet, any case, `=` optional) or the older `#CMD[=value]`. Parsed in
-`sms_cmd.c` (host test `tests/sms_cmd_test.c`), run in `sim7600_check_incoming_sms()` after each slot's send. Every
-unread message is taken with its own sender (up to 4 per slot), deleted, then run; replies go to the sender and start
+`sms_cmd.c` (host test `tests/sms_cmd_test.c`), run in `sim7600_check_incoming_sms()` after each slot's send (and every
+few seconds while the LCD is on). `AT+CMGL="ALL"` (1 KB copy); up to 4 whole messages per slot, each with its own sender,
+each deleted by its index (`AT+CMGD=<i>`) before it runs. More, or one cut off at the end of the copy, stay on the SIM
+for the next slot (v6.9.42; v6.9.41 deleted everything after 4, cut ones included). Replies go to the sender and start
 `STN <id>`. A sender that isn't a phone number (operator adverts) gets nothing.
 
 | Command | Who | Does |

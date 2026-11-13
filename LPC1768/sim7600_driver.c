@@ -61,7 +61,7 @@ static char s_http_req[1024];
 static char s_http_capture[1024];
 static const char *s_active_apn = "";
 static bool s_bearer_ready = false; /* AT+CGACT done since the modem last started or changed APN */
-static char s_sms_capture[512];
+static char s_sms_capture[1024];   /* An SMS list: about 8 messages (v6.9.41; 512 held 4) */
 
 static modem_status_t s_modem_status = {
     .csq_val = 99,
@@ -2644,13 +2644,16 @@ const char *sim7600_build_gps_sms(char kind, const char *present_time)
 /* ---- SMS commands (v6.9.41, sms_cmd.c) ---- */
 #define SMS_INBOX_MAX 4
 typedef struct {
+    int index;          /* Its place in the SIM's store, to delete just this one */
     char from[24];
     char body[168];
 } sms_in_t;
 static sms_in_t s_inbox[SMS_INBOX_MAX];     /* Static: runs in the slot, on the main task's stack */
 static char s_sms_reply[160];
 
-/* Unread messages out of an AT+CMGL list: +CMGL: <i>,"REC UNREAD","<from>","","<time>"\r\n<body>\r\n */
+/* Messages out of an AT+CMGL list: +CMGL: <i>,"REC UNREAD","<from>","","<time>"\r\n<body>\r\n. Only
+ * whole ones: a list cut short by the buffer ends with a message whose text may be cut too, and a
+ * cut command ("SET_STN_ID 19" of 1903) must never run. Those stay on the SIM for the next slot. */
 static int split_inbox(const char *list)
 {
     int n = 0;
@@ -2658,6 +2661,7 @@ static int split_inbox(const char *list)
     while (p && n < SMS_INBOX_MAX) {
         sms_in_t *m = &s_inbox[n];
         m->from[0] = m->body[0] = '\0';
+        m->index = atoi(p + 7);
         const char *line_end = strstr(p, "\r\n");
         if (!line_end) {
             break;
@@ -2679,10 +2683,13 @@ static int split_inbox(const char *list)
         }
         const char *body = line_end + 2;
         const char *next = strstr(body, "+CMGL: ");
-        const char *stop = next ? next : body + strlen(body);
         const char *ok = strstr(body, "\r\nOK");
-        if (ok && ok < stop) {
+        const char *stop = next;
+        if (ok && (!stop || ok < stop)) {
             stop = ok;
+        }
+        if (!stop) {
+            break;      /* Cut short: not taken */
         }
         size_t len = (size_t)(stop - body);
         if (len >= sizeof(m->body)) {
@@ -2890,7 +2897,9 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
     /* Polled every few seconds with the LCD on: wait for the end of the list, and log only a message */
     clear_rx();
     s_log_quiet = true;
-    send_raw("AT+CMGL=\"REC UNREAD\"\r\n");
+    /* ALL, not REC UNREAD: listing marks them read, and any not handled this slot (more than 4,
+     * or cut short) must be listed again next slot */
+    send_raw("AT+CMGL=\"ALL\"\r\n");
     bool listed = wait_response("OK", 2000, s_sms_capture, sizeof(s_sms_capture));
     s_log_quiet = false;
     if (!listed || strstr(s_sms_capture, "+CMGL: ") == NULL) {
@@ -2900,10 +2909,15 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
     /* Copied out first: the replies reuse the capture buffer. Each message has its own sender. */
     int n = split_inbox(s_sms_capture);
 
-    /* Deleted before acting: a reset part way through can't run a command twice */
-    send_raw("AT+CMGD=1,4\r\n");
-    wait_response("OK", 1000, NULL, 0);
-
+    /* Each deleted before it runs: a restart part way through can't run a command twice. Only the
+     * ones taken: the rest wait for the next slot. */
+    for (int i = 0; i < n; i++) {
+        char del[24];
+        snprintf(del, sizeof(del), "AT+CMGD=%d\r\n", s_inbox[i].index);
+        clear_rx();
+        send_raw(del);
+        wait_response("OK", 2000, NULL, 0);
+    }
     for (int i = 0; i < n; i++) {
         hal_power_heartbeat();
         sms_run(&s_inbox[i], telemetry);
