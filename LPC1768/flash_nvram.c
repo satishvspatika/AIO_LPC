@@ -26,14 +26,34 @@ static char s_active_last_logged[20] = "NO DATA YET";
 /* Robust In-Application Programming (IAP) writer for Sector 1 (0x1000)
  * Uses clock fallback (100MHz CCLK -> 398MHz PLL timing used by legacy TWS firmware)
  * and read-back hardware verification with memcmp. */
-/* From main RAM: a caller's stack (in AHB SRAM) can be a source the boot ROM refuses (fw_app.c) */
-static uint32_t s_sector_src[64];
+/* From main RAM: a caller's stack (in AHB SRAM) can be a source the boot ROM refuses (fw_app.c).
+ * Two pages: 0x1000 settings, 0x1100 remote settings (v6.9.41, set by SMS). The sector is erased as a
+ * whole, so every write puts both back: the page not being changed is copied from flash first. */
+static uint32_t s_sector_src[128];
 
+static bool iap_write_sector1_pages(void);
+
+/* Settings page (0x1000) */
 static bool iap_write_sector1(const void *src_buf, size_t len)
 {
     if (!src_buf || len != 256) return false;
-    memcpy(s_sector_src, src_buf, len);
-    src_buf = s_sector_src;
+    memcpy(s_sector_src, src_buf, 256);
+    memcpy((uint8_t *)s_sector_src + 256, (const void *)REMOTE_PAGE_ADDR, 256);
+    return iap_write_sector1_pages();
+}
+
+/* Remote settings page (0x1100) */
+static bool iap_write_remote_page(const void *src_buf)
+{
+    memcpy(s_sector_src, (const void *)PARAM_SECTOR_ADDR, 256);
+    memcpy((uint8_t *)s_sector_src + 256, src_buf, 256);
+    return iap_write_sector1_pages();
+}
+
+static bool iap_write_sector1_pages(void)
+{
+    const void *src_buf = s_sector_src;
+    const size_t len = 512;
 
     static const uint32_t clocks[] = { 100000, 398000, 12000 };
 
@@ -85,11 +105,11 @@ static bool iap_write_sector1(const void *src_buf, size_t len)
         /* Delay between prepare and write */
         for (volatile int d = 0; d < 20000; d++);
 
-        /* Step 4: Copy RAM to Flash (256 bytes) */
+        /* Step 4: Copy RAM to Flash (512 bytes: both pages) */
         s_iap_cmd[0] = 51;
         s_iap_cmd[1] = PARAM_SECTOR_ADDR;
         s_iap_cmd[2] = (unsigned long)src_buf;
-        s_iap_cmd[3] = 256;
+        s_iap_cmd[3] = 512;
         s_iap_cmd[4] = clk;
         __disable_irq();
         iap_call(s_iap_cmd, s_iap_res);
@@ -392,4 +412,45 @@ bool flash_nvram_write(const station_nvram_params_t *in_params)
     ram_copy.magic = PARAM_MAGIC;
 
     return iap_write_sector1(&ram_copy, sizeof(ram_copy));
+}
+
+/* ---- Remote settings (v6.9.41): page 0x1100, set by SMS from office numbers ---- */
+static uint32_t remote_crc(const remote_settings_t *r)
+{
+    const uint8_t *b = (const uint8_t *)r;
+    uint32_t c = 0xFFFFFFFFUL;
+    for (size_t i = 0; i < offsetof(remote_settings_t, crc); i++) {
+        c ^= b[i];
+        for (int k = 0; k < 8; k++) {
+            c = (c >> 1) ^ (0xEDB88320UL & (0UL - (c & 1UL)));
+        }
+    }
+    return ~c;
+}
+
+/* The page as stored, or the defaults (no server 2, mode 0, the firmware's office numbers) when it is
+ * blank or damaged */
+void flash_nvram_get_remote(remote_settings_t *out)
+{
+    const remote_settings_t *r = (const remote_settings_t *)REMOTE_PAGE_ADDR;
+    if (r->magic == REMOTE_MAGIC && r->crc == remote_crc(r)) {
+        memcpy(out, r, sizeof(*out));
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->magic = REMOTE_MAGIC;
+    out->server_mode = 0;
+    static const char *const defaults[] = { SMS_OFFICE_NUMBERS };
+    for (size_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]) && i < REMOTE_MAX_NUMBERS; i++) {
+        strncpy(out->numbers[i], defaults[i], sizeof(out->numbers[i]) - 1);
+    }
+}
+
+bool flash_nvram_set_remote(const remote_settings_t *in)
+{
+    static remote_settings_t page __attribute__((aligned(4)));
+    memcpy(&page, in, sizeof(page));
+    page.magic = REMOTE_MAGIC;
+    page.crc = remote_crc(&page);
+    return iap_write_remote_page(&page);
 }

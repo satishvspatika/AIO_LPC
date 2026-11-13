@@ -26,8 +26,6 @@ typedef struct {
     char gprs_power_flag;      /* GPRS rail flag ('Y'/'N' or 'G'/'g') */
     char usb_power_flag;       /* 5V LCD rail flag ('U' = ON, 'u' = OFF) */
     char lpc845_ver;           /* Coprocessor firmware version */
-    float solar_volt;          /* Solar panel voltage (V) */
-    char solar_status;         /* 'C' = Charging, 'S' = Standby */
     bool is_valid;             /* Frame validity */
 } telemetry_data_t;
 

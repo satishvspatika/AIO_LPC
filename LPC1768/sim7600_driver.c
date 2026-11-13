@@ -5,6 +5,8 @@
 #include "flash_nvram.h"
 #include "flash_log.h"
 #include "intermcu_protocol.h"
+#include "sms_cmd.h"
+#include "fw_app.h"
 #include "telemetry_formatter.h"
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
@@ -372,8 +374,19 @@ static long clock_drift_limit(bool rejected)
     return rejected ? CLOCK_DRIFT_LIMIT_REJECTED_SEC : CLOCK_DRIFT_LIMIT_SEC;
 }
 
+static bool s_server_clock_sync = true;
+
+/* Off while server 2 gets its copy in mode 2: only server 1, the reference, sets the clock */
+void sim7600_set_server_clock_sync(bool on)
+{
+    s_server_clock_sync = on;
+}
+
 static void sync_clock_from_server(const char *http_response, bool rejected)
 {
+    if (!s_server_clock_sync) {
+        return;
+    }
     char server_ts[16];
     telemetry_data_t t;
     char msg[72];
@@ -2444,9 +2457,18 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
     return send_sms_to_number(sanitized, message);
 }
 
+/* kind 'F': SEND STATUS SMS from the keypad, to the status number. 'C': an office query by SMS,
+ * answered to the sender (as the ESP32's STATUS-F / STATUS-C) */
+static bool status_sms(const telemetry_data_t *telem, int csq_dbm, char kind, const char *dest_phone);
+
 bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
 {
-    if (!telem) return false;
+    return status_sms(telem, csq_dbm, 'F', STATUS_SMS_DEST_NUMBER);
+}
+
+static bool status_sms(const telemetry_data_t *telem, int csq_dbm, char kind, const char *dest_phone)
+{
+    if (!telem || !dest_phone) return false;
 
     s_cancel_requested = false;
     report_progress("STARTING SMS... ");
@@ -2474,7 +2496,7 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     report_progress("READING CSQ...  ");
     clear_rx();
     send_raw("AT+CSQ\r\n");
-    char csq_cap[64];
+    static char csq_cap[64];   /* Statics here: only ever run holding the modem, one at a time */
     if (wait_response("+CSQ:", 1000, csq_cap, sizeof(csq_cap))) {
         int csq = 99, ber = 99;
         char *p = strstr(csq_cap, "+CSQ: ");
@@ -2491,7 +2513,6 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     report_progress(csq_step);
     delay_ms(500);
 
-    const char *dest_phone = STATUS_SMS_DEST_NUMBER;
     const char *network_name = STATUS_SMS_NETWORK_NAME;
     const char *stn_type = (UNIT_CFG == KSNDMC_TWS) ? "TWS" : "TRG";
     const char *stn_id = flash_nvram_get_station_id();
@@ -2501,7 +2522,8 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     }
 
     /* Format timestamp in ISO: YYYY-MM-DDTHH:MM */
-    char time_iso[24] = "2026-01-01T00:00";
+    static char time_iso[24];
+    strcpy(time_iso, "2026-01-01T00:00");
     if (strlen(telem->present_time) >= 12) {
         snprintf(time_iso, sizeof(time_iso), "%.4s-%.2s-%.2sT%.2s:%.2s",
                  telem->present_time, telem->present_time + 4, telem->present_time + 6,
@@ -2509,13 +2531,15 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     }
 
     /* ESP32 flow: the last field is the last record the server got, not the slot in progress */
-    char slot_iso[24] = "0000-00-00T00:00";
+    static char slot_iso[24];
+    strcpy(slot_iso, "0000-00-00T00:00");
     const char *ll = flash_nvram_get_last_logged(); /* "DD-MM-YYYY HH:MM" */
     if (strlen(ll) >= 16 && ll[2] == '-' && ll[5] == '-') {
         snprintf(slot_iso, sizeof(slot_iso), "%.4s-%.2s-%.2sT%.5s", ll + 6, ll + 3, ll, ll + 11);
     }
 
-    char calib_date[12] = "0000-00-00";
+    static char calib_date[12];
+    strcpy(calib_date, "0000-00-00");
     #if (UNIT_CFG == KSNDMC_TWS)
     /* TWS has no rain gauge, so field calibration doesn't apply */
     const char *calib_status = "CLB-NA";
@@ -2533,20 +2557,21 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
     /* Exact ESP32 format:
      * <NETWORK>,<STATION_TYPE>,STATUS-F,<STATION_ID>,<YYYY-MM-DDTHH:MM>,<UNIT_VER>,15,<CSQ_DBM>,<BAT1>,<BAT2>,<SOLAR_CHARGING>,<SD_STATUS>,<CALIB_STATUS>,<CALIB_DATE>,<LAST_REC_DATE_TIME>,0\r\n
      */
-    char status_msg[256];
+    static char status_msg[256];   /* Static: also runs from the slot, on the main task's stack */
     char bat_str[8];
     fmt_fixed(bat_str, sizeof(bat_str), telem->bat1_volt, 4, 1);
     snprintf(status_msg, sizeof(status_msg),
-        "%s,%s,STATUS-F,%s,%s,%s,15,%04d,%s,%s,%c,%s,%s,%s,%s,0\r\n",
+        "%s,%s,STATUS-%c,%s,%s,%s,15,%04d,%s,%s,%c,%s,%s,%s,%s,0\r\n",
         network_name,
         stn_type,
+        kind,
         stn_id,
         time_iso,
         FIRMWARE_VERSION,
         csq_dbm,
         bat_str, /* The server shows only this first battery field, so it carries the real voltage */
         bat_str,
-        (telem->solar_status == 'C' || telem->solar_volt > 4.0f) ? 'Y' : 'N',
+        'N',    /* SOLAR_CHARGING: kept for the format, solar taken off (user, 2026-11-13) */
         sd_status,
         calib_status,
         calib_date,
@@ -2567,8 +2592,8 @@ bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm)
 
 /* GPS SMS, as the ESP32's SEND GPS (gprs_health.ino get_lat_long_date_time):
  *   <NETWORK>,<STATION_TYPE>,STAT_AD-<F|C>,<STATION_ID>,<YYYY-MM-DDTHH:MM>,SIM_1,<CSQ_DBM>,<LAT>,<LON>,0.0
- * F = asked from the keypad, C = asked by SMS. The position is the saved one (the GPS job saves a new
- * fix first); none saved yet sends 0.000000 as the ESP32 does. The modem must be on. */
+ * F = asked from the field (keypad), C = asked from the console/office by SMS. The position sent is always
+ * the saved one (a search saves its fix first); none saved yet sends 0.000000 as the ESP32 does. The modem must be on. */
 static void fmt_udeg(char *out, size_t size, int32_t udeg)
 {
     uint32_t a = (udeg < 0) ? (uint32_t)(-(int64_t)udeg) : (uint32_t)udeg;
@@ -2616,6 +2641,250 @@ const char *sim7600_build_gps_sms(char kind, const char *present_time)
     return msg;
 }
 
+/* ---- SMS commands (v6.9.41, sms_cmd.c) ---- */
+#define SMS_INBOX_MAX 4
+typedef struct {
+    char from[24];
+    char body[168];
+} sms_in_t;
+static sms_in_t s_inbox[SMS_INBOX_MAX];     /* Static: runs in the slot, on the main task's stack */
+static char s_sms_reply[160];
+
+/* Unread messages out of an AT+CMGL list: +CMGL: <i>,"REC UNREAD","<from>","","<time>"\r\n<body>\r\n */
+static int split_inbox(const char *list)
+{
+    int n = 0;
+    const char *p = strstr(list, "+CMGL: ");
+    while (p && n < SMS_INBOX_MAX) {
+        sms_in_t *m = &s_inbox[n];
+        m->from[0] = m->body[0] = '\0';
+        const char *line_end = strstr(p, "\r\n");
+        if (!line_end) {
+            break;
+        }
+        /* Sender: the third quoted field (after "REC UNREAD") */
+        const char *q = p;
+        for (int i = 0; i < 1 && q && q < line_end; i++) {   /* Past "REC UNREAD" */
+            q = strchr(q, '"');
+            q = q ? strchr(q + 1, '"') : NULL;
+            q = q ? q + 1 : NULL;
+        }
+        q = q ? strchr(q, '"') : NULL;
+        if (q && q < line_end) {
+            const char *e = strchr(q + 1, '"');
+            if (e && e < line_end && (size_t)(e - q - 1) < sizeof(m->from)) {
+                memcpy(m->from, q + 1, (size_t)(e - q - 1));
+                m->from[e - q - 1] = '\0';
+            }
+        }
+        const char *body = line_end + 2;
+        const char *next = strstr(body, "+CMGL: ");
+        const char *stop = next ? next : body + strlen(body);
+        const char *ok = strstr(body, "\r\nOK");
+        if (ok && ok < stop) {
+            stop = ok;
+        }
+        size_t len = (size_t)(stop - body);
+        if (len >= sizeof(m->body)) {
+            len = sizeof(m->body) - 1;
+        }
+        memcpy(m->body, body, len);
+        m->body[len] = '\0';
+        n++;
+        p = next;
+    }
+    return n;
+}
+
+static bool sender_is_office(const char *from, const remote_settings_t *r)
+{
+    for (int i = 0; i < REMOTE_MAX_NUMBERS; i++) {
+        if (r->numbers[i][0] && sms_number_same(from, r->numbers[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int office_count(const remote_settings_t *r)
+{
+    int c = 0;
+    for (int i = 0; i < REMOTE_MAX_NUMBERS; i++) {
+        c += (r->numbers[i][0] != '\0');
+    }
+    return c;
+}
+
+static void reply(const char *to, const char *text)
+{
+    storage_log_debug("SMS", text);
+    sim7600_send_sms(to, text);
+}
+
+/* One command from one sender. The reply goes to the sender, starting with the station ID. */
+static void sms_run(const sms_in_t *m, const telemetry_data_t *telemetry)
+{
+    static char arg[96];
+    static remote_settings_t r;
+    sms_cmd_t cmd = sms_cmd_parse(m->body, arg, sizeof(arg));
+    if (cmd == SMS_CMD_NONE) {
+        return;
+    }
+    char from10[11];
+    if (!sms_number_last10(m->from, from10)) {
+        storage_log_debug("SMS", "Command from a sender that is not a phone number: ignored");
+        return;
+    }
+    const char *stn = flash_nvram_get_station_id();
+    char *out = s_sms_reply;
+    const size_t osz = sizeof(s_sms_reply);
+    flash_nvram_get_remote(&r);
+
+    if (sms_cmd_needs_office(cmd) && !sender_is_office(m->from, &r)) {
+        snprintf(out, osz, "STN %s: NOT ALLOWED from %s (office numbers only)", stn, from10);
+        storage_log_debug("ERROR", "SMS command refused: sender is not an office number");
+        reply(m->from, out);
+        return;
+    }
+
+    switch (cmd) {
+    case SMS_CMD_GET_STATUS:
+        status_sms(telemetry, s_modem_status.csq_dbm, 'C', m->from);
+        return;
+    case SMS_CMD_GET_GPS:
+        sim7600_send_sms(m->from, sim7600_build_gps_sms('C', telemetry->present_time));
+        return;
+    case SMS_CMD_GET_CONFIG: {
+        const char *v845 = fw_app_845_version();
+        static char s2[64];
+        strcpy(s2, "NONE");
+        if (r.s2_host[0]) {
+            snprintf(s2, sizeof(s2), "%.40s:%u", r.s2_host, (unsigned)r.s2_port);
+        }
+        snprintf(out, osz, "STN %s %s MAIN %s CTRL %s MODE %u S2 %s%.40s NUMS %d",
+                 stn, (UNIT_CFG == KSNDMC_TRG) ? "KSNDMC_TRG" : (UNIT_CFG == BIHAR_TRG) ? "BIHAR_TRG" : "KSNDMC_TWS",
+                 FIRMWARE_VERSION, (v845 && v845[0]) ? v845 : "----", (unsigned)r.server_mode, s2,
+                 r.s2_host[0] ? r.s2_path : "", office_count(&r));
+        break;
+    }
+    case SMS_CMD_GET_NUM: {
+        int len = snprintf(out, osz, "STN %s OFFICE NUMBERS:", stn);
+        for (int i = 0; i < REMOTE_MAX_NUMBERS && len > 0 && (size_t)len < osz; i++) {
+            if (r.numbers[i][0]) {
+                len += snprintf(out + len, osz - (size_t)len, " %s", r.numbers[i]);
+            }
+        }
+        break;
+    }
+    case SMS_CMD_SET_TIME: {
+        /* As the server's clock correction: the time only, the rain-day total is kept */
+        char ts[15];
+        if (sms_parse_time(arg, ts) && intermcu_ts14_believable(ts)) {
+            hal_power_sync_rtc(ts);
+            intermcu_update_time(ts);
+            snprintf(out, osz, "STN %s TIME SET %.14s", stn, ts);
+        } else {
+            snprintf(out, osz, "STN %s TIME NOT SET: use SET_TIME YYYYMMDDHHMMSS", stn);
+        }
+        break;
+    }
+    case SMS_CMD_SET_STN_ID: {
+        char id[12];
+        char old[12];
+        snprintf(old, sizeof(old), "%s", stn);
+        if (!sms_parse_station_id(arg, STATION_ID_DIGITS, id, sizeof(id))) {
+            snprintf(out, osz, "STN %s ID NOT SET: 1 to %d digits, not all 0", stn, STATION_ID_DIGITS);
+        } else if (flash_nvram_set_station_id(id)) {
+            snprintf(out, osz, "STN %s ID SET: %s -> %s", id, old, id);
+        } else {
+            snprintf(out, osz, "STN %s ID NOT SET: flash write failed", stn);
+        }
+        break;
+    }
+    case SMS_CMD_SET_SERVER_2: {
+        bool off = false;
+        uint16_t port = 0;      /* Not &r.s2_port: a packed field may be unaligned */
+        bool parsed = sms_parse_server2(arg, r.s2_host, sizeof(r.s2_host), &port, r.s2_path, sizeof(r.s2_path),
+                                        r.s2_key, sizeof(r.s2_key), &off);
+        r.s2_port = port;
+        if (!parsed) {
+            snprintf(out, osz, "STN %s SERVER 2 NOT SET: host=..;port=..;path=/..;key=.. or OFF", stn);
+            break;
+        }
+        if (off) {
+            r.server_mode = 0;      /* Nothing to send to */
+        }
+        if (flash_nvram_set_remote(&r)) {
+            if (off) {
+                snprintf(out, osz, "STN %s SERVER 2 OFF, MODE 0", stn);
+            } else {
+                snprintf(out, osz, "STN %s SERVER 2 SET %.40s:%u%.40s MODE %u", stn, r.s2_host, (unsigned)r.s2_port, r.s2_path, (unsigned)r.server_mode);
+            }
+        } else {
+            snprintf(out, osz, "STN %s SERVER 2 NOT SET: flash write failed", stn);
+        }
+        break;
+    }
+    case SMS_CMD_SET_SERVER_MODE: {
+        int mode = (arg[0] >= '0' && arg[0] <= '2' && arg[1] == '\0') ? arg[0] - '0' : -1;
+        if (mode < 0) {
+            snprintf(out, osz, "STN %s MODE NOT SET: 0 server 1, 1 server 2, 2 both", stn);
+        } else if (mode > 0 && !r.s2_host[0]) {
+            snprintf(out, osz, "STN %s MODE NOT SET: set SERVER_2 first", stn);
+        } else {
+            r.server_mode = (uint8_t)mode;
+            snprintf(out, osz, flash_nvram_set_remote(&r) ? "STN %s MODE %d SET" : "STN %s MODE NOT SET: flash write failed", stn, mode);
+        }
+        break;
+    }
+    case SMS_CMD_ADD_NUM:
+    case SMS_CMD_DEL_NUM: {
+        char num[11];
+        if (!sms_number_last10(arg, num)) {
+            snprintf(out, osz, "STN %s NUMBER NOT CHANGED: give 10 digits", stn);
+            break;
+        }
+        int at = -1, free_at = -1;
+        for (int i = 0; i < REMOTE_MAX_NUMBERS; i++) {
+            if (r.numbers[i][0] && strcmp(r.numbers[i], num) == 0) at = i;
+            if (!r.numbers[i][0] && free_at < 0) free_at = i;
+        }
+        if (cmd == SMS_CMD_ADD_NUM) {
+            if (at >= 0) {
+                snprintf(out, osz, "STN %s %s ALREADY AN OFFICE NUMBER", stn, num);
+                break;
+            }
+            if (free_at < 0) {
+                snprintf(out, osz, "STN %s LIST FULL (%d): DEL_NUM one first", stn, REMOTE_MAX_NUMBERS);
+                break;
+            }
+            strcpy(r.numbers[free_at], num);
+        } else {
+            if (at < 0) {
+                snprintf(out, osz, "STN %s %s IS NOT IN THE LIST", stn, num);
+                break;
+            }
+            if (office_count(&r) <= 1) {
+                snprintf(out, osz, "STN %s LAST OFFICE NUMBER: ADD_NUM another first", stn);
+                break;
+            }
+            memset(r.numbers[at], 0, sizeof(r.numbers[at]));
+        }
+        const char *what = (cmd == SMS_CMD_ADD_NUM) ? "ADDED" : "REMOVED";
+        if (flash_nvram_set_remote(&r)) {
+            snprintf(out, osz, "STN %s %s %s, %d OFFICE NUMBERS", stn, num, what, office_count(&r));
+        } else {
+            snprintf(out, osz, "STN %s %s NOT %s: flash write failed", stn, num, what);
+        }
+        break;
+    }
+    default:
+        snprintf(out, osz, "STN %s UNKNOWN COMMAND. VARSHA GET_STATUS GET_GPS GET_CONFIG SET_TIME SET_STN_ID SET_SERVER_2 SET_SERVER_MODE ADD_NUM DEL_NUM GET_NUM", stn);
+        break;
+    }
+    reply(m->from, out);
+}
+
 void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
 {
     /* Polled every few seconds with the LCD on: wait for the end of the list, and log only a message */
@@ -2624,79 +2893,19 @@ void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
     send_raw("AT+CMGL=\"REC UNREAD\"\r\n");
     bool listed = wait_response("OK", 2000, s_sms_capture, sizeof(s_sms_capture));
     s_log_quiet = false;
-    if (listed && strstr(s_sms_capture, "+CMGL: ") != NULL) {
-        storage_log_debug("SMS", s_sms_capture);
-        char sender_phone[32] = "";
-        char *p = strstr(s_sms_capture, "+CMGL: ");
-        if (p) {
-            /* Extract sender number */
-            char *num_start = strchr(p, '\"');
-            if (num_start) {
-                num_start = strchr(num_start + 1, '\"');
-                if (num_start) {
-                    num_start = strchr(num_start + 1, '\"');
-                    if (num_start) {
-                        char *num_end = strchr(num_start + 1, '\"');
-                        if (num_end) {
-                            size_t nlen = num_end - (num_start + 1);
-                            if (nlen < sizeof(sender_phone)) {
-                                strncpy(sender_phone, num_start + 1, nlen);
-                                sender_phone[nlen] = '\0';
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if (!listed || strstr(s_sms_capture, "+CMGL: ") == NULL) {
+        return;
+    }
+    storage_log_debug("SMS", s_sms_capture);
+    /* Copied out first: the replies reuse the capture buffer. Each message has its own sender. */
+    int n = split_inbox(s_sms_capture);
 
-        if (strstr(s_sms_capture, "#STATUS") || strstr(s_sms_capture, "#STAT")) {
-            char reply[160];
-            char s_bat[8], s_rf15[8], s_cum[8];
-            fmt_fixed(s_bat, sizeof(s_bat), telemetry->bat1_volt, 4, 2);
-            fmt_fixed(s_rf15, sizeof(s_rf15), telemetry->rf_15m_mm, 4, 1);
-            fmt_fixed(s_cum, sizeof(s_cum), telemetry->rf_cum_mm, 4, 1);
-            snprintf(reply, sizeof(reply),
-                "AIO STN:%s\nTIME:%s\nBAT:%sV\nSIG:%ddBm\nRAIN 15M:%smm\nCUM:%smm\nLAST:%s",
-                flash_nvram_get_station_id(), telemetry->present_time, s_bat,
-                s_modem_status.csq_dbm, s_rf15, s_cum, flash_nvram_get_last_logged());
+    /* Deleted before acting: a reset part way through can't run a command twice */
+    send_raw("AT+CMGD=1,4\r\n");
+    wait_response("OK", 1000, NULL, 0);
 
-            const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
-            sim7600_send_sms(target, reply);
-        } else if (strstr(s_sms_capture, "#GPS") || strstr(s_sms_capture, "GET_GPS")) {
-            /* Old 1768 GET_GPS / ESP32 SEND GPS by SMS: the saved position, at once (a fresh fix can
-             * take minutes; MENU > SEND GPS SMS gets one first) */
-            const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
-            sim7600_send_sms(target, sim7600_build_gps_sms('C', telemetry->present_time));
-        } else if (strstr(s_sms_capture, "#TIME=") || strstr(s_sms_capture, "#SET_TIME=")) {
-            /* Operator manual time set: #TIME=YYYYMMDDHHMMSS */
-            char *tp = strstr(s_sms_capture, "#TIME=");
-            if (!tp) tp = strstr(s_sms_capture, "#SET_TIME=");
-            if (tp) {
-                tp = strchr(tp, '=');
-                if (tp && strlen(tp + 1) >= 14) {
-                    char ts[16];
-                    char reply[80];
-                    strncpy(ts, tp + 1, 14);
-                    ts[14] = '\0';
-                    if (intermcu_ts14_believable(ts)) {
-                        hal_power_sync_rtc(ts);
-                        intermcu_update_time(ts);
-                        snprintf(reply, sizeof(reply), "Clock set by SMS #TIME= to %s", ts);  /* Buffer reused: modem stack */
-                        storage_log_debug("RTC", reply);
-                        snprintf(reply, sizeof(reply), "AIO STN:%s\nRTC SET OK: %.14s", flash_nvram_get_station_id(), ts);
-                    } else {
-                        /* The LPC845 takes whatever it is sent: a mistyped SMS must not reach it */
-                        storage_log_debug("ERROR", "SMS #TIME= refused: not a valid YYYYMMDDHHMMSS");
-                        snprintf(reply, sizeof(reply), "AIO STN:%s\nRTC NOT SET: use #TIME=YYYYMMDDHHMMSS", flash_nvram_get_station_id());
-                    }
-                    const char *target = (strlen(sender_phone) > 5) ? sender_phone : STATUS_SMS_DEST_NUMBER;
-                    sim7600_send_sms(target, reply);
-                }
-            }
-        }
-
-        /* Delete processed read SMS */
-        send_raw("AT+CMGD=1,4\r\n");
-        wait_response("OK", 1000, NULL, 0);
+    for (int i = 0; i < n; i++) {
+        hal_power_heartbeat();
+        sms_run(&s_inbox[i], telemetry);
     }
 }

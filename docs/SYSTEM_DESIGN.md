@@ -129,7 +129,7 @@ source by `build.sh` at `-O1`, the same level as the old prebuilt library. The p
 | 0x09000 | 9-11 | 12 KB | **Error log**: 48 pages of 256 B, a fixed ring |
 | 0x0C000 | 12-15 | 16 KB | Firmware update journal |
 | 0x10000 | 16 | 32 KB | Swap scratch |
-| 0x18000 | 17-20 | 128 KB | **Application (slot A)**. v6.9.13 uses 119,160 B (BIHAR_TRG), 119,332 B (KSNDMC_TRG), 118,108 B (KSNDMC_TWS); about 12 KB free |
+| 0x18000 | 17-20 | 128 KB | **Application (slot A)**. v6.9.41: built with `-Os` (was `-O2`, which reached 128.6 KB with SMS commands): 110.4-110.9 KB, about 20 KB free for OTA and the health report. v6.9.13 uses 119,160 B (BIHAR_TRG), 119,332 B (KSNDMC_TRG), 118,108 B (KSNDMC_TWS); about 12 KB free |
 | 0x38000 | 21-24 | 128 KB | Staging (slot B) for a new image |
 | 0x58000 | 25-29 | 160 KB | **Record log**: 640 pages of 256 B, about 6.5 days of records |
 
@@ -279,12 +279,16 @@ while the LCD is on runs normally and is marked `OPERATOR` in `SLOTS.CSV`.
 
 ### 7.3 Screens and menu (v6.9.6 onward)
 
-Scroll (read-only; EN does nothing): Station ID landing page, date/time, rainfall (TRG) or temp/humidity and wind plus
-solar (TWS), battery, signal, location, last logged, backlog, field calibration result (TRG), and **POWER SAVE**,
+Scroll (read-only; EN does nothing): Station ID landing page, date/time, rainfall (TRG) or temp/humidity and wind
+(TWS), battery, signal, location, last logged, backlog, field calibration result (TRG), and **POWER SAVE**,
 which is one UP from the landing page (EN there powers off).
 
-MENU (actions): SEND STATUS SMS, GPS UPDATE, KEY TEST, ERASE DATA, FIRMWARE UPDATE, SET STATION ID. BACK from an
-action returns to MENU. The CALIB key starts calibration directly on TRG. DSP opens the power save prompt. SEND HEALTH
+MENU (actions): SEND STATUS SMS, SEND GPS SMS, KEY TEST, ERASE DATA, FIRMWARE UPDATE, SET DATE/TIME, SET STATION ID.
+BACK from an action returns to MENU. SEND GPS SMS (v6.9.40, was GPS UPDATE + SEND GPS SMS): with no saved position it
+searches, saves and sends; with one it asks `SEND SAVED GPS?` / `EN=SEND UP=NEW`: EN sends the saved position at
+once, UP searches first. Keypad sends are STAT_AD-F (from the field); SMS queries are answered STAT_AD-C (console/office). GPS needs only the modem on, so it works with no network (the SMS
+then reports NO NETWORK). Solar voltage is off the LCD and its calculation removed (v6.9.40); the status SMS keeps its
+SOLAR_CHARGING field as N for the format. The CALIB key starts calibration directly on TRG. DSP opens the power save prompt. SEND HEALTH
 will go second in the menu when built. `TEST SEND` is switched off (`ENABLE_TEST_SEND 0`).
 
 Landing page (v6.9.32, all three types): config name centred on line 1, station ID centred on line 2 (`ID: 1923` for
@@ -309,6 +313,28 @@ never changed and no slot wake came. Since v1.5:
 - Safety net: if the time is invalid (year < 24) or unread for 60 s with the LPC1768 off, the LPC845 wakes it after
   15 minutes (`bad_clock_wakes`) so it can take tower or server time.
 Jams come only while the unit is awake, about 1-7 per slot on 1922 (the modem is the likely source); none seen asleep.
+
+### 7.4b SMS commands (v6.9.41)
+
+`VARSHA <CMD> [value]` (as the ESP32 fleet, any case, `=` optional) or the older `#CMD[=value]`. Parsed in
+`sms_cmd.c` (host test `tests/sms_cmd_test.c`), run in `sim7600_check_incoming_sms()` after each slot's send. Every
+unread message is taken with its own sender (up to 4 per slot), deleted, then run; replies go to the sender and start
+`STN <id>`. A sender that isn't a phone number (operator adverts) gets nothing.
+
+| Command | Who | Does |
+|---|---|---|
+| `GET_STATUS` (`#STATUS`, `#STAT`) | anyone | ESP32 status SMS, `STATUS-C`, to the sender |
+| `GET_GPS` (`#GPS`) | anyone | saved position, `STAT_AD-C`, to the sender |
+| `GET_CONFIG` | anyone | ID, type, MAIN and CTRL versions, server mode, server 2, number of office numbers |
+| `SET_TIME YYYYMMDDHHMMSS` (`#TIME=`) | office | sets the clock as the server correction does (rain-day total kept) |
+| `SET_STN_ID <1-6 or 1-8 digits>` | office | zero-padded to the type's length, saved to flash |
+| `SET_SERVER_2 host=..;port=..;path=/..;key=..` / `OFF` | office | server 2 (key optional: replaces the payload key for server 2) |
+| `SET_SERVER_MODE 0/1/2` | office | 0 server 1 only, 1 server 2 only (live + backlog), 2 both (server 2 gets one copy of the live record, no backlog, its clock not used) |
+| `ADD_NUM` / `DEL_NUM <number>`, `GET_NUM` | office | office number list (up to 5, last 10 digits; the last one can't be removed) |
+
+Office numbers start as `SMS_OFFICE_NUMBERS` (user_config.h, = the status SMS number) and live, with server 2 and the
+mode, in the settings sector's second page 0x1100 (`remote_settings_t`, CRC; blank or damaged = defaults). Every
+settings write now writes both pages (512 bytes), so neither can erase the other.
 
 ### 7.5 Firmware update from the SD card
 
@@ -516,6 +542,7 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | CTRL v1.11, built 2026-11-12 | Software clock fallback. Bench: an old CTRL board put on by the ROM loader route kept its time frozen at every set (RTC not running), so no slot boundary would ever come. Now: RTC silent for 3 s (RTC_FAULT_NO_ANSWER) or its seconds still after two restarts (RTC_FAULT_STUCK) -> Present_Date_Time moved on from the 1 s SysTick count (soft_clock_100ms, clock_add_second with Next_Date carries); Get_Time stops copying the RTC; $S still sets the time; RTC restarts limited to once a minute; RTC taken back, with the software time written into it, after 10 second-changes in a row; safety-net wake only with no valid time at all. Clock state in bits 8-9 of the reset-status field (0 RTC, 1 silent, 2 stuck): the frame keeps exactly 27 commas. (First build added a 28th field: every LPC1768 firmware's frame_checksum_ok drops a frame with any other comma count, so on the bench all readings went to 0, the CTRL version stayed blank and the new main firmware couldn't confirm itself; bench/frame_compat_test.py now builds a frame from the real CTRL sprintf and checks it with the real LPC1768 check, and fails on that build.) Software time kept across CTRL restarts that keep RAM (update, watchdog) in .noinit with a check value, not across POR, BOD or reset pin; restored with its fault state. FRO-based (about +-1%): up to about 9 s per slot, corrected by the server past 90 s. Host simulation of the real functions: healthy, halted at power-on, frozen (fault at 6 s, clock within 1 s over 30 min, 1 restart/min), silent, frozen-then-healthy and silent-then-answers all as designed; leap-day/month/year carries. Code 20.5 KB of 24 KB (+444 B), RAM +28 B, CTRL bootloader binary unchanged. Host tests pass | Built; bench test on the old CTRL board next |
 | v6.9.36 + MIG-1.6, built 2026-11-12 | Main chip for CTRL v1.11: clock state from bits 8-9 of frame field 24 (reset status), reset bits kept as the low byte; DATE/TIME screen shows `HH:MM:SS RTC BAD` while the CTRL keeps the time itself; once per boot in a slot an ERROR line (same text, so the error log counts repeats). Review fix: clock_set_by_hand changed the clock and the scheduler's last slot in separate steps, so the main loop could pair the new time with the old last slot (a slot at once) or the reverse; now both change under s_sched_lock, which the main loop also holds while it reads the clock and decides (released before run_slot and before sleeping). LOCATION screen: a GPS result shows for 3 s, then LAT/LON again (user). MIG-1.6 = MIG-1.5 with CTRL v1.11 built in. All three configs build (largest 121.6 KB), host and update tests pass, stacks unchanged (main 920 B spare) | Built; card not yet updated |
 | v6.9.37, built 2026-11-12 | TESTING build: `TESTING_DEBUG_LOG 1` in user_config.h turns the SD debug log on by default with PRODUCTION_BUILD 1 (KEY TEST hidden, no -DDEBUG), so every test unit logs to its own card; build.sh says TESTING build. Set it to 0 for the production release (user: log on until testing is signed off). SEND GPS SMS (from the ESP32's SEND GPS and the old 1768 GET_GPS): MENU > SEND GPS SMS runs the GPS UPDATE job, then sends `<NETWORK>,<TRG|TWS>,STAT_AD-F,<ID without leading zeros>,<YYYY-MM-DDTHH:MM>,SIM_1,<CSQ_DBM>,<LAT>,<LON>,0.0` to STATUS_SMS_DEST_NUMBER with the fresh fix or the saved position (0.000000 if none, as the ESP32); an incoming SMS with #GPS or GET_GPS gets the same with STAT_AD-C and the saved position, to the sender. sim7600_build_gps_sms() only builds (static buffers); callers send with sim7600_send_sms() at their own level, so the modem task keeps its 360 B spare. All three configs build, host tests pass | Built; not on a unit yet |
+| v6.9.38-v6.9.40 + CTRL v1.12/v1.13 + MIG-1.7/1.8, 2026-11-13 | v6.9.38 (released, tag v6.9.38): TWS slot with temp or humidity 0 never stored or sent; a re-run slot resends its stored copy; error log once a day per message; software-clock units corrected at 15 s. CTRL v1.12: no time after a cold start until the RTC is seen ticking (dead RTC's frozen time withheld). v6.9.39 + CTRL v1.13: CTRL reads T/H at start; TWS slot uses CTRL live readings after a CTRL restart; GPS time when no clock and no network; daily error match fixed for lines cut at 96 chars. v6.9.40: solar voltage off; one SEND GPS SMS item (saved position, UP for a new search); SET DATE/TIME before SET STATION ID | v6.9.38 on 001903: power-switch test passed (stuck RTC time withheld, network time at +15 s, 10:45 slot real values) |
 | v6.9.12 + 845-v1.5 | BIHAR 1923 off 19:00 to 09:00, both installed by SD at power-up | Pass: 19:15-08:30 sent as -110 with CUM 10, 08:45 as -112 with CUM 0, live from 09:00, backlog done in 4 slots (15 a slot); 845 UPDATE OK |
 
 ### Not tested yet

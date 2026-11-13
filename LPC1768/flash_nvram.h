@@ -27,6 +27,27 @@ typedef struct __attribute__((packed)) {
 } station_nvram_params_t;
 _Static_assert(sizeof(station_nvram_params_t) == 256, "settings sector layout must be 256 bytes");
 
+/* Remote settings (v6.9.41): the second page of the settings sector, set by SMS from office numbers.
+ * Nothing used 0x1100-0x1FFF before (MIG checks it blank after its own erase). */
+#define REMOTE_PAGE_ADDR    0x00001100
+#define REMOTE_MAGIC        0x31464352UL    /* 'RCF1' */
+#define REMOTE_MAX_NUMBERS  5
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t server_mode;        /* 0 server 1 only, 1 server 2 only, 2 both (server 2 gets the live record) */
+    uint8_t reserved0;
+    uint16_t s2_port;
+    char s2_host[48];           /* Name or IP; empty: no server 2 */
+    char s2_path[64];
+    char s2_key[20];            /* Replaces the payload's key for server 2; empty: same key */
+    char numbers[REMOTE_MAX_NUMBERS][11];   /* Office numbers, last 10 digits; empty slots "" */
+    uint8_t reserved[57];
+    uint32_t crc;
+} remote_settings_t;
+_Static_assert(sizeof(remote_settings_t) == 256, "remote settings must be one 256-byte page");
+void flash_nvram_get_remote(remote_settings_t *out);
+bool flash_nvram_set_remote(const remote_settings_t *in);
+
 void flash_nvram_init(void);
 /* What flash_nvram_init found, to log once the card is up */
 typedef enum {

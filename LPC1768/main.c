@@ -12,6 +12,7 @@
 #include "errlog.h"
 #include "flash_nvram.h"
 #include "flash_log.h"
+#include "sms_cmd.h"
 #include "user_config.h"
 #include "lpc17xx_uart.h"
 #include <stdio.h>
@@ -477,9 +478,64 @@ static void __attribute__((noinline)) gps_auto_step(const telemetry_data_t *tele
  * a repeat could duplicate it), a lost network or a used-up slot. 2G sometimes fails one socket
  * open straight after another and takes the next (1922, 2026-11-09): one failure used to leave
  * the rest of the backlog to the next slot. */
+/* Server 2 (v6.9.41, set by SMS): mode 0 server 1 only, 1 server 2 only (live and backlog), 2 both
+ * (server 2 gets one copy of the live record; the backlog stays with server 1, so a dead server 2
+ * never holds anything up). Same payload; its key replaced when server 2 has its own. */
+static http_endpoint_t s_server2;
+static remote_settings_t s_remote;
+static char s_keyed_payload[512];
+static char s_server2_copy[400];
+
+static const http_endpoint_t *slot_endpoint(void)
+{
+    const http_endpoint_t *base = telemetry_get_endpoint(UNIT_CFG);
+    flash_nvram_get_remote(&s_remote);
+    s_server2 = *base;
+    s_server2.domain = s_remote.s2_host;
+    s_server2.ip = s_remote.s2_host;
+    s_server2.path = s_remote.s2_path;
+    s_server2.port = s_remote.s2_port ? s_remote.s2_port : 80;
+    if (s_remote.s2_key[0]) {
+        s_server2.api_key = s_remote.s2_key;
+    }
+    if (s_remote.server_mode == 1 && s_remote.s2_host[0]) {
+        storage_log_debug("HTTP", "Server mode 1: sending to server 2 only");
+        return &s_server2;
+    }
+    return base;
+}
+
+static bool post_to(const http_endpoint_t *endpoint, const char *payload, int route)
+{
+    if (endpoint == &s_server2 && s_remote.s2_key[0] &&
+        sms_payload_with_key(payload, s_remote.s2_key, s_keyed_payload, sizeof(s_keyed_payload))) {
+        payload = s_keyed_payload;
+    }
+    return sim7600_http_post_once(endpoint, payload, route);
+}
+
+/* Mode 2: one copy of this slot's record to server 2, after everything for server 1. Its clock isn't
+ * used (server 1 is the reference), and its result changes nothing for server 1's records. */
+static void __attribute__((noinline)) copy_to_server2(portTickType budget_end)
+{
+    if (s_remote.server_mode != 2 || !s_remote.s2_host[0] || !s_server2_copy[0]) {
+        return;
+    }
+    if ((long)(budget_end - xTaskGetTickCount()) <= 0 || !sim7600_still_registered()) {
+        storage_log_debug("HTTP", "Server 2 copy skipped: no time or network left");
+        return;
+    }
+    vTaskDelay(3000 / portTICK_RATE_MS);    /* Carrier NAT gap between sockets */
+    hal_power_heartbeat();
+    sim7600_set_server_clock_sync(false);
+    bool ok = post_to(&s_server2, s_server2_copy, 0);
+    sim7600_set_server_clock_sync(true);
+    storage_log_debug(ok ? "HTTP" : "ERROR", ok ? "Server 2 copy delivered" : "Server 2 copy not delivered (not kept for later)");
+}
+
 static bool post_backlog_record(const http_endpoint_t *endpoint, const char *payload, int route, portTickType budget_end)
 {
-    if (sim7600_http_post_once(endpoint, payload, route)) {
+    if (post_to(endpoint, payload, route)) {
         return true;
     }
     if (sim7600_post_rejected() || sim7600_post_unanswered() || !sim7600_still_registered() ||
@@ -489,7 +545,7 @@ static bool post_backlog_record(const http_endpoint_t *endpoint, const char *pay
     storage_log_debug("BACKLOG", "Backlog send failed before reaching the server: one more try in 3s");
     hal_power_heartbeat();
     vTaskDelay(3000 / portTICK_RATE_MS);
-    return sim7600_http_post_once(endpoint, payload, route);
+    return post_to(endpoint, payload, route);
 }
 
 static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out_attempts, int *out_csq, const char **out_reason)
@@ -570,7 +626,12 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
         }
 #endif
 
-        const http_endpoint_t *endpoint = telemetry_get_endpoint(UNIT_CFG);
+        const http_endpoint_t *endpoint = slot_endpoint();
+        /* Kept for server 2 (mode 2): this buffer carries the backlog records later */
+        s_server2_copy[0] = '\0';
+        if (strlen(payload) < sizeof(s_server2_copy)) {
+            strcpy(s_server2_copy, payload);
+        }
 
         snprintf(s_slot_line, sizeof(s_slot_line), "Endpoint: %s:%d%s", endpoint->ip, endpoint->port, endpoint->path);
         storage_log_debug("HTTP", s_slot_line);
@@ -588,7 +649,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
             *out_attempts = attempt;
             hal_power_heartbeat();
 
-            post_ok = sim7600_http_post_once(endpoint, payload, attempt - 1);
+            post_ok = post_to(endpoint, payload, attempt - 1);
             if (post_ok) {
                 good_route = attempt - 1;
                 storage_log_debug("HTTP", "Transmission succeeded (200 OK)!");
@@ -756,6 +817,8 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
             *out_reason = sim7600_post_unanswered() ? "NO_REPLY" : fail_reason;
             result = save_slot_for_retry(telem, payload);
         }
+
+        copy_to_server2(budget_end);
 
         /* The record has gone out, so this can't delay it */
 #if GPS_AUTO_SEARCH

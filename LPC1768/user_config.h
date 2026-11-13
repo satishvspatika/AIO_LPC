@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.39"
+#define FIRMWARE_VERSION "v6.9.41"
 
 /* THE production switch. 1 = field build:
  *   - MENU > KEY TEST hidden (and TEST SEND can't be switched on)
@@ -74,6 +74,12 @@
 #define STATUS_SMS_DEST_NUMBER    "9980945474"
 #define STATUS_SMS_NETWORK_NAME   "KSNDMC"
 #endif
+
+/* SMS commands (v6.9.41): VARSHA <CMD> [value], or the older #CMD=value. GET_ commands are answered to
+ * any sender; SET_ commands only from these office numbers (last 10 digits). Up to 5, until changed by
+ * SMS (ADD_NUM / DEL_NUM from a listed number): the list then lives in flash page 0x1100. */
+/* DMC Airtel, DMC BSNL, Spatika Airtel, Satish Jio (user, 2026-11-13). No +91: matched on the last 10 digits */
+#define SMS_OFFICE_NUMBERS        "9980945474", "9449020611", "9741391102", "9108052058"
 
 /* Debug log on the card (LOG/YYMMDD.TXT, HTTPLOG.TXT): about 1 MB a day of card writes.
  * Production: off unless the card holds DEBUGLOG.ON at its root (checked at every boot, so every slot):

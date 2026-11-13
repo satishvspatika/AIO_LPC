@@ -82,7 +82,6 @@ typedef enum {
     SCR_TEMP_HUM,
     SCR_WIND,
     SCR_BATTERY,
-    SCR_SOLAR,
     SCR_SIGNAL,
     SCR_LOCATION,
     SCR_LAST_LOGGED,
@@ -109,7 +108,6 @@ static const screen_type_t s_screens[] = {
     SCR_TEMP_HUM,
     SCR_WIND,
     SCR_BATTERY,
-    SCR_SOLAR,
     SCR_SIGNAL,
     SCR_LOCATION,
     SCR_LAST_LOGGED,
@@ -168,7 +166,8 @@ typedef enum {
     UI_MODE_SLEEP_CONFIRM,
     UI_MODE_KEY_TEST,
     UI_MODE_TEST_SEND,
-    UI_MODE_FW_UPDATE
+    UI_MODE_FW_UPDATE,
+    UI_MODE_GPS_CHOICE      /* Saved position: send it, or search for a new one first */
 } ui_mode_t;
 
 /* MENU key: everything that does something. Screen items jump to that screen, so actions such as
@@ -178,8 +177,7 @@ typedef enum {
     MENU_KEY_TEST,
     MENU_SET_STATION,
     MENU_SET_TIME,
-    MENU_GPS_UPDATE,
-    MENU_SEND_GPS,
+    MENU_GPS,
     MENU_TEST_SEND,
     MENU_FW_UPDATE
 } menu_action_t;
@@ -195,15 +193,16 @@ static const menu_item_t s_menu_items[] = {
     { "TEST SEND",       MENU_TEST_SEND,   SCR_STATION_ID },
     #endif
     { "SEND STATUS SMS", MENU_GOTO_SCREEN, SCR_SEND_STATUS },
-    { "SEND GPS SMS",    MENU_SEND_GPS,    SCR_LOCATION },
-    { "GPS UPDATE",      MENU_GPS_UPDATE,  SCR_LOCATION },
+    /* One item (user, 2026-11-13): GPS UPDATE and SEND GPS SMS were two. The saved position is
+     * sent as it is; a search only runs with no position yet, or when the operator asks (UP) */
+    { "SEND GPS SMS",    MENU_GPS,         SCR_LOCATION },
     #if ENABLE_KEY_TEST
     { "KEY TEST",        MENU_KEY_TEST,    SCR_STATION_ID },
     #endif
     { "ERASE DATA",      MENU_GOTO_SCREEN, SCR_ERASE_DATA },
     { "FIRMWARE UPDATE", MENU_FW_UPDATE,   SCR_STATION_ID },
-    { "SET STATION ID",  MENU_SET_STATION, SCR_STATION_ID },
-    { "SET DATE/TIME",   MENU_SET_TIME,    SCR_DATETIME }
+    { "SET DATE/TIME",   MENU_SET_TIME,    SCR_DATETIME },    /* Before the ID (user, 2026-11-13) */
+    { "SET STATION ID",  MENU_SET_STATION, SCR_STATION_ID }
 };
 #define NUM_MENU_ITEMS (sizeof(s_menu_items) / sizeof(s_menu_items[0]))
 
@@ -615,6 +614,8 @@ static void gps_status_set(const char *text)
     s_gps_status = text;
 }
 static char s_gps_today[12] = "";
+static bool s_gps_search = true;    /* False: send the saved position, no search */
+#define GPS_CHOICE_TIMEOUT_TICKS (20 * 20)  /* 20 s of 50 ms UI ticks */
 
 static void vGps_Task(void *pvParameters)
 {
@@ -625,24 +626,33 @@ static void vGps_Task(void *pvParameters)
     } else {
         sim7600_clear_cancel();
         /* GPS needs the modem on, not a network: a site with no signal can still get a position */
-        if (!sim7600_power_on() && !sim7600_modem_answered()) {
+        bool registered = sim7600_power_on();
+        if (!registered && !sim7600_modem_answered()) {
             gps_status_set("MODEM FAIL");
         } else {
-            switch (sim7600_gps_update(s_gps_today)) {
-            case GPS_NEW_POSITION:  gps_status_set("POSITION SAVED"); break;
-            case GPS_MOVED:         gps_status_set("MOVED: UPDATED"); break;
-            case GPS_SAME_POSITION: gps_status_set("SAME POSITION"); break;
-            case GPS_NOT_AVAILABLE: gps_status_set("GPS NOT AVAIL"); break;
-            default:                gps_status_set("NO FIX: EN=RETRY"); break;
+            if (s_gps_search) {
+                switch (sim7600_gps_update(s_gps_today)) {
+                case GPS_NEW_POSITION:  gps_status_set("POSITION SAVED"); break;
+                case GPS_MOVED:         gps_status_set("MOVED: UPDATED"); break;
+                case GPS_SAME_POSITION: gps_status_set("SAME POSITION"); break;
+                case GPS_NOT_AVAILABLE: gps_status_set("GPS NOT AVAIL"); break;
+                default:                gps_status_set("NO FIX"); break;
+                }
             }
             if (s_gps_send_sms) {
-                /* As the ESP32's SEND GPS: a fresh fix if there is one, else the saved position */
+                /* F: asked from the field (keypad), saved or fresh. C is for office queries by SMS */
                 static telemetry_data_t t;      /* GPS task stack is short */
                 memset(&t, 0, sizeof(t));
                 intermcu_get_telemetry(&t);
                 strncpy(s_status_sms_substep, "SENDING GPS SMS ", sizeof(s_status_sms_substep) - 1);
-                bool sent = sim7600_send_sms(STATUS_SMS_DEST_NUMBER, sim7600_build_gps_sms('F', t.present_time));
-                gps_status_set(sent ? "GPS SMS SENT" : "GPS SMS FAILED");
+                if (!registered) {
+                    gps_status_set("NO NETWORK: SMS");
+                } else if (!flash_nvram_get_location(NULL, NULL)) {
+                    gps_status_set("NO POSITION");
+                } else {
+                    bool sent = sim7600_send_sms(STATUS_SMS_DEST_NUMBER, sim7600_build_gps_sms('F', t.present_time));
+                    gps_status_set(sent ? "GPS SMS SENT" : "GPS SMS FAILED");
+                }
             }
         }
         sim7600_release();
@@ -653,12 +663,13 @@ static void vGps_Task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-static void gps_fetch_start(const telemetry_data_t *telemetry, bool send_sms)
+static void gps_task_start(const telemetry_data_t *telemetry, bool send_sms, bool search)
 {
     if (s_gps_running) {
         return;
     }
     s_gps_send_sms = send_sms;
+    s_gps_search = search;
     if (s_slot_busy || slot_scheduler_is_due()) {
         gps_status_set("SLOT DUE, WAIT");
         return;
@@ -678,6 +689,18 @@ static void gps_fetch_start(const telemetry_data_t *telemetry, bool send_sms)
         gps_status_set("NO MEMORY");
         storage_log_debug("ERROR", "Not enough memory to start the GPS task");
     }
+}
+
+/* Search for a position, save it, then (send_sms) send it */
+static void gps_fetch_start(const telemetry_data_t *telemetry, bool send_sms)
+{
+    gps_task_start(telemetry, send_sms, true);
+}
+
+/* Send the saved position at once: no search */
+static void gps_send_saved_start(const telemetry_data_t *telemetry)
+{
+    gps_task_start(telemetry, true, false);
 }
 
 /* MENU > FIRMWARE UPDATE. Nothing is erased until the operator has seen the checked file's version
@@ -1623,6 +1646,9 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
         fmt_fixed(num, sizeof(num), tips * RF_BUCKET_RESOLUTION, 4, 2);
         snprintf(line1, sizeof(line1), "Count     RF(mm)");
         snprintf(line2, sizeof(line2), "%-5d     %-6s", tips, num);
+    } else if (s_ui_mode == UI_MODE_GPS_CHOICE) {
+        snprintf(line1, sizeof(line1), "SEND SAVED GPS? ");
+        snprintf(line2, sizeof(line2), "EN=SEND UP=NEW  ");
     } else if (s_ui_mode == UI_MODE_ERASE_CONFIRM) {
         snprintf(line1, sizeof(line1), "ARE YOU SURE?   ");
         snprintf(line2, sizeof(line2), "PRESS EN: CONFIRM");
@@ -1747,18 +1773,6 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 snprintf(line2, sizeof(line2), "    %s V    ", num);
                 break;
 
-            case SCR_SOLAR:
-                snprintf(line1, sizeof(line1), "SOLAR VOLTAGE   ");
-                if (telemetry->solar_volt > 1.0f) {
-                    fmt_fixed(num, sizeof(num), telemetry->solar_volt, 4, 2);
-                    snprintf(line2, sizeof(line2), "%sV %s",
-                             num,
-                             (telemetry->solar_status == 'C' || telemetry->solar_status == 'Y') ? "CHARGING" : "STANDBY");
-                } else {
-                    snprintf(line2, sizeof(line2), "    STANDBY     ");
-                }
-                break;
-
             case SCR_SIGNAL:
                 if (!modem_stat || !modem_stat->is_registered || modem_stat->csq_dbm <= -113) {
                     snprintf(line1, sizeof(line1), "NET: SEARCHING  ");
@@ -1794,7 +1808,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                     }
                 } else {
                     snprintf(line1, sizeof(line1), "NO LOCATION YET ");
-                    snprintf(line2, sizeof(line2), "%-16.16s", s_gps_status ? s_gps_status : "MENU: GPS UPDATE");
+                    snprintf(line2, sizeof(line2), "%-16.16s", s_gps_status ? s_gps_status : "MENU: GPS SMS");
                 }
                 break;
             }
@@ -2225,7 +2239,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
 
     /* Prompts that close by themselves if the operator walks away */
     if (key == KEY_NONE && s_mode_timeout_ticks > 0 &&
-        (s_ui_mode == UI_MODE_SLEEP_CONFIRM || s_ui_mode == UI_MODE_KEY_TEST)) {
+        (s_ui_mode == UI_MODE_SLEEP_CONFIRM || s_ui_mode == UI_MODE_KEY_TEST || s_ui_mode == UI_MODE_GPS_CHOICE)) {
         s_mode_timeout_ticks--;
         if (s_mode_timeout_ticks == 0) {
             if (s_ui_mode == UI_MODE_SLEEP_CONFIRM) {
@@ -2321,6 +2335,19 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 request_power_save();
             } else {
                 sleep_confirm_cancel();
+            }
+            return;
+        }
+
+        /* --- Mode: SEND GPS SMS with a saved position. EN: send it now, no search. UP: search for a
+         * new one, save it, then send. Anything else goes back. --- */
+        if (s_ui_mode == UI_MODE_GPS_CHOICE) {
+            s_ui_mode = UI_MODE_BROWSE;
+            s_force_redraw = true;
+            if (key == KEY_EN) {
+                gps_send_saved_start(telemetry);
+            } else if (key == KEY_UP) {
+                gps_fetch_start(telemetry, true);
             }
             return;
         }
@@ -2465,12 +2492,16 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 } else if (item->action == MENU_SET_TIME) {
                     goto_screen(SCR_DATETIME);
                     time_edit_open(telemetry);
-                } else if (item->action == MENU_GPS_UPDATE) {
+                } else if (item->action == MENU_GPS) {
                     goto_screen(SCR_LOCATION);
-                    gps_fetch_start(telemetry, false);
-                } else if (item->action == MENU_SEND_GPS) {
-                    goto_screen(SCR_LOCATION);
-                    gps_fetch_start(telemetry, true);
+                    if (s_gps_running) {
+                        /* Already at it: the screen shows its progress */
+                    } else if (flash_nvram_get_location(NULL, NULL)) {
+                        s_mode_timeout_ticks = GPS_CHOICE_TIMEOUT_TICKS;
+                        s_ui_mode = UI_MODE_GPS_CHOICE;
+                    } else {
+                        gps_fetch_start(telemetry, true);   /* No position yet: search, save, send */
+                    }
                 #if ENABLE_KEY_TEST
                 } else if (item->action == MENU_KEY_TEST) {
                     s_key_test_last = KEY_NONE;

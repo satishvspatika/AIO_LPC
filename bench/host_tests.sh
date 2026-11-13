@@ -20,3 +20,4 @@ cc $F -DFW_TARGET_LPC845 -I$R/LPC1768 -I$R/LPC1768/boot -o $O/cit $R/LPC1768/tes
 python3 $R/bench/frame_compat_test.py $R | tail -1
 for t in 0 1 2; do cc $F -DUNIT_CFG=$t -I$R/LPC1768 -o $O/sid$t $R/LPC1768/tests/station_id_test.c $R/LPC1768/telemetry_formatter.c && $O/sid$t | tail -1; done
 cc $F -I$R/LPC1768 -o $O/npt $R/LPC1768/tests/net_policy_test.c $R/LPC1768/net_policy.c && $O/npt | tail -1
+cc $F -I$R/LPC1768 -o $O/smst $R/LPC1768/tests/sms_cmd_test.c $R/LPC1768/sms_cmd.c && $O/smst | tail -1

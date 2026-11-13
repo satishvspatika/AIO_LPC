@@ -490,8 +490,7 @@ static void parse_d_packet(const char *frame)
     char wake_reason = '?';
     int reset_status = -1;
     char gprs_flag = 'N', usb_flag = 'u', ver_code = 'b';
-    int sc_bat1_raw = 0, solar_raw = 0;
-    char solar_state = 'S';
+    int sc_bat1_raw = 0;
     int rain_day_tips = 0;
     int lpc845_system = -1;
     int live_tips = -1;
@@ -518,8 +517,7 @@ static void parse_d_packet(const char *frame)
             case 16: usb_flag = token[0]; break;
             case 17: ver_code = token[0]; break;
             case 18: sc_bat1_raw = atoi(token); break;
-            case 19: solar_raw = atoi(token); break;
-            case 20: solar_state = token[0]; break;
+            /* 19, 20: second battery and solar state, unused (solar taken off, user 2026-11-13) */
             case 21: rain_day_tips = atoi(token); break;
             case 22: lpc845_system = atoi(token); break;
             case 23: wake_reason = token[0]; break;
@@ -598,13 +596,6 @@ static void parse_d_packet(const char *frame)
         s_latest_telemetry.usb_power_flag = usb_flag;
         s_latest_telemetry.lpc845_ver = ver_code;
 
-        /* Solar Voltage (R1=15k, R2=2.2k -> ratio 0.128) */
-        float sol = 0.0f;
-        if (solar_raw > 0) {
-            sol = (((float)solar_raw * 3.3f / 4095.0f) / 0.128f);
-        }
-        s_latest_telemetry.solar_volt = sol;
-        s_latest_telemetry.solar_status = solar_state;
         s_latest_telemetry.is_valid = true;
     }
 }

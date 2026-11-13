@@ -55,7 +55,7 @@ elif [ "${PRODUCTION_BUILD}" = "0" ]; then
 else
     echo "[ERROR] PRODUCTION_BUILD line not found in user_config.h"; exit 1
 fi
-CFLAGS="-c -mcpu=cortex-m3 -mthumb -O2 -g -fcommon -ffunction-sections -fdata-sections \
+CFLAGS="-c -mcpu=cortex-m3 -mthumb -Os -g -fcommon -ffunction-sections -fdata-sections \
   ${DEBUG_FLAG} -D__USE_CMSIS=CMSISv1p30_LPC17xx \
   -I${LPC_DIR} \
   -I${PROJECT_ROOT}/CMSISv1p30_LPC17xx/inc \
@@ -109,6 +109,7 @@ ${CC} ${CFLAGS} "${LPC_DIR}/fw_update.c" -o "${OUT_DIR}/fw_update.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_ctrl.c" -o "${OUT_DIR}/fw_ctrl.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/errlog.c" -o "${OUT_DIR}/errlog.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/net_policy.c" -o "${OUT_DIR}/net_policy.o"
+${CC} ${CFLAGS} "${LPC_DIR}/sms_cmd.c" -o "${OUT_DIR}/sms_cmd.o"
 mkdir -p "${OUT_DIR}/boot"
 ${CC} ${CFLAGS} "${LPC_DIR}/boot/fw_journal.c" -o "${OUT_DIR}/boot/fw_journal.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/cr_startup_lpc17.c" -o "${OUT_DIR}/cr_startup_lpc17.o"
@@ -180,6 +181,7 @@ ${CC} \
   "${OUT_DIR}/fw_ctrl.o" \
   "${OUT_DIR}/errlog.o" \
   "${OUT_DIR}/net_policy.o" \
+  "${OUT_DIR}/sms_cmd.o" \
   "${OUT_DIR}/ctrl_isp.o" \
   "${OUT_DIR}/ctrl_isp_core.o" \
   "${OUT_DIR}/boot/fw_journal.o" \
