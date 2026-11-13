@@ -49,6 +49,7 @@ int chr1,chr2, chr3;
 //////////////////////////////////////////////
 
 extern volatile uint32_t soft_clock_ticks;	//CTRL v1.11 software clock, defined with the RTC watch
+static volatile uint8_t s_time_unconfirmed;	//CTRL v1.12, defined with the RTC watch
 
 void SysTick_Handler(void)
 {
@@ -444,6 +445,7 @@ void decode_command(void)
 			Present_Date_Time.hour = Set_Date_Time.hour;
 			Present_Date_Time.minute = Set_Date_Time.minute;
 			Present_Date_Time.sec = Set_Date_Time.sec;
+			s_time_unconfirmed = 0;		//v1.12: set from the server, GPS or by hand
 			break;
 
 		case 'C':
@@ -1177,6 +1179,14 @@ typedef struct {
 __attribute__((section(".noinit"))) static clock_keep_t s_clock_keep;
 volatile uint32_t clock_keeps_restored = 0;	//restarts that took the software time back (read by probe)
 
+/* CTRL v1.12. After power loss, a dead RTC still answers with the time it froze at (001903,
+ * 2026-11-12 16:32: 15:49, 43 minutes back). For the 3-6 s before it is found stuck that looked like
+ * a good time: the LPC1768's scheduler stepped back, then ran the 16:30 slot again once the time was
+ * put right. So after any start that doesn't bring the software time back, no time is given (year 0)
+ * until the RTC's seconds are seen moving (about 1 s on a good RTC) or the LPC1768 sets it ($S). */
+static volatile uint8_t s_time_unconfirmed = 0;
+volatile uint32_t time_unconfirmed_starts = 0;	//starts that waited for a moving RTC (read by probe)
+
 static uint32_t clock_keep_check(const clock_keep_t *k)
 {
 	const uint8_t *t = (const uint8_t *)&k->time;
@@ -1226,6 +1236,8 @@ static void rtc_i2c_recover(void)
 	I2C0_init();
 }
 
+volatile uint8_t rtc_was_halted = 0;	//v1.12: halt bit found set at start (read by probe)
+
 void init_ext_rtc(void){
 	int i, j;
 
@@ -1248,6 +1260,7 @@ void init_ext_rtc(void){
 	I2C_MasterTransferBlocking(I2C_MASTER, &XITC_I2C_IDT);
 
 	if(i2c_clkval[1] & 0x80){
+		rtc_was_halted = 1;		//v1.12: stopped while off, so the time it holds is old
 		i2c_clkval[0]= 0;
 		i2c_clkval[1] &= 0x7F;
 		XITC_I2C_IDT.slaveAddress = IDT_DEV_ADDR;
@@ -1385,7 +1398,7 @@ static void soft_clock_100ms(void)
 
 /* At start-up, after init_ext_rtc's first read. reset_bits: SYSRSTSTAT (POR 0x01, EXTRST 0x02,
  * BOD 0x08 mean RAM can't be trusted for the time) */
-static void clock_keep_restore(uint32_t reset_bits)
+static bool clock_keep_restore(uint32_t reset_bits)
 {
 	clock_keep_t k = s_clock_keep;
 	s_clock_keep.magic = 0;
@@ -1393,11 +1406,12 @@ static void clock_keep_restore(uint32_t reset_bits)
 			k.time.year < 24 || k.time.year > 99 || k.time.month < 1 || k.time.month > 12 ||
 			k.time.date < 1 || k.time.date > 31 || k.time.hour > 23 || k.time.minute > 59 || k.time.sec > 59 ||
 			(k.state != RTC_FAULT_NO_ANSWER && k.state != RTC_FAULT_STUCK)){
-		return;
+		return false;
 	}
 	Present_Date_Time = k.time;
 	rtc_state = k.state;
 	clock_keeps_restored++;
+	return true;
 }
 
 static void rtc_watch_100ms(void)
@@ -1418,6 +1432,9 @@ static void rtc_watch_100ms(void)
 	if(read_ok){
 		if(s_rtc_raw_sec != last_raw_sec){
 			if(last_raw_sec != 0xFF && !(s_rtc_raw_sec & 0x80)){
+				if(s_time_unconfirmed == 1){
+					s_time_unconfirmed = 0;	//v1.12: a moving RTC's time can be given out again
+				}
 				s_stuck_kicks = 0;			//moving: any earlier restart worked
 				if(rtc_state != RTC_OK && s_rtc_good_secs < 255){
 					s_rtc_good_secs++;
@@ -1510,6 +1527,9 @@ void Get_Time()
 	}
 	if(rtc_state != RTC_OK){
 		return;		//software clock in charge: the read only feeds rtc_watch_100ms (v1.11)
+	}
+	if(s_time_unconfirmed){
+		return;		//v1.12: not yet seen moving, so it may be a dead RTC's frozen time
 	}
 
 
@@ -2396,7 +2416,13 @@ int main(void)
 	reset_status = SYSCON->SYSRSTSTAT;
 	SYSCON->SYSRSTSTAT = reset_status;	//writing the bits back clears them for the next restart
 	rain_keep_restore(reset_status);
-	clock_keep_restore(reset_status);	//v1.11: software clock time, if the RTC was out
+	if(!clock_keep_restore(reset_status)){	//v1.11: software clock time, if the RTC was out
+		//v1.12: no time until the RTC is seen moving; an RTC that had stopped holds an old time
+		//however well it runs now, so only a set ($S) ends that
+		s_time_unconfirmed = rtc_was_halted ? 2 : 1;
+		Present_Date_Time.year = 0;
+		time_unconfirmed_starts++;
+	}
 	pckt_recvd = 0;
 
 	GPIO_PortClear(GPIO, LPC845_PORT, 1u << LPC1768_PWR_STDN);

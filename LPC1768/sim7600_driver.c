@@ -358,6 +358,19 @@ static void parse_cops_operator(const char *cops_resp, char *out_carrier, size_t
  * 90s after a delivered record, 45s after a rejected one (often caused by the clock itself). */
 #define CLOCK_DRIFT_LIMIT_SEC           90
 #define CLOCK_DRIFT_LIMIT_REJECTED_SEC  45
+/* CTRL v1.11 keeping the time itself (its RTC chip failed) runs about 0.6% fast, 6 s a slot (001903,
+ * 2026-11-13): at 90 s its slots were up to 1.5 minutes early. 15 s stays clear of the server time's
+ * 1 s steps and the send delay, and is corrected about every third slot. Corrections come about a
+ * minute after a boundary, so the step back never crosses one. */
+#define CLOCK_DRIFT_LIMIT_SOFT_CLOCK_SEC 15
+
+static long clock_drift_limit(bool rejected)
+{
+    if (intermcu_845_rtc_state() > 0) {
+        return CLOCK_DRIFT_LIMIT_SOFT_CLOCK_SEC;
+    }
+    return rejected ? CLOCK_DRIFT_LIMIT_REJECTED_SEC : CLOCK_DRIFT_LIMIT_SEC;
+}
 
 static void sync_clock_from_server(const char *http_response, bool rejected)
 {
@@ -372,7 +385,7 @@ static void sync_clock_from_server(const char *http_response, bool rejected)
 
     bool have_clock = intermcu_get_telemetry(&t);
     long drift = have_clock ? intermcu_clock_drift_sec(t.present_time, server_ts) : -1;
-    if (drift >= 0 && drift < (rejected ? CLOCK_DRIFT_LIMIT_REJECTED_SEC : CLOCK_DRIFT_LIMIT_SEC)) {
+    if (drift >= 0 && drift < clock_drift_limit(rejected)) {
         /* Every slot, so a card shows how fast this RTC really drifts */
         snprintf(msg, sizeof(msg), "Clock %lds from server, no change", drift);
         storage_log_debug("RTC", msg);
@@ -2080,7 +2093,7 @@ static void __attribute__((noinline)) correct_clock_from_gps(const char *reply)
 
     bool have_clock = intermcu_get_telemetry(&t);
     long drift = have_clock ? intermcu_clock_drift_sec(t.present_time, gps_ts) : -1;
-    if (drift >= 0 && drift < CLOCK_DRIFT_LIMIT_SEC) {
+    if (drift >= 0 && drift < clock_drift_limit(false)) {
         snprintf(msg, sizeof(msg), "Clock agrees with GPS, drift %lds", drift);
         storage_log_debug("RTC", msg);
         return;

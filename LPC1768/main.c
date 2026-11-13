@@ -362,15 +362,55 @@ static void sync_flash_records_to_sd(void)
     s_sd_ok = ok;
 }
 
-/* Keeps the record: flash always, and the SD card when there is one */
-static void archive_slot(const telemetry_data_t *telem, int csq_dbm, const char *payload)
+#if (UNIT_CFG == KSNDMC_TWS)
+/* Temperature or humidity at exactly 0 is a missing reading, never a real one here (user, 2026-11-13) */
+static bool tws_th_missing(const telemetry_data_t *telem)
+{
+    return telem->temp_c == 0.0f || telem->humidity_pct == 0.0f;
+}
+
+/* The same rule on a payload already made ("...&temp=000.0&humid=036.7&..."): a value of only zeros,
+ * point and sign. For backlog records stored by older firmware. */
+static bool payload_value_zero(const char *payload, const char *key)
+{
+    const char *v = strstr(payload, key);
+    if (!v) {
+        return false;
+    }
+    v += strlen(key);
+    bool digit = false;
+    for (; *v != '\0' && *v != '&'; v++) {
+        if (*v >= '1' && *v <= '9') {
+            return false;
+        }
+        digit |= (*v == '0');
+    }
+    return digit;
+}
+
+static bool tws_payload_th_missing(const char *payload)
+{
+    return payload_value_zero(payload, "&temp=") || payload_value_zero(payload, "&humid=");
+}
+#endif
+
+/* Keeps the record: flash always, and the SD card when there is one. payload must hold 512 bytes. */
+static void archive_slot(const telemetry_data_t *telem, int csq_dbm, char *payload)
 {
     /* A restart mid-slot runs the slot again. Its record is already kept, so don't store a second
-     * row. It's still sent again: flash can't show whether the first send got through. */
+     * row. It's still sent again (flash can't show whether the first send got through), but as
+     * stored: the readings now may be worse than the first ones (001903, 2026-11-12 16:34: a
+     * restarted CTRL gave 0 for temp/humidity/wind and the resend went out with those zeros). */
     const flash_log_page_t *newest = flash_log_newest_record();
     if (newest && newest->slot_id == s_archive_slot_id) {
         s_last_record_seq = newest->seq;
-        storage_log_debug("SLOT", "This slot is already stored: sending it again without a second copy");
+        if (newest->payload[0] != '\0' && newest->payload[0] != (char)0xFF &&
+            strnlen(newest->payload, FLASH_LOG_PAYLOAD_SIZE) < FLASH_LOG_PAYLOAD_SIZE) {
+            strcpy(payload, newest->payload);
+            storage_log_debug("SLOT", "This slot is already stored: sending the stored copy again, not today's readings");
+        } else {
+            storage_log_debug("SLOT", "This slot is already stored: sending it again without a second copy");
+        }
         sync_flash_records_to_sd();
         return;
     }
@@ -520,6 +560,15 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
 
         /* ESP32 flow: the record is on the card before any attempt to send it */
         archive_slot(telem, status.csq_dbm, payload);
+#if (UNIT_CFG == KSNDMC_TWS)
+        /* A slot run again sends its stored copy: one stored by older firmware may hold the zeros */
+        if (tws_payload_th_missing(payload)) {
+            storage_log_debug("ERROR", "Stored copy of this slot has temperature or humidity 0: not sent");
+            *out_reason = "NO_TEMP_HUMID";
+            sim7600_release();
+            return SLOT_LOST;
+        }
+#endif
 
         const http_endpoint_t *endpoint = telemetry_get_endpoint(UNIT_CFG);
 
@@ -605,6 +654,18 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                 snprintf(bk_msg, sizeof(bk_msg), "Sending Backlog #%d (offset %u)...", backlogs_sent + 1, (unsigned int)bk_offset);
                 storage_log_debug("BACKLOG", bk_msg);
                 hal_power_heartbeat();
+#if (UNIT_CFG == KSNDMC_TWS)
+                if (tws_payload_th_missing(payload)) {
+                    storage_append_stamped(REJECTED_FILENAME, payload);
+                    if (!storage_backlog_mark_sent(bk_offset)) {
+                        storage_log_debug("ERROR", "Could not mark backlog record sent: stopping backlog cycle");
+                        bk_failed = true;
+                        break;
+                    }
+                    storage_log_debug("ERROR", "Backlog record has temperature or humidity 0: not sent, moved to " REJECTED_FILENAME);
+                    continue;
+                }
+#endif
 
                 /* Carrier NAT needs this gap after a socket closes before opening the next */
                 vTaskDelay(3000 / portTICK_RATE_MS);
@@ -651,6 +712,18 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
             uint32_t flash_seq = 0;
             while (!bk_failed && backlogs_sent < 15 && SLOT_BUDGET_LEFT() && flash_log_next_pending(&flash_seq, payload, 384)) {
                 hal_power_heartbeat();
+#if (UNIT_CFG == KSNDMC_TWS)
+                if (tws_payload_th_missing(payload)) {
+                    if (!flash_log_mark_sent(flash_seq)) {
+                        bk_failed = true;   /* Or it would be picked again at once */
+                        break;
+                    }
+                    ui_dec_backlog_count();
+                    storage_append_stamped(REJECTED_FILENAME, payload);
+                    storage_log_debug("ERROR", "Flash backlog record has temperature or humidity 0: not sent, set aside");
+                    continue;
+                }
+#endif
                 vTaskDelay(3000 / portTICK_RATE_MS);
 
                 if (post_backlog_record(endpoint, payload, good_route, budget_end)) {
@@ -966,6 +1039,15 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
             state = intermcu_poll_record(&s_gap_record);
         }
 
+#if (UNIT_CFG == KSNDMC_TWS)
+        if (state == 1 && tws_th_missing(&s_gap_record)) {
+            /* Measured, but temperature or humidity 0: never sent (user, 2026-11-13) */
+            snprintf(s_slot_line, sizeof(s_slot_line), "Stored sample for %.14s has temperature or humidity 0: not sent", request);
+            storage_log_debug("GAP", s_slot_line);
+            not_held++;
+            continue;
+        }
+#endif
         if (state == 1) {
             format_slot_payload(payload, sizeof(payload), &s_gap_record, SIGNAL_GAP_FILLED);
             s_archive_slot_id = id;
@@ -1175,9 +1257,8 @@ static void __attribute__((noinline)) note_values_out_of_range(const telemetry_d
         storage_log_debug("ERROR", s_slot_line);
     }
 #else
-    /* Both exactly 0 is the LPC845's "no answer" (CTRL v1.9 counts these), never a real reading */
-    if (telem->temp_c == 0.0f && telem->humidity_pct == 0.0f) {
-        storage_log_debug("ERROR", "No temperature/humidity reading: check the sensor and its cable");
+    if (tws_th_missing(telem)) {
+        storage_log_debug("ERROR", "No temperature/humidity reading: slot not sent. Check the sensor and its cable");
     }
 #endif
 }
@@ -1278,6 +1359,23 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     note_values_out_of_range(telem);
 
     const char *boot_mode = ui_was_scheduled_boot() ? "SCHEDULED" : "OPERATOR";
+#if (UNIT_CFG == KSNDMC_TWS)
+    /* User, 2026-11-13: a TWS record with temperature or humidity at 0 is never sent. Neither is
+     * real here, so it is a missing reading (sensor, cable, or a CTRL that has just restarted). Not
+     * stored either, so no backlog can send it later. Left unmarked like a silent CTRL: the next
+     * slot's gap fill asks the CTRL for it once more, and the same rule applies there. */
+    if (tws_th_missing(telem)) {
+        snprintf(s_slot_line, sizeof(s_slot_line), "%.14s,%.14s,SKIPPED,NO_TEMP_HUMID,0,-113,0,,%s,%u",
+                 telem->present_time, telem->slot_time, boot_mode, (unsigned int)ui_get_backlog_count());
+        storage_log_debug("SLOT_END", s_slot_line);
+        storage_log_slot(s_slot_line);
+        ui_set_slot_busy(false);
+        if (!ui_is_display_active() && !ui_is_operator_touched()) {
+            ui_enter_sleep();
+        }
+        return;
+    }
+#endif
     char s_bat[8], s_rf15[8], s_rfday[8];
     fmt_fixed(s_rf15, sizeof(s_rf15), telem->rf_15m_mm, 5, 2);
     fmt_fixed(s_rfday, sizeof(s_rfday), telem->rf_cum_mm, 5, 2);

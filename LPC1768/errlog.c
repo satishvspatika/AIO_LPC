@@ -197,7 +197,33 @@ void errlog_note(const char *line, const char *msg)
     taskEXIT_CRITICAL();
 }
 
-static void write_pending(void)
+/* Already in flash today? The LPC1768 restarts every slot, so counting repeats in RAM can't stop a
+ * fault that lasts (dead RTC on 001903: the same line 96 times a day, 2026-11-13) from filling the
+ * 48 entries and pushing real faults out. Same message, same date: once a day is enough. Entries
+ * look like "v6.9.37 [2026-11-13 00:00:32 +2s] [ERROR] text". */
+static bool already_logged_today(const char *text)
+{
+    const char *when = strchr(text, '[');
+    const char *msg = strstr(text, "] [ERROR] ");
+    if (!when || !msg || when[1] != '2' || when[5] != '-') {
+        return false;   /* No date yet (clock not known): always kept */
+    }
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const errlog_page_t *p = page_at(i);
+        if (!page_valid(p)) {
+            continue;
+        }
+        const char *p_when = strchr(p->text, '[');
+        const char *p_msg = strstr(p->text, "] [ERROR] ");
+        if (p_when && p_msg && strncmp(p_when, when, 11) == 0 && strcmp(p_msg, msg) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* False when nothing was written (already logged today) */
+static bool write_pending(void)
 {
     errlog_page_t page;
     memset(&page, 0xFF, sizeof(page));
@@ -212,6 +238,12 @@ static void write_pending(void)
     s_has_pending = false;
     taskEXIT_CRITICAL();
 
+    /* Only the text after the time is compared, so the time itself can't make it new. The repeats
+     * counted for the previous entry stay with it, as RAM, until a different error is written. */
+    if (already_logged_today(page.text)) {
+        return false;
+    }
+
     page.crc = page_crc(&page);
 
     /* Starting a sector: it holds the oldest entries, which make way */
@@ -223,10 +255,11 @@ static void write_pending(void)
         s_next_page = (pg + 1) % TOTAL_PAGES;
         if (page_blank(pg) && iap_write(pg, &page)) {
             s_next_seq++;
-            return;
+            return true;
         }
         /* Damaged page (power lost mid-write): skip it */
     }
+    return true;
 }
 
 /* New entries to ERRORS.TXT, oldest first, a few at a time */
@@ -272,8 +305,9 @@ void errlog_step(void)
 {
     if (s_has_pending) {
         if (s_writes < WRITES_PER_BOOT) {
-            s_writes++;
-            write_pending();
+            if (write_pending()) {
+                s_writes++;
+            }
         } else {
             taskENTER_CRITICAL();
             s_has_pending = false;
