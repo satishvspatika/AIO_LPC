@@ -1070,7 +1070,7 @@ void sim7600_worker_step(void)
                 /* Check incoming SMS */
                 telemetry_data_t t;
                 if (intermcu_get_telemetry(&t)) {
-                    sim7600_check_incoming_sms(&t);
+                    sim7600_check_incoming_sms(&t, false);
                 }
             } else {
                 /* If not registered, reset carrier name to searching */
@@ -2892,17 +2892,37 @@ static void sms_run(const sms_in_t *m, const telemetry_data_t *telemetry)
     reply(m->from, out);
 }
 
-void sim7600_check_incoming_sms(const telemetry_data_t *telemetry)
+void sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
 {
+    static bool s_list_error_logged = false;
     /* Polled every few seconds with the LCD on: wait for the end of the list, and log only a message */
     clear_rx();
     s_log_quiet = true;
+    /* Text mode first: the modem starts in PDU mode at every power-on, where CMGL "ALL" is an ERROR.
+     * Until v6.9.43 it was set only by sending an SMS, so commands were never seen (001903,
+     * 2026-11-13 12:00: GET_STATUS and GET_CONFIG sent, no reply) */
+    send_raw("AT+CMGF=1\r\n");
+    wait_response("OK", 1000, NULL, 0);
+    clear_rx();
     /* ALL, not REC UNREAD: listing marks them read, and any not handled this slot (more than 4,
      * or cut short) must be listed again next slot */
     send_raw("AT+CMGL=\"ALL\"\r\n");
-    bool listed = wait_response("OK", 2000, s_sms_capture, sizeof(s_sms_capture));
+    s_sms_capture[0] = '\0';
+    bool listed = wait_response("OK", 3000, s_sms_capture, sizeof(s_sms_capture));
     s_log_quiet = false;
-    if (!listed || strstr(s_sms_capture, "+CMGL: ") == NULL) {
+    if (!listed) {
+        if (!s_list_error_logged) {
+            s_list_error_logged = true;     /* Once a power-on: the LCD-on poll runs every few seconds */
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Could not list SMS: %.60s", s_sms_capture[0] ? s_sms_capture : "no answer");
+            storage_log_debug("ERROR", msg);
+        }
+        return;
+    }
+    if (strstr(s_sms_capture, "+CMGL: ") == NULL) {
+        if (in_slot) {
+            storage_log_debug("SMS", "No SMS waiting");
+        }
         return;
     }
     storage_log_debug("SMS", s_sms_capture);

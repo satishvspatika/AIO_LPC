@@ -828,7 +828,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
 #endif
 
         /* Check and process incoming operator SMS */
-        sim7600_check_incoming_sms(telem);
+        sim7600_check_incoming_sms(telem, true);
     } else {
         storage_log_debug("MODEM", "Modem has no network after all tries! Saving to backlog.");
         format_slot_payload(payload, sizeof(payload), telem, -113);

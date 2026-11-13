@@ -81,7 +81,7 @@ bool sim7600_send_sms(const char *dest_phone, const char *message);
  * The modem must be on; send it with sim7600_send_sms(). Static buffer: one caller at a time. */
 const char *sim7600_build_gps_sms(char kind, const char *present_time);
 bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm);
-void sim7600_check_incoming_sms(const telemetry_data_t *telemetry);
+void sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot);
 
 #endif /* SIM7600_DRIVER_H */
 

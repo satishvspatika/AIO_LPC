@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.42"
+#define FIRMWARE_VERSION "v6.9.43"
 
 /* THE production switch. 1 = field build:
  *   - MENU > KEY TEST hidden (and TEST SEND can't be switched on)
