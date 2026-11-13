@@ -502,10 +502,16 @@ static const char *select_apn(const char *iccid, const char *imsi)
 }
 
 static bool s_sim_missing = false;
+static bool s_modem_answered = false;   /* Answered AT since its last power-on: on, maybe with no network */
 
 bool sim7600_sim_missing(void)
 {
     return s_sim_missing;
+}
+
+bool sim7600_modem_answered(void)
+{
+    return s_modem_answered;
 }
 
 bool sim7600_power_on(void)
@@ -555,6 +561,7 @@ bool sim7600_power_on(void)
         send_raw("AT\r\n");
         if (wait_response("OK", 800, NULL, 0) || wait_response("RDY", 200, NULL, 0)) {
             modem_ready = true;
+            s_modem_answered = true;
             break;
         }
         delay_ms(200);
@@ -857,6 +864,7 @@ static uint32_t s_cclk_poll_counter = 0;
 void sim7600_power_off(void)
 {
     storage_log_debug("MODEM", "Powering down SIM7600 cellular engine...");
+    s_modem_answered = false;
 
     clear_rx();
     close_socket_quiet(500);

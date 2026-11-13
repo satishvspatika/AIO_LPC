@@ -25,7 +25,7 @@
 #include "boot_core.h"
 #include "fwhex.h"
 
-#define MIG_VERSION "MIG-1.7"
+#define MIG_VERSION "MIG-1.8"
 
 const fw_image_info_t g_fw_image_info = {
     FW_IMAGE_MAGIC, FW_BOARD_ID, 0, 0, 0xFFFFFFFFUL, MIG_VERSION   /* Length and CRC: build.sh */

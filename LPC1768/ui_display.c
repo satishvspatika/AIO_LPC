@@ -624,7 +624,8 @@ static void vGps_Task(void *pvParameters)
         gps_status_set("MODEM BUSY");
     } else {
         sim7600_clear_cancel();
-        if (!sim7600_power_on()) {
+        /* GPS needs the modem on, not a network: a site with no signal can still get a position */
+        if (!sim7600_power_on() && !sim7600_modem_answered()) {
             gps_status_set("MODEM FAIL");
         } else {
             switch (sim7600_gps_update(s_gps_today)) {

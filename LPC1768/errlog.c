@@ -146,7 +146,7 @@ static uint32_t s_next_seq = 1;
 static uint8_t s_writes;
 static uint32_t s_last_hash;        /* Newest entry written, to count repeats instead */
 static uint16_t s_last_repeats;
-static char s_pending[96];
+static char s_pending[160];   /* Whole line with most messages (96 cut them short) */
 static uint32_t s_pending_hash;
 static uint16_t s_pending_repeats;
 static volatile bool s_has_pending;
@@ -215,8 +215,18 @@ static bool already_logged_today(const char *text)
         }
         const char *p_when = strchr(p->text, '[');
         const char *p_msg = strstr(p->text, "] [ERROR] ");
-        if (p_when && p_msg && strncmp(p_when, when, 11) == 0 && strcmp(p_msg, msg) == 0) {
-            return true;
+        /* Lines are cut to a fixed length, so how much of the message is kept depends on the length
+         * of the time before it ("+0s" or "+103s"): compare what both kept (001903, 2026-11-13: the
+         * same RTC line ended "itself", "itse" and "itsel" and was written each time) */
+        if (p_when && p_msg && strncmp(p_when, when, 11) == 0) {
+            size_t n = strlen(p_msg);
+            size_t m = strlen(msg);
+            if (m < n) {
+                n = m;
+            }
+            if (n > 20 && strncmp(p_msg, msg, n) == 0) {   /* "] [ERROR] " plus some text */
+                return true;
+            }
         }
     }
     return false;

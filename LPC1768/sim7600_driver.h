@@ -22,6 +22,8 @@ void sim7600_note_slot_delivery(bool delivered, bool network_fault);
 
 /* The last power-on found no usable SIM */
 bool sim7600_sim_missing(void);
+/* The modem answered AT since it was last powered on (GPS works without a network) */
+bool sim7600_modem_answered(void);
 
 /* The last post went out with no answer: don't repeat it until the next slot */
 bool sim7600_post_unanswered(void);

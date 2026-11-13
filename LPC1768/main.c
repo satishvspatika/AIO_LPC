@@ -1195,6 +1195,33 @@ static bool __attribute__((noinline)) clock_wait_is_over(void)
     return up_sec > SLOT_CLOCK_NO_NET_SEC && !status.is_registered;
 }
 
+/* No clock and no network to get one from (a CTRL whose RTC failed, after a power cut: CTRL v1.12
+ * gives no time then). Before the slot is given up, GPS is asked for the time once a boot: it needs
+ * the modem on, not a network. The modem supervisor has normally powered it already. */
+static bool __attribute__((noinline)) clock_from_gps(void)
+{
+    storage_log_debug("ERROR", "No clock and no network: trying GPS for the time");
+    if (!sim7600_acquire(30000)) {
+        storage_log_debug("GPS", "Modem busy: no GPS time");
+        return false;
+    }
+    sim7600_clear_cancel();
+    hal_power_heartbeat();
+    if (!sim7600_modem_answered()) {
+        sim7600_power_on();     /* Registered or not: GPS needs only a modem that answers */
+    }
+    bool tried = sim7600_modem_answered();
+    if (tried) {
+        hal_power_heartbeat();
+        sim7600_gps_update("");
+    } else {
+        storage_log_debug("GPS", "Modem not answering: no GPS time");
+    }
+    sim7600_release();
+    hal_power_heartbeat();
+    return tried;
+}
+
 /* Is the LPC845 sending good status frames right now? It sends one a second. */
 #define LINK_CHECK_SEC 5
 static bool lpc845_link_alive(void)
@@ -1210,7 +1237,7 @@ static bool lpc845_link_alive(void)
  * zeros) the name is invalid, so the slot gets this clock's name for it (taken when the slot began:
  * the gap fill and hold that follow could run past the next boundary). The rain is still the count
  * the LPC845 closed for the slot. */
-static void __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data_t *telem, const char *own_name)
+static bool __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data_t *telem, const char *own_name)
 {
     const char *st = telem->slot_time;
     bool valid = strlen(st) >= 12;
@@ -1224,7 +1251,7 @@ static void __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data
         valid = yr >= 2024 && mo >= 1 && mo <= 12 && da >= 1 && da <= 31;
     }
     if (valid) {
-        return;
+        return false;
     }
     char was[16];
     strncpy(was, st, sizeof(was) - 1);
@@ -1233,6 +1260,7 @@ static void __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data
     snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 clock was lost or not yet set (its slot %.14s): slot named %.14s from this clock",
              was[0] ? was : "none", telem->slot_time);
     storage_log_debug("ERROR", s_slot_line);
+    return true;
 }
 
 /* A value no gauge or battery can give points at a fault (a damaged frame that passed its check, a
@@ -1352,7 +1380,22 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     }
     /* Re-read fresh telemetry */
     intermcu_get_telemetry(telem);
-    name_slot_if_845_clock_lost(telem, own_name);
+    bool ctrl_had_no_record = name_slot_if_845_clock_lost(telem, own_name);
+#if (UNIT_CFG == KSNDMC_TWS)
+    /* The CTRL keeps its slot readings in RAM only: one that has just restarted has no record for
+     * this slot and gives zeros (001903, 2026-11-12 16:34). Its live readings are at most 10 s old
+     * (CTRL v1.13 also reads the sensor at start-up): temperature, humidity and wind direction are
+     * spot values anyway; wind speed is the average since the restart. Zeros still aren't sent. */
+    if (ctrl_had_no_record) {
+        telem->temp_c = telem->live_temp_c;
+        telem->humidity_pct = telem->live_humidity_pct;
+        telem->wind_speed_avg = telem->live_wind_speed;
+        telem->wind_dir_deg = telem->live_wind_dir_deg;
+        storage_log_debug("SLOT", "CTRL has no record for this slot (it restarted): its live readings are used");
+    }
+#else
+    (void)ctrl_had_no_record;
+#endif
 #if (UNIT_CFG != KSNDMC_TWS)
     keep_cum_from_dipping(telem);
 #endif
@@ -1520,6 +1563,7 @@ static void vMain_Task(void *pvParameters)
 
     uint32_t heartbeat_sec = 0;
     uint32_t link_log_sec = 0;
+    bool s_gps_time_tried = false;  /* Once a boot: see clock_from_gps */
 
     for (;;) {
         /* LPC845 link health: soon after boot, then every 5 minutes */
@@ -1550,7 +1594,7 @@ static void vMain_Task(void *pvParameters)
 
         telemetry_data_t telem;
         memset(&telem, 0, sizeof(telem));
-        bool run_now = false, sleep_now = false;
+        bool run_now = false, sleep_now = false, gps_now = false;
         xSemaphoreTake(s_sched_lock, portMAX_DELAY);    /* Released before a slot runs */
         intermcu_get_telemetry(&telem);
 
@@ -1589,15 +1633,22 @@ static void vMain_Task(void *pvParameters)
                     storage_log_debug("ERROR", "Scheduled wake but clock is invalid: slot cannot run yet");
                 }
                 if (clock_wait_is_over()) {
-                    storage_log_debug("ERROR", "Clock still invalid: SLOT LOST, entering sleep");
-                    storage_log_slot("NO_CLOCK,NO_CLOCK,LOST,INVALID_CLOCK,0,-113,0,0.00,SCHEDULED,0");
-                    sleep_now = true;
+                    if (!s_gps_time_tried) {
+                        s_gps_time_tried = true;
+                        gps_now = true;     /* Outside the lock, then the scheduler looks again */
+                    } else {
+                        storage_log_debug("ERROR", "Clock still invalid: SLOT LOST, entering sleep");
+                        storage_log_slot("NO_CLOCK,NO_CLOCK,LOST,INVALID_CLOCK,0,-113,0,0.00,SCHEDULED,0");
+                        sleep_now = true;
+                    }
                 }
             }
         }
         xSemaphoreGive(s_sched_lock);
         if (run_now) {
             run_slot(&telem, min, sec, slot_id);
+        } else if (gps_now) {
+            clock_from_gps();
         } else if (sleep_now) {
             ui_enter_sleep();
         }

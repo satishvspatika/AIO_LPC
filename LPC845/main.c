@@ -2389,7 +2389,9 @@ int main(void)
 		for(j=0;j<2000;j++);
 
 
-	//	read_th_val();
+	//CTRL v1.13: read the sensor now, not 10 s from now, so a slot right after a restart has live
+	//temperature and humidity (001903, 2026-11-12 16:34). No sensor (TRG) gives up at once (v1.10).
+	read_th_val();
 	for(i=0;i<1000;i++)
 		for(j=0;j<2000;j++);
 	//for DMC
