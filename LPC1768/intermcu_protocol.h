@@ -61,6 +61,8 @@ int intermcu_get_845_system(void);
 /* Why the LPC845 last powered this chip ('B' it restarted, 'K' DSP key, 'S' slot, '?' unknown),
  * and why it last restarted (SYSRSTSTAT) */
 void intermcu_get_845_wake(char *out_reason, int *out_reset_status);
+/* The CTRL's slot wake delay in seconds (CTRL v1.15+), 0 from an older CTRL, -1 before a frame */
+int intermcu_get_845_slot_wake(void);
 void intermcu_get_link_stats(uint32_t *out_bytes, uint32_t *out_frames, uint32_t *out_good, char *out_last, size_t size);
 
 /* Server time from an HTTP reply as YYYYMMDDHHMMSS (IST): the body's "tm" field, or else the

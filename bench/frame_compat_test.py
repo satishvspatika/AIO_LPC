@@ -43,11 +43,12 @@ def frame_c(values):
 
 # Arguments: one per conversion. Worst case = the widest each field can really get: ADC 4095, HDC
 # raw 65535, a 15-minute wind pulse total of 90000 (100 Hz), 900 s, rain-day tips 99999, the reset
-# field with the clock state in bits 8-9 (0x21F = 543), date-times 2 digits each.
+# field with the clock state in bits 8-9 and (CTRL v1.15) the slot wake delay in bits 10-15 (up to
+# 65535), date-times 2 digits each.
 convs = re.findall(r'%(?:0?\d+)?([dc])', fmt)
 WORST = [20, 26, 11, 12, 23, 59, 59, 20, 26, 11, 12, 23, 45, 0,
          9999, 4095, 65535, 65535, 90000, 4095, 100, 900, 65535, 65535, 90000, 4095, 900,
-         'G', 'U', 'b', 9999, 9999, 'C', 99999, 2, 'K', 543, 999, 1]
+         'G', 'U', 'b', 9999, 9999, 'C', 99999, 2, 'K', 65535, 999, 1]
 def vals(kind):
     assert len(WORST) == len(convs), f'{len(convs)} conversions in $D: update WORST in this test'
     out = []

@@ -2,6 +2,8 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "fw_app.h"
+#include "intermcu_protocol.h"
+#include "user_config.h"
 #include "lpc17xx_uart.h"
 #include "lpc17xx_pinsel.h"
 #include <string.h>
@@ -122,8 +124,25 @@ void hal_power_heartbeat(void)
     send_intermcu_cmd("$H;\012");
 }
 
+/* CTRL v1.15: $W<seconds>; the delay after a slot boundary before the CTRL powers this board */
+void hal_power_set_slot_wake(unsigned seconds)
+{
+    char cmd[12];
+    snprintf(cmd, sizeof(cmd), "$W%02u;\012", seconds);
+    send_intermcu_cmd(cmd);
+}
+
 void hal_power_sleep_system(void)
 {
+    /* CTRL v1.15+: its slot wake delay, if it isn't ours (first sleep after a CTRL update or restart:
+     * it starts at 30 s). Sent here, not during the slot: the CTRL holds one command at a time, and a
+     * $G gap-fill request dropped for this would lose a record. The pause lets the CTRL take it before
+     * $f7 (which is resent anyway if lost). Older CTRLs report 0 and are left alone. */
+    const int slot_wake = intermcu_get_845_slot_wake();
+    if (slot_wake > 0 && slot_wake != SLOT_WAKE_DELAY_SEC) {
+        hal_power_set_slot_wake(SLOT_WAKE_DELAY_SEC);
+        vTaskDelay(300 / portTICK_RATE_MS);
+    }
     send_intermcu_cmd("$f7;\012");
     s_is_5v_on = false;
     s_is_modem_on = false;

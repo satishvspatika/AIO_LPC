@@ -31,9 +31,35 @@ static void save_net_policy(void)
     storage_state_save(RAT_MODE_FILENAME, text);
 }
 
+/* v6.9.55 (build 8): AT+CNMP answered ERROR once (001903, 14 Nov 15:01:04, both CNMP=38 and
+ * CNMP=13): the modem stayed in automatic mode, the slot went out on 3G, and that taught "2G first".
+ * Tried 3 times; if the mode still isn't taken, this slot teaches the radio-mode learning nothing. */
+static bool s_rat_unsure = false;
+
+static void send_raw(const char *cmd);
+static void clear_rx(void);
+static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_capture, size_t cap_size);
+
+static bool set_rat_mode(const char *rat_cmd)
+{
+    for (int t = 0; t < 3; t++) {
+        if (t) {
+            vTaskDelay(1000 / portTICK_RATE_MS);
+        }
+        clear_rx();
+        send_raw(rat_cmd);
+        if (wait_response("OK", 1000, NULL, 0)) {
+            return true;
+        }
+    }
+    s_rat_unsure = true;
+    storage_log_debug("MODEM", "Radio mode command (AT+CNMP) refused 3 times: this slot doesn't change the learned radio mode");
+    return false;
+}
+
 void sim7600_note_slot_delivery(bool delivered, bool network_fault)
 {
-    if (s_net_mode == 0) {
+    if (s_net_mode == 0 || s_rat_unsure) {
         return;
     }
     net_policy_t before = s_net;
@@ -41,8 +67,11 @@ void sim7600_note_slot_delivery(bool delivered, bool network_fault)
     if (memcmp(&before, &s_net, sizeof(s_net)) != 0) {
         save_net_policy();
         if (before.primary != s_net.primary) {
-            storage_log_debug("MODEM", s_net.primary == NET_2G ? "4G registers but can't send here: 2G first from now"
-                                                               : "Back to 4G first");
+            /* v6.9.55: was always "4G registers but can't send", also when 4G simply wasn't found and
+             * the slot went out on 2G (001903, 14 Nov 08:45) */
+            storage_log_debug("MODEM", s_net.primary == NET_4G ? "Back to 4G first"
+                                       : (s_net.datafail4 >= NET_SKIP_4G_AFTER_FAIL ? "4G registers but can't send here: 2G first from now"
+                                                                                    : "Sent on 2G (no 4G this time): 2G first from now"));
         }
     }
 }
@@ -50,6 +79,30 @@ void sim7600_note_slot_delivery(bool delivered, bool network_fault)
 #define UART_MODEM      LPC_UART2
 #define PIN_SIM_SEL     0       /* P0.0: SIM select (Output LOW = Holder J1A) */
 #define PIN_PWR_KEY     1       /* P0.1: SIM7600 PWRKEY (Active LOW pulse, resting HIGH) */
+
+/* v6.9.55 (build 12): the modem boots by itself when its 3.8V rail comes on and answers AT about
+ * 16-18 s later (bench, 2026-11-08). The CTRL switches that rail on with the LPC1768's; since CTRL
+ * v1.15 that is 40 s after the slot boundary, so at +62 s the modem can still be booting. A PWRKEY
+ * pulse is for a modem that is off with its rail on: it is only given once the rail has been on this
+ * long and the modem still doesn't answer. */
+#define MODEM_BOOT_WAIT_SEC 30
+static portTickType s_rail_on_tick = 0;     /* When the rail last came on (boot: the CTRL's wake) */
+static bool s_rail_cut = false;             /* Cut by sim7600_power_off since */
+static char s_rail_msg[64];                 /* Static: Modem task stack (sim7600_power_on runs under the modem lock) */
+
+static void modem_rail_on(void)
+{
+    hal_power_modem_on();
+    if (s_rail_cut) {
+        s_rail_cut = false;
+        s_rail_on_tick = xTaskGetTickCount();
+    }
+}
+
+static uint32_t modem_rail_age_sec(void)
+{
+    return (uint32_t)((xTaskGetTickCount() - s_rail_on_tick) / configTICK_RATE_HZ);
+}
 
 #define RX_BUFFER_SIZE  2048
 static char s_rx_buf[RX_BUFFER_SIZE];
@@ -63,6 +116,18 @@ static char s_http_capture[1024];
 static const char *s_active_apn = "";
 static bool s_bearer_ready = false; /* AT+CGACT done since the modem last started or changed APN */
 static char s_sms_capture[1024];   /* An SMS list: about 8 messages (v6.9.41; 512 held 4) */
+static char s_sms_capture2[1024];  /* The list taken again while more arrive (v6.9.55) */
+static sms_seen_t s_seen;          /* Messages already handled (v6.9.55), SMS_SEEN_FILENAME */
+static bool s_seen_loaded = false;
+
+static int count_listed(const char *list)
+{
+    int n = 0;
+    for (const char *p = strstr(list, "+CMGL: "); p; p = strstr(p + 7, "+CMGL: ")) {
+        n++;
+    }
+    return n;
+}
 
 static modem_status_t s_modem_status = {
     .csq_val = 99,
@@ -185,8 +250,11 @@ void sim7600_init(void)
     LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY); /* Default resting HIGH */
     LPC_GPIO0->FIODIR |= (1UL << PIN_PWR_KEY);/* Output */
 
-    /* Immediately request LPC845 sentry to activate 3.8V switching regulator on boot */
+    /* Immediately request LPC845 sentry to activate 3.8V switching regulator on boot. On a slot or
+     * DSP wake the CTRL has just switched it on with the LPC1768's rail: its age counts from here. */
     hal_power_modem_on();
+    s_rail_on_tick = xTaskGetTickCount();
+    s_rail_cut = false;
 
     UART_CFG_Type uart_cfg;
     UART_ConfigStructInit(&uart_cfg);
@@ -206,6 +274,10 @@ void sim7600_init(void)
 /* Routine commands whose replies tell nothing (an empty SMS list every few seconds, closing a socket
  * that is already closed) are kept out of the log, so it shows what matters */
 static bool s_log_quiet = false;
+/* Build 14 (review): set while an SMS list (AT+CMGL) is read. The list carries message text, so only
+ * a line that is the modem's own error ends the wait: "ERROR" inside a message used to end it, the
+ * list was never read, and that message stayed on the SIM and blocked every command after it. */
+static bool s_list_wait = false;
 
 static void __attribute__((noinline)) send_raw(const char *cmd)
 {
@@ -215,8 +287,66 @@ static void __attribute__((noinline)) send_raw(const char *cmd)
     UART_Send(UART_MODEM, (uint8_t *)cmd, strlen(cmd), BLOCKING);
 }
 
+/* v6.9.55: when an incoming SMS last showed up (+CMTI, or one listed). An SMS centre needs the
+ * modem's acknowledgement; one that arrived while the unit sent its own SMS or left the network
+ * was taken as not delivered and sent again up to an hour later, holding up everything behind it
+ * (Airtel, 001903, 14 Nov). Replies and power-off wait a few seconds after an arrival. */
+static portTickType s_sms_in_tick = 0;
+static bool s_sms_in_seen = false;
+
+static void note_sms_arrival(void)
+{
+    s_sms_in_tick = xTaskGetTickCount();
+    s_sms_in_seen = true;
+}
+
+static bool sms_arrived_within(uint32_t ms)
+{
+    return s_sms_in_seen && (xTaskGetTickCount() - s_sms_in_tick) < (ms / portTICK_RATE_MS);
+}
+
+static void clear_rx(void);
+
+/* Until no SMS has arrived for quiet_ms, at most max_ms. Reads (and drops) what the modem sends
+ * meanwhile, so a +CMTI arriving during the wait is seen (review, build 9: it only slept before,
+ * and an arrival during the wait went unnoticed until after the decision). Returns true if quiet. */
+static bool wait_sms_quiet(uint32_t quiet_ms, uint32_t max_ms)
+{
+    uint32_t waited = 0;
+    clear_rx();
+    while (sms_arrived_within(quiet_ms)) {
+        if (waited >= max_ms) {
+            return false;
+        }
+        vTaskDelay(250 / portTICK_RATE_MS);
+        waited += 250;
+        clear_rx();
+    }
+    return true;
+}
+
+/* +CMTI in what is about to be thrown away. The match state is kept between calls, so a +CMTI
+ * split across two reads is still seen (review, build 9). */
+static uint8_t s_cmti_match = 0;
+static void scan_ring_for_cmti(void)
+{
+    static const char pat[] = "+CMTI";
+    uint16_t t = s_rx_tail;
+    const uint16_t h = s_rx_head;
+    while (t != h) {
+        char c = s_rx_buf[t];
+        s_cmti_match = (c == pat[s_cmti_match]) ? (uint8_t)(s_cmti_match + 1) : (uint8_t)(c == pat[0] ? 1 : 0);
+        if (s_cmti_match == sizeof(pat) - 1) {
+            note_sms_arrival();
+            s_cmti_match = 0;
+        }
+        t = (uint16_t)((t + 1) % RX_BUFFER_SIZE);
+    }
+}
+
 static void clear_rx(void)
 {
+    scan_ring_for_cmti();
     NVIC_DisableIRQ(UART2_IRQn);
     s_rx_head = 0;
     s_rx_tail = 0;
@@ -261,6 +391,9 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
                 tail = (tail + 1) % RX_BUFFER_SIZE;
             }
             s_rx_temp[idx] = '\0';
+            if (strstr(s_rx_temp, "+CMTI")) {
+                note_sms_arrival();
+            }
 
             char *match = strstr(s_rx_temp, expected);
             if (match != NULL) {
@@ -278,7 +411,11 @@ static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_c
             }
 
             /* Detect error response to avoid useless long timeouts */
-            if (strstr(s_rx_temp, "ERROR") != NULL && strstr(expected, "ERROR") == NULL) {
+            const bool err = s_list_wait ? (strstr(s_rx_temp, "\r\nERROR\r\n") != NULL ||
+                                            strstr(s_rx_temp, "\r\n+CMS ERROR") != NULL ||
+                                            strstr(s_rx_temp, "\r\n+CME ERROR") != NULL)
+                                         : (strstr(s_rx_temp, "ERROR") != NULL);
+            if (err && strstr(expected, "ERROR") == NULL) {
                 rx_settle_and_snapshot();
                 head = s_rx_head;
                 if (out_capture && capture_size > 0) {
@@ -592,7 +729,7 @@ bool sim7600_power_on(void)
     s_net_mode = 0;   /* Set again only if this power-on registers */
 
     /* 1. Turn ON 3.8V rail via LPC845 sentry command ($n2;) */
-    hal_power_modem_on();
+    modem_rail_on();
 
     /* 2. Select SIM holder J1A (P0.0 LOW) */
     LPC_GPIO0->FIOCLR = (1UL << PIN_SIM_SEL);       /* Driven LOW = Holder J1A */
@@ -602,29 +739,46 @@ bool sim7600_power_on(void)
     LPC_GPIO0->FIODIR |= (1UL << PIN_PWR_KEY);
     LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
 
-    /* 3. Probe if modem is already running */
+    /* 3. Probe if modem is already running. One still booting from its rail is waited for
+     * (MODEM_BOOT_WAIT_SEC), not pulsed. */
     clear_rx();
     send_raw("AT\r\n");
-    if (!wait_response("OK", 500, NULL, 0)) {
+    bool modem_ready = wait_response("OK", 500, NULL, 0);
+    if (!modem_ready && modem_rail_age_sec() < MODEM_BOOT_WAIT_SEC) {
+        report_progress("MODEM BOOTING...");
+        while (!modem_ready && modem_rail_age_sec() < MODEM_BOOT_WAIT_SEC) {
+            if (sim7600_is_cancel_requested()) return false;
+            delay_ms(200);
+            clear_rx();
+            send_raw("AT\r\n");
+            modem_ready = wait_response("OK", 800, NULL, 0);
+        }
+    }
+    if (modem_ready) {
+        /* Answering: the SIM holder has been selected since boot (sim7600_init), so the 2 s settle
+         * below isn't needed (v6.9.55 build 12: it added 2 s to every slot) */
+        s_modem_answered = true;
+        snprintf(s_rail_msg, sizeof(s_rail_msg), "Modem answered %lus after its power came on", (unsigned long)modem_rail_age_sec());
+        storage_log_debug("MODEM", s_rail_msg);
+    } else {
         /* Modem is asleep: pulse PWRKEY LOW for 500ms to boot SIM7600 */
         storage_log_debug("MODEM", "Modem idle, pulsing PWRKEY LOW (500ms) to power on...");
         LPC_GPIO0->FIOCLR = (1UL << PIN_PWR_KEY);
         delay_ms(500);
         LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
         delay_ms(500);
-    }
 
-    /* Allow SIM multiplexer and power supply 2.0s to settle */
-    for (int i = 0; i < 20; i++) {
-        if (sim7600_is_cancel_requested()) return false;
-        delay_ms(100);
+        /* Allow SIM multiplexer and power supply 2.0s to settle */
+        for (int i = 0; i < 20; i++) {
+            if (sim7600_is_cancel_requested()) return false;
+            delay_ms(100);
+        }
     }
 
     /* 4. Probe modem with "AT" once per second up to 30s or until RDY/OK */
     report_progress("AT PROBING...   ");
     clear_rx();
-    bool modem_ready = false;
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 30 && !modem_ready; i++) {
         if (sim7600_is_cancel_requested()) return false;
         send_raw("AT\r\n");
         if (wait_response("OK", 800, NULL, 0) || wait_response("RDY", 200, NULL, 0)) {
@@ -778,8 +932,8 @@ bool sim7600_power_on(void)
     int rat_mode = plan.search_4g ? 38 : 13;
     char rat_cmd[20];
     snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
-    send_raw(rat_cmd);
-    wait_response("OK", 1000, NULL, 0);
+    s_rat_unsure = false;
+    set_rat_mode(rat_cmd);
     snprintf(capture, sizeof(capture), plan.search_4g ? "Searching 4G for up to %us%s" : "4G no use here lately: straight to 2G",
              (unsigned)plan.wait_4g_sec, plan.full_probe ? " (full 4G check)" : "");
     storage_log_debug("MODEM", capture);
@@ -793,6 +947,7 @@ bool sim7600_power_on(void)
     uint8_t sec_to_4g = 0;
     const portTickType search_begin = xTaskGetTickCount();
     portTickType voice_only_since = 0;
+    bool cgreg_not_lte_logged = false;
     /* The mode is the one the modem was held to when it registered: in 4G-only mode it can only be on
      * 4G, whichever of CEREG/CGREG/CREG reports it first (BIHAR's modem answers CGREG on LTE) */
     #define MODE_NOW() ((rat_mode == 38) ? NET_4G : NET_2G)
@@ -809,15 +964,13 @@ bool sim7600_power_on(void)
             snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
             snprintf(capture, sizeof(capture), "No 2G after %lus: trying 4G", (unsigned long)searched_sec);
             storage_log_debug("MODEM", capture);
-            send_raw(rat_cmd);
-            wait_response("OK", 1000, NULL, 0);
+            set_rat_mode(rat_cmd);
         } else if (rat_mode == 38 && plan.search_4g && searched_sec >= plan.wait_4g_sec) {
             rat_mode = 13;
             snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
             snprintf(capture, sizeof(capture), "No 4G after %lus: trying 2G", (unsigned long)searched_sec);
             storage_log_debug("MODEM", capture);
-            send_raw(rat_cmd);
-            wait_response("OK", 1000, NULL, 0);
+            set_rat_mode(rat_cmd);
         }
 
         clear_rx();
@@ -828,8 +981,7 @@ bool sim7600_power_on(void)
             rat_mode = 13;
             snprintf(rat_cmd, sizeof(rat_cmd), "AT+CNMP=%d\r\n", rat_mode);
             storage_log_debug("MODEM", "4G registration denied by the network: trying 2G now");
-            send_raw(rat_cmd);
-            wait_response("OK", 1000, NULL, 0);
+            set_rat_mode(rat_cmd);
             continue;
         }
         if (cereg_answered && (strstr(capture, ",1") || strstr(capture, ",5"))) {
@@ -843,6 +995,24 @@ bool sim7600_power_on(void)
         clear_rx();
         send_raw("AT+CGREG?\r\n");
         if (wait_response("+CGREG: ", 800, capture, sizeof(capture)) && (strstr(capture, ",1") || strstr(capture, ",5"))) {
+            /* v6.9.55 (build 11): in 4G-only mode CGREG can still be the old 3G registration the modem
+             * powered up on (001903, 15 Nov 11:31: the 11:16 SMS listening ended on 3G; CNMP=38, then
+             * CEREG 0,4 + CGREG 0,1 taken as LTE, COPS showed act 2, CGACT "no network service", 80 s
+             * lost). Accept it only if COPS shows the modem really is on LTE (act 7). */
+            if (rat_mode == 38) {
+                char cops[96];
+                clear_rx();
+                send_raw("AT+COPS?\r\n");
+                const char *act = wait_response("+COPS:", 1500, cops, sizeof(cops)) ? strrchr(cops, ',') : NULL;
+                if (act == NULL || act[1] != '7') {
+                    if (!cgreg_not_lte_logged) {
+                        cgreg_not_lte_logged = true;
+                        storage_log_debug("MODEM", "+CGREG registered but not on LTE yet (old 3G/2G registration): waiting for 4G");
+                    }
+                    delay_ms(1000);
+                    continue;
+                }
+            }
             registered = true;
             reg_mode = MODE_NOW();
             storage_log_debug("MODEM", rat_mode == 38 ? "Registered on LTE (+CGREG: 1/5 in 4G-only mode)" : "Registered on GPRS (+CGREG: 1/5)");
@@ -872,13 +1042,18 @@ bool sim7600_power_on(void)
     }
     if (registered) {
         report_progress("NET REGISTERED  ");
+        /* Build 12: what sets the CTRL's slot wake delay (SLOT_WAKE_DELAY_100MS) */
+        snprintf(s_rail_msg, sizeof(s_rail_msg), "Registered %lus after the modem's power came on", (unsigned long)modem_rail_age_sec());
+        storage_log_debug("MODEM", s_rail_msg);
     } else {
         report_progress("NO NETWORK      ");
         storage_log_debug("MODEM", "Network registration timeout!");
     }
     s_net_mode = reg_mode;
-    net_policy_registered(&s_net, searched_4g, reg_mode, sec_to_4g);
-    save_net_policy();
+    if (!s_rat_unsure) {
+        net_policy_registered(&s_net, searched_4g, reg_mode, sec_to_4g);
+        save_net_policy();
+    }
 
     /* 9. Read Signal Quality (AT+CSQ) */
     report_progress("READING CSQ...  ");
@@ -931,6 +1106,11 @@ static uint32_t s_cclk_poll_counter = 0;
 
 void sim7600_power_off(void)
 {
+    /* v6.9.55: an SMS that just arrived still needs its acknowledgement to reach the network */
+    if (sms_arrived_within(SMS_QUIET_MS)) {
+        storage_log_debug("SMS", "An SMS just arrived: power-off waits a few seconds for its acknowledgement");
+        wait_sms_quiet(SMS_QUIET_MS, SMS_QUIET_MS);
+    }
     storage_log_debug("MODEM", "Powering down SIM7600 cellular engine...");
     s_modem_answered = false;
 
@@ -961,6 +1141,7 @@ void sim7600_power_off(void)
 
     /* Cut 3.8V rail via LPC845 sentry ($f2;) */
     hal_power_modem_off();
+    s_rail_cut = true;
 
     /* Reset worker state so supervisor does not poll while powered down */
     s_worker_state = MODEM_ST_UNINIT;
@@ -981,16 +1162,20 @@ void sim7600_worker_step(void)
 
     switch (s_worker_state) {
         case MODEM_ST_UNINIT:
-            hal_power_modem_on();
+            modem_rail_on();
             LPC_GPIO0->FIOCLR = (1UL << PIN_SIM_SEL);
             LPC_GPIO0->FIODIR |= (1UL << PIN_SIM_SEL);
             LPC_GPIO0->FIODIR |= (1UL << PIN_PWR_KEY);
             LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
 
-            /* Check if already responsive; if not, pulse PWRKEY LOW for 500ms */
+            /* Check if already responsive; if not, pulse PWRKEY LOW for 500ms. Not while it may
+             * still be booting from its rail (build 12): it is asked again next step instead. */
             clear_rx();
             send_raw("AT\r\n");
             if (!wait_response("OK", 400, NULL, 0)) {
+                if (modem_rail_age_sec() < MODEM_BOOT_WAIT_SEC) {
+                    break;      /* Still UNINIT: probed again next step */
+                }
                 LPC_GPIO0->FIOCLR = (1UL << PIN_PWR_KEY);
                 delay_ms(500);
                 LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
@@ -2335,9 +2520,14 @@ void sanitize_phone_number(char *dest, const char *src, size_t dest_size)
 }
 
 /* The ESP32's sequence: AT+CMGF, AT+CSCA?, AT+CMGS, the text, 100 ms, then Ctrl+Z */
+/* v6.9.55: true once the text and Ctrl+Z have gone to the modem: from then on the network may have it,
+ * whether or not +CMGS comes, so the reply must not be sent again */
+static bool s_sms_handed_over = false;
+
 static bool __attribute__((noinline)) send_sms_to_number(const char *number, const char *message)
 {
     char cap[128] = "";
+    s_sms_handed_over = false;
 
     clear_rx();
     send_raw("ATE0\r\n");
@@ -2407,10 +2597,43 @@ static bool __attribute__((noinline)) send_sms_to_number(const char *number, con
     delay_ms(100); /* Breather before the transmit surge */
     uint8_t ctrl_z = 0x1A;
     UART_Send(UART_MODEM, &ctrl_z, 1, BLOCKING);
+    s_sms_handed_over = true;
 
     /* 6. Wait for cellular network SMS acknowledgement */
-    /* The ESP32 waits 20s, but the SIM7600 answers nothing else until this ends, so give it longer */
-    if (wait_response("+CMGS:", 60000, cap, sizeof(cap))) {
+    /* The ESP32 waits 20s, but the SIM7600 answers nothing else until this ends, so give it longer.
+     * v6.9.55: BSNL on LTE took 102 s (001903, 14 Nov 08:22: +CMGS: 36 came after the 60 s wait had
+     * given up; the retry sent the reply a second time). So after 60 s it waits up to SMS_CMGS_MORE_MS
+     * more, for +CMGS or an error, before calling it unknown. */
+    /* Review, build 9: waited in 30 s pieces with a watchdog check-in, as 60 + 120 s in one go
+     * passed the Modem task's 180 s limit (LCD on) and restarted the unit mid-send */
+    bool confirmed = false;
+    uint32_t waited_ms = 0;
+    const uint32_t total_ms = 60000 + SMS_CMGS_MORE_MS;
+    /* Build 12 (review): cap still held the '>' prompt's capture; a timeout leaves it as it is, so
+     * anything in it with "ERROR" would have been taken as the network refusing, and resent */
+    cap[0] = '\0';
+    while (!confirmed && waited_ms < total_ms) {
+        hal_power_heartbeat();
+        confirmed = wait_response("+CMGS:", 30000, cap, sizeof(cap));
+        waited_ms += 30000;
+        if (confirmed || strstr(cap, "ERROR")) {
+            break;
+        }
+        if (waited_ms == 60000) {
+            storage_log_debug("SMS", "No confirmation in 60 s: still waiting for the network");
+            report_progress("WAITING NETWORK ");
+        }
+        if (sim7600_is_cancel_requested()) {
+            break;
+        }
+    }
+    hal_power_heartbeat();
+    if (!confirmed && strstr(cap, "ERROR")) {
+        /* +CMS ERROR (network refused) or a plain ERROR (modem rejected the text): not sent, a
+         * retry is safe (review, build 9: only +CMS ERROR counted before) */
+        s_sms_handed_over = false;
+    }
+    if (confirmed) {
         report_progress("STATUS SENT OK  ");
         char ok_log[80];
         snprintf(ok_log, sizeof(ok_log), "SMS Sent OK: %s", cap);
@@ -2472,10 +2695,21 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
     char line[64];
     snprintf(line, sizeof(line), "Sending to %s", plain);
     storage_log_debug("SMS", line);
+    /* v6.9.55: not while SMS are still coming in (see note_sms_arrival) */
+    wait_sms_quiet(SMS_QUIET_MS, SMS_QUIET_MAX_MS);
     if (send_sms_to_number(plain, message)) {
         return true;
     }
     if (sim7600_is_cancel_requested()) {
+        return false;
+    }
+    /* v6.9.55: handed to the network with no answer either way. It may well arrive (it did, twice,
+     * at 08:24 on 14 Nov), so it is not sent again: a missing reply can be asked for again, a
+     * repeated one can't be taken back. ESC in case the modem is still in text input. */
+    if (s_sms_handed_over) {
+        bool alive = sms_modem_answers();
+        storage_log_debug("SMS", alive ? "No confirmation for the reply: not sent again (a repeat would arrive twice)"
+                                       : "No confirmation for the reply and the modem is silent: not sent again");
         return false;
     }
 
@@ -2707,10 +2941,31 @@ bool sim7600_prepare_sms_listen(void)
     clear_rx();
     send_raw("AT+CNMP=2\r\n");
     wait_response("OK", 2000, NULL, 0);
-    /* v6.9.47: register afresh, as at a power-on. Switching an LTE-only registration to automatic
-     * only updates it, and SMS waiting at another operator's SMS centre stayed there (001903,
-     * 13 Nov: Jio SMS waited across slots; delivered 34 s after a power-on in automatic mode at
-     * 12:51). A new attach is what tells the network, and so the SMS centres, the phone is back. */
+    /* v6.9.55 (build 7): always leave the network and join again (COPS=2, COPS=0), as v6.9.47, once
+     * no SMS is arriving. Build 6 joined again only when automatic mode showed no CREG in 15 s;
+     * on BSNL LTE CREG showed at once, so there was never a fresh attach, and Jio/Airtel SMS waited
+     * for those centres' own retry timers (1-1.5 h, 001903, 14 Nov afternoon). A fresh attach is what
+     * makes the network tell a waiting SMS centre the phone is back (13 Nov 12:51: delivered 34 s
+     * after). The Airtel repeat (09:31:17: an SMS arrived 1 s before COPS=2, so its acknowledgement
+     * never went out) is avoided by waiting for SMS quiet first and staying on the network if one
+     * came. */
+    for (int i = 0; i < 3; i++) {
+        clear_rx();
+        send_raw("AT+CREG?\r\n");
+        if (wait_response("+CREG: ", 1000, cap, sizeof(cap)) && (strstr(cap, ",1") || strstr(cap, ",5"))) {
+            break;
+        }
+        delay_ms(1000);
+    }
+    delay_ms(2000);        /* An SMS waiting at our own operator's centre comes now */
+    /* Review, build 9: an SMS arriving no longer skips the re-join (that left Jio/Airtel SMS waiting
+     * whenever a BSNL one came first). The re-join waits until none has arrived for SMS_QUIET_MS, so
+     * each acknowledgement is out; only if they keep coming for SMS_QUIET_MAX_MS does it stay on. */
+    if (!wait_sms_quiet(SMS_QUIET_MS, SMS_QUIET_MAX_MS)) {
+        storage_log_debug("SMS", "Listening: automatic mode, SMS still arriving: staying on the network");
+        return true;
+    }
+    storage_log_debug("SMS", "Listening: leaving the network and joining again (tells other operators' SMS centres)");
     clear_rx();
     send_raw("AT+COPS=2\r\n");
     wait_response("OK", 10000, NULL, 0);
@@ -2752,6 +3007,54 @@ typedef struct {
 } sms_in_t;
 static sms_in_t s_inbox[SMS_INBOX_MAX];     /* Static: runs in the slot, on the main task's stack */
 static char s_sms_reply[160];
+
+/* Build 9 (001903, 14 Nov 16:00): Airtel delivered a morning's worth of commands at once (GET_GPS,
+ * GET_STATUS, GET_NUM, several of each); each reply took BSNL 1-2 min to confirm and the slot ran
+ * 5 min. A GET_ command (read-only) from a sender who got the same answer in the last
+ * SMS_GET_REPEAT_MIN minutes is not answered again: the answer would be the same. SET_ commands
+ * always run. */
+typedef struct {
+    char num[11];
+    uint8_t cmd;
+    portTickType at;
+} sms_answered_t;
+static sms_answered_t s_answered[6];
+
+static bool sms_get_answered_lately(const sms_in_t *m)
+{
+    static char arg[96];
+    static char body[sizeof(m->body)];
+    char num[11];
+    memcpy(body, m->body, sizeof(body));
+    body[sizeof(body) - 1] = '\0';
+    sms_decode_ucs2(body);
+    const sms_cmd_t cmd = sms_cmd_parse(body, arg, sizeof(arg));
+    if ((cmd != SMS_CMD_GET_STATUS && cmd != SMS_CMD_GET_GPS && cmd != SMS_CMD_GET_CONFIG && cmd != SMS_CMD_GET_NUM)
+        || !sms_number_last10(m->from, num)) {
+        return false;
+    }
+    const portTickType now = xTaskGetTickCount();
+    const portTickType window = (portTickType)SMS_GET_REPEAT_MIN * 60u * configTICK_RATE_HZ;
+    int oldest = 0;
+    for (int i = 0; i < (int)(sizeof(s_answered) / sizeof(s_answered[0])); i++) {
+        sms_answered_t *a = &s_answered[i];
+        if (a->num[0] && a->cmd == (uint8_t)cmd && strcmp(a->num, num) == 0 && (now - a->at) < window) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Same request from %s answered %lu s ago: not answered again",
+                     num, (unsigned long)((now - a->at) / configTICK_RATE_HZ));
+            storage_log_debug("SMS", msg);
+            return true;
+        }
+        if (!a->num[0] || (now - a->at) > (now - s_answered[oldest].at)) {
+            oldest = i;
+        }
+    }
+    memcpy(s_answered[oldest].num, num, sizeof(num));
+    s_answered[oldest].cmd = (uint8_t)cmd;
+    s_answered[oldest].at = now;
+    return false;
+}
+
 
 /* Messages out of an AT+CMGL list: +CMGL: <i>,"REC UNREAD","<from>","","<time>"\r\n<body>\r\n. Only
  * whole ones: a list cut short by the buffer ends with a message whose text may be cut too, and a
@@ -3063,6 +3366,19 @@ static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
     reply(m->from, out);
 }
 
+/* The SIM's messages into cap. Waits for the list's own closing line: "OK" alone is also found
+ * inside message text (build 14, review). */
+static bool list_sms(char *cap, size_t cap_size)
+{
+    clear_rx();
+    cap[0] = '\0';
+    s_list_wait = true;
+    send_raw("AT+CMGL=\"ALL\"\r\n");
+    bool listed = wait_response("\r\nOK\r\n", 3000, cap, cap_size);
+    s_list_wait = false;
+    return listed;
+}
+
 int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
 {
     static bool s_list_error_logged = false;
@@ -3074,12 +3390,9 @@ int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
      * 2026-11-13 12:00: GET_STATUS and GET_CONFIG sent, no reply) */
     send_raw("AT+CMGF=1\r\n");
     wait_response("OK", 1000, NULL, 0);
-    clear_rx();
     /* ALL, not REC UNREAD: listing marks them read, and any not handled this slot (more than 4,
      * or cut short) must be listed again next slot */
-    send_raw("AT+CMGL=\"ALL\"\r\n");
-    s_sms_capture[0] = '\0';
-    bool listed = wait_response("OK", 3000, s_sms_capture, sizeof(s_sms_capture));
+    bool listed = list_sms(s_sms_capture, sizeof(s_sms_capture));
     s_log_quiet = false;
     if (!listed) {
         if (!s_list_error_logged) {
@@ -3121,9 +3434,38 @@ int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
         }
         return 0;
     }
-    storage_log_debug("SMS", s_sms_capture);
+    /* v6.9.55: more may be on their way (an SMS centre hands over its queue one at a time, seconds
+     * apart): listed again until nothing new comes for SMS_QUIET_MS, so no reply goes out while
+     * one is arriving (see note_sms_arrival) */
+    if (strstr(s_sms_capture, "REC UNREAD")) {
+        note_sms_arrival();    /* Only new ones: old ones on the SIM aren't arriving (review, build 9) */
+    }
+    for (int relist = 0; relist < 3 && sms_arrived_within(SMS_QUIET_MS); relist++) {
+        int before = count_listed(s_sms_capture);
+        if (before >= SMS_INBOX_MAX) {
+            break;
+        }
+        wait_sms_quiet(SMS_QUIET_MS, SMS_QUIET_MAX_MS);
+        hal_power_heartbeat();
+        s_log_quiet = true;
+        bool again = list_sms(s_sms_capture2, sizeof(s_sms_capture2));
+        s_log_quiet = false;
+        if (!again || count_listed(s_sms_capture2) <= before) {
+            break;
+        }
+        memcpy(s_sms_capture, s_sms_capture2, sizeof(s_sms_capture));
+        note_sms_arrival();
+    }
+    /* Build 10: one line per message (the whole list in one line was cut at about 300 characters, so
+     * messages 3 and 4 never showed in the log; 001903, 14 Nov 16:01) */
     /* Copied out first: the replies reuse the capture buffer. Each message has its own sender. */
     int n = split_inbox(s_sms_capture);
+    for (int i = 0; i < n; i++) {
+        static char line[120];   /* Static: Modem task stack */
+        snprintf(line, sizeof(line), "In #%d from %s at %.17s: %.60s", s_inbox[i].index, s_inbox[i].from,
+                 s_inbox[i].ts, s_inbox[i].body);
+        storage_log_debug("SMS", line);
+    }
 
     /* Each deleted before it runs: a restart part way through can't run a command twice. Only the
      * ones taken: the rest wait for the next slot. */
@@ -3134,8 +3476,39 @@ int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
         send_raw(del);
         wait_response("OK", 2000, NULL, 0);
     }
+    /* v6.9.55: one the network delivered again (same sender, centre stamp and text as one already
+     * handled) is not answered again */
+    static char seen_text[SMS_SEEN_TEXT_LEN + 8];   /* Static: Modem task stack (review, build 9) */
+    if (!s_seen_loaded) {
+        seen_text[0] = '\0';
+        if (!storage_state_load(SMS_SEEN_FILENAME, seen_text, sizeof(seen_text))) {
+            seen_text[0] = '\0';
+        }
+        sms_seen_parse(&s_seen, seen_text);
+        /* Build 12 (review): loaded once, even with no file or card. Was set from the load result,
+         * so with none it parsed an empty list at every check and forgot what this boot had seen. */
+        s_seen_loaded = true;
+    }
+    bool seen_changed = false;
     for (int i = 0; i < n; i++) {
         hal_power_heartbeat();
+        if (sms_seen_repeat(&s_seen, s_inbox[i].from, s_inbox[i].ts, s_inbox[i].body, &seen_changed)) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Sent again by the network (%s, %.17s): already answered, not again",
+                     s_inbox[i].from, s_inbox[i].ts);
+            storage_log_debug("SMS", msg);
+            continue;
+        }
+        /* Saved before it runs: a restart during the reply must not leave it unrecorded, or a
+         * repeat delivery would be answered again (review, build 9) */
+        if (seen_changed) {
+            sms_seen_format(&s_seen, seen_text, sizeof(seen_text));
+            storage_state_save(SMS_SEEN_FILENAME, seen_text);
+            seen_changed = false;
+        }
+        if (sms_get_answered_lately(&s_inbox[i])) {
+            continue;
+        }
         sms_run(&s_inbox[i], telemetry);
     }
     return n;

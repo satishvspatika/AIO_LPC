@@ -65,4 +65,30 @@ bool sms_age_minutes(const char *sms_ts, const char *now14, long *out_minutes);
  * plain text when every character is plain ASCII; anything else is left as it is. True if decoded. */
 bool sms_decode_ucs2(char *body);
 
+/* ---- Messages the network delivers twice (v6.9.55) ----
+ * An SMS centre that gets no delivery acknowledgement sends the same message again later, with the
+ * same centre time stamp (Airtel, 001903, 14 Nov: three commands answered twice, up to 66 min apart).
+ * A repeat is the same sender (last 10 digits), stamp and text as one of the last SMS_SEEN_MAX messages
+ * handled. Only exact matches: a late but genuine older message still runs. Fixed-length text for a
+ * state file. */
+#define SMS_SEEN_MAX       10
+#define SMS_SEEN_LINE_LEN  35   /* "NNNNNNNNNN YY/MM/DD,hh:mm:ss CCCC\r\n" */
+#define SMS_SEEN_TEXT_LEN  (SMS_SEEN_MAX * SMS_SEEN_LINE_LEN)
+typedef struct {
+    char num[11];      /* Sender's last 10 digits, "" = free */
+    char ts[18];       /* SMS centre stamp "yy/MM/dd,hh:mm:ss" */
+    uint16_t body_sum; /* Of the message's text */
+} sms_seen_entry_t;
+typedef struct {
+    sms_seen_entry_t e[SMS_SEEN_MAX];
+} sms_seen_t;
+
+void sms_seen_clear(sms_seen_t *s);
+void sms_seen_parse(sms_seen_t *s, const char *text);
+/* Always SMS_SEEN_TEXT_LEN characters (written over the old file in place). Returns the length. */
+int sms_seen_format(const sms_seen_t *s, char *out, size_t size);
+/* True if this message was handled before. Otherwise notes it (true in *changed) and returns false.
+ * No usable number or stamp: never a repeat, nothing noted. */
+bool sms_seen_repeat(sms_seen_t *s, const char *from, const char *ts, const char *body, bool *changed);
+
 #endif /* SMS_CMD_H */

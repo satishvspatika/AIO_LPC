@@ -41,12 +41,7 @@ fi
 echo "=== 1. Compiling Clean AIO LPC1768 Sources ==="
 # PRODUCTION_BUILD in user_config.h: 1 leaves out -DDEBUG (the NXP drivers' parameter checks)
 PRODUCTION_BUILD="$(awk '$1 == "#define" && $2 == "PRODUCTION_BUILD" {print $3}' "${LPC_DIR}/user_config.h")"
-TESTING_DEBUG_LOG="$(awk '$1 == "#define" && $2 == "TESTING_DEBUG_LOG" {print $3}' "${LPC_DIR}/user_config.h")"
-if [ "${PRODUCTION_BUILD}" = "1" ] && [ "${TESTING_DEBUG_LOG}" = "1" ]; then
-    DEBUG_FLAG=""
-    echo "TESTING build (PRODUCTION_BUILD 1, TESTING_DEBUG_LOG 1): no -DDEBUG, KEY TEST hidden, debug log ON by default"
-    echo "    For the production release set TESTING_DEBUG_LOG 0 in user_config.h"
-elif [ "${PRODUCTION_BUILD}" = "1" ]; then
+if [ "${PRODUCTION_BUILD}" = "1" ]; then
     DEBUG_FLAG=""
     echo "Production build (PRODUCTION_BUILD 1): no -DDEBUG, KEY TEST hidden, debug log only with DEBUGLOG.ON"
 elif [ "${PRODUCTION_BUILD}" = "0" ]; then

@@ -16,6 +16,8 @@ void hal_power_sleep_system(void);
 
 /* Tells the LPC845 this chip is still making progress (it cuts power after 11 min without) */
 void hal_power_heartbeat(void);
+/* CTRL v1.15+: slot wake delay after the boundary, in seconds (older CTRLs ignore it) */
+void hal_power_set_slot_wake(unsigned seconds);
 
 /* Firmware update commands to the LPC845 */
 void hal_power_send_frame(const char *frame);

@@ -1,6 +1,7 @@
 #include "sms_cmd.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static char up(char c)
 {
@@ -392,4 +393,116 @@ bool sms_decode_ucs2(char *body)
     }
     body[o] = '\0';
     return true;
+}
+
+/* ---- Messages delivered twice (v6.9.55) ---- */
+static uint16_t body_sum16(const char *b)
+{
+    uint16_t h = 0x1D0F;
+    for (; b && *b; b++) {
+        if (*b == '\r' || *b == '\n') {
+            continue;      /* Line ends differ between list copies; the text doesn't */
+        }
+        h = (uint16_t)((h << 5) ^ (h >> 11) ^ (uint8_t)*b);
+    }
+    return h;
+}
+
+void sms_seen_clear(sms_seen_t *s)
+{
+    memset(s, 0, sizeof(*s));
+}
+
+static bool ts17(const char *ts, char out[18])
+{
+    /* "yy/MM/dd,hh:mm:ss": digits where digits belong, so a stamp compares as text */
+    static const char shape[] = "dd/dd/dd,dd:dd:dd";
+    if (!ts) return false;
+    for (int i = 0; i < 17; i++) {
+        char c = ts[i];
+        if (shape[i] == 'd' ? (c < '0' || c > '9') : (c != shape[i])) {
+            return false;
+        }
+    }
+    memcpy(out, ts, 17);
+    out[17] = '\0';
+    return true;
+}
+
+void sms_seen_parse(sms_seen_t *s, const char *text)
+{
+    sms_seen_clear(s);
+    int n = 0;
+    const char *p = text;
+    while (p && *p && n < SMS_SEEN_MAX) {
+        char num[11];
+        char ts[18];
+        unsigned sum = 0;
+        bool ok = true;
+        for (int i = 0; i < 10; i++) {
+            if (p[i] < '0' || p[i] > '9') { ok = false; break; }
+            num[i] = p[i];
+        }
+        num[10] = '\0';
+        ok = ok && p[10] == ' ' && ts17(p + 11, ts) && p[28] == ' ';
+        if (ok) {
+            char hex[5];
+            memcpy(hex, p + 29, 4);
+            hex[4] = '\0';
+            char *end = NULL;
+            sum = (unsigned)strtoul(hex, &end, 16);
+            ok = end == hex + 4;
+        }
+        if (ok) {
+            memcpy(s->e[n].num, num, sizeof(num));
+            memcpy(s->e[n].ts, ts, sizeof(ts));
+            s->e[n].body_sum = (uint16_t)sum;
+            n++;
+        }
+        const char *nl = strchr(p, '\n');
+        p = nl ? nl + 1 : NULL;
+    }
+}
+
+int sms_seen_format(const sms_seen_t *s, char *out, size_t size)
+{
+    if (!out || size < SMS_SEEN_TEXT_LEN + 1) {
+        return 0;
+    }
+    int o = 0;
+    for (int i = 0; i < SMS_SEEN_MAX; i++) {
+        const sms_seen_entry_t *e = &s->e[i];
+        if (e->num[0]) {
+            o += snprintf(out + o, size - (size_t)o, "%-10.10s %-17.17s %04X\r\n", e->num, e->ts, (unsigned)e->body_sum);
+        } else {
+            o += snprintf(out + o, size - (size_t)o, "%-33s\r\n", "-");   /* Free: same length */
+        }
+    }
+    return o;
+}
+
+bool sms_seen_repeat(sms_seen_t *s, const char *from, const char *ts, const char *body, bool *changed)
+{
+    char num[11];
+    char t[18];
+    if (!sms_number_last10(from, num) || !ts17(ts, t)) {
+        return false;
+    }
+    const uint16_t sum = body_sum16(body);
+    int at = 0;
+    for (int i = 0; i < SMS_SEEN_MAX; i++) {
+        const sms_seen_entry_t *e = &s->e[i];
+        if (e->num[0] && e->body_sum == sum && strcmp(e->num, num) == 0 && strcmp(e->ts, t) == 0) {
+            return true;
+        }
+        /* Room for it: a free entry, else the oldest stamp */
+        if (s->e[at].num[0] && (!e->num[0] || strcmp(e->ts, s->e[at].ts) < 0)) {
+            at = i;
+        }
+    }
+    memcpy(s->e[at].num, num, sizeof(num));
+    memcpy(s->e[at].ts, t, sizeof(t));
+    s->e[at].body_sum = sum;
+    if (changed) *changed = true;
+    return false;
 }

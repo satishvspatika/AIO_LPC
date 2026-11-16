@@ -52,7 +52,8 @@
  *----------------------------------------------------------*/
 
 #define configUSE_PREEMPTION		1
-#define configUSE_IDLE_HOOK			0
+/* v6.9.55 build 13: 1 = vApplicationIdleHook (main.c) sleeps the core whenever no task has work */
+#define configUSE_IDLE_HOOK			1
 #define configMAX_PRIORITIES		( ( unsigned portBASE_TYPE ) 5 )
 #define configUSE_TICK_HOOK			0
 // change this default 100000000UL to 25000000UL for 25 MHz working

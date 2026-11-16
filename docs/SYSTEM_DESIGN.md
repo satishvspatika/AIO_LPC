@@ -21,7 +21,9 @@ Requirements set by the product owner, in force:
 | Requirement | How it is met |
 |---|---|
 | The 15th-minute transmission is critical | Wake at every slot; the record is saved before any send; failed sends go to a backlog |
-| Slot wake 30 s after the boundary (845-v1.7) | The LPC845 closes the slot at the boundary as before, but powers an LPC1768 that is off 30 s later (`SLOT_WAKE_DELAY_100MS`). The server takes nothing before +62 s and the LPC1768 used to hold about 55 s. The modem boots with its rail (no PWRKEY pulse) and needs 16-18 s to answer and 20-27 s to register (operator boots, 2026-11-08), so 30 s keeps it registered by +62 s; a 45 s wake would push every send to about +70 s. An LPC1768 already running at the boundary runs the slot itself, and a DSP or safety wake in the 30 s drops the late wake. Expected: about 30 s less awake time for both the LPC1768 and the modem per slot (68 s to about 38 s) |
+| Slot wake 40 s after the boundary (845-v1.7: 30 s; 40 s from v6.9.55 build 12 with CTRL v1.16) | The LPC845 closes the slot at the boundary as before, but powers an LPC1768 that is off some seconds later, with the modem rail. Since CTRL v1.16 (v1.15 was an unreleased bench build) the delay is set by the LPC1768: `SLOT_WAKE_DELAY_SEC` in `user_config.h`, sent as `$W<seconds>;` at power-off whenever the CTRL reports another value (bits 10-15 of status-frame field 24; the CTRL accepts 10-55 s, starts at 30 s after any restart, and older CTRLs report 0 and are left alone). Tuning it needs a main firmware update only. The record is fixed at the boundary, so the wake time can't change any value sent. The server takes nothing before +62 s. The modem boots with its rail (no PWRKEY pulse) and needs 16-18 s to answer and 20-27 s to register (operator boots, 2026-11-08). At 30 s (v1.7 to v1.14) it was registered at the LPC1768's first check in 84 of 92 slots on 001903 (15-16 Nov), after a 26 s hold that was about 80 % of the 39 s awake. At 40 s the LPC1768 waits for registration where needed (to about +67 s) and does not pulse PWRKEY at a modem whose rail has been on under 30 s (v6.9.55 build 12); expected about 29 s awake. The modem rail can't come on earlier than the LPC1768's: the SIM holder select (P0.0) is driven by the LPC1768, so a modem booting with it unpowered could read the wrong holder. An LPC1768 already running at the boundary runs the slot itself, and a DSP or safety wake in the 40 s drops the late wake |
+| Power: no chip runs flat out while waiting (v6.9.55 build 13, CTRL v1.16) | LPC1768: the FreeRTOS idle task sleeps the core (`vApplicationIdleHook`, WFI; not with a debug probe attached). LPC845: WFI at the end of its main loop; everything timed runs in the 1 ms SysTick. Sleep mode only: all clocks, timers, UARTs and both watchdogs keep running. Saving not yet measured |
+| A damaged RTC read never becomes the time (CTRL v1.16) | `rtc_bcd_ok` (real BCD in range), `rtc_step_ok` (0-3 s on from the time held) or else two reads that agree; host test `bench/rtc_check_test.py`. Probe counters `rtc_bad_fields`, `rtc_steps_refused` |
 | Don't lose records; don't loop and drain the battery | Flash + SD copies, backlog, missed-slot fill, send time limits, restart-loop limit |
 | Rain day is 08:45 to 08:30 next day | LPC845 indexes samples from 08:45; day total resets only on a real change of rain day |
 | `CUM_RF` never dips within a rain day | Never-dip rule on the LPC1768 (TRG); rain count kept across LPC845 restarts |
@@ -62,6 +64,9 @@ LPC845 SWD connector; **plugging the MCU-Link into J2 resets the LPC845** (reset
 Inputs exist for BAT1, BAT2, solar (PIO0_21) and door sense. The separate JP1 on the LPC1768 board is USB power.
 
 LPC845 reset status values (`SYSRSTSTAT`): 1 power-on, 2 reset pin, 4 watchdog, 8 brown-out, 16 software.
+Status-frame field 24 carries those reset bits in bits 0-7, the clock state in bits 8-9 (CTRL v1.11) and the slot
+wake delay in seconds in bits 10-15 (CTRL v1.16). CTRL v1.16 also refuses a `$S` that isn't 14 digits of a real
+date and time followed by `;` (a damaged command used to set whatever it held).
 
 ---
 
@@ -253,10 +258,12 @@ status, firmware version and a checksum. Also the replies to the commands below.
    payload used the corrected time; SLOTS.CSV, the DATA file and backlog entries kept the LPC845's (e.g.
    `20000101001500`). The rain is still the count the LPC845 closed, so it may land one slot late, never lost.
 4. **Hold to +62 s.** Servers refuse a record sent less than 62 s after its boundary. The hold counts all the time
-   since the slot began (fixed in v6.9.2).
+   since the slot began (fixed in v6.9.2). Nothing is waiting for sensors here: the record was closed at the boundary (log text corrected in
+   v6.9.55 build 12).
 5. **Never-dip check (TRG).** `CUM_RF` is raised to the newest stored record's total if it would drop.
 6. **Modem on and registered.** Up to 2 tries; 1 try after about an hour with no network. A missing SIM stops after
-   one CFUN cycle.
+   one CFUN cycle. A modem whose rail came on less than 30 s ago is waited for, not pulsed (build 12). The log gives
+   `Modem answered Ns` and `Registered Ns after the modem's power came on`: the figures that set the CTRL's wake delay.
 7. **Save first.** The record goes to flash, then to the SD day file (the last row is compared first, so a restart
    can't add a second copy).
 8. **Send.** Up to 3 tries, one per route (by name, by IP, by modem HTTP). The route that worked then carries up to 15
@@ -349,7 +356,7 @@ the log then shows `registered for SMS` with `No SMS waiting`. v6.9.47: the wind
 | `ERASE_DATA <station ID>` (v6.9.48) | office | The keypad's ERASE DATA (`data_erase_all()`). The ID must be this unit's (leading zeros ignored). Done by the main task only: after the slot is recorded, or at once with the LCD on (the UI holds its power save until the erase is over, v6.9.54). Not done with CTRL silent (its rain total would be left behind) |
 
 **v6.9.49 to v6.9.54 (13 Nov, first test-team production cut with CTRL v1.14 and MIG-1.9):**
-- Listening slots are 11:00 and 17:00 only (`SMS_LISTEN_ALL_SLOTS 0`, `SMS_LISTEN_HOURS 11, 17`). Other slots do no
+- Listening slots (v6.9.55 build 8): 11:00, 11:15, 16:00, 16:15 (`SMS_LISTEN_ALL_SLOTS 0`, `SMS_LISTEN_SLOTS 1100, 1115, 1600, 1615`). Each re-joins the network (COPS=2/0) after 4 s SMS quiet, so other operators' SMS centres are alerted; the second of each pair catches what the first didn't. Was 11:00 and 17:00 only. Other slots do no
   SMS check at all (no extra modem time). A listening slot always reads the SIM once; the window itself only with
   `SMS_LISTEN_MIN_BUDGET_SEC` (120 s) of the slot left. Commands live 48 h (`SMS_MAX_AGE_MIN`); `SET_TIME` is refused
   when more than 15 min old by the network's time (`AT+CCLK?`), not this unit's clock.
@@ -365,6 +372,51 @@ the log then shows `registered for SMS` with `No SMS waiting`. v6.9.47: the wind
   (`wind_sample_1ms()` in SysTick), not every SCT edge: sub-ms spikes from a mains supply had read 53-85 m/s with the
   cups still. The main board still sends a 15-min average above `WS_AVG_MAX_MPS` (30) as 0.0 and logs it. The LCD
   shows the last 3 s (`lcd_wind_speed`), not the slot average.
+
+**v6.9.55 (14 Nov, in progress): SMS from other operators, every slot listens. Builds 1-3's radio changes below were REVERTED in build 4 (see end of this note).** The modem starts by itself at the
+slot boundary and registers during the sensor hold, in automatic mode on LTE with voice/SMS (`+CREG: 0,1`). Switching
+it to 4G-only (`CNMP=38`) at about +34 s dropped the voice/SMS part just when another operator's SMS centre, told
+the unit was back, tried to deliver; it backed off, and the window's re-attach (`COPS=2`/`0`) did not bring it back
+(001903, 13 Nov: Jio SMS of 15:38 missed the 15:46 and 16:01 windows, came 19 s after an LCD power-on at 16:35, where
+the mode is never changed). Now: where the learned plan wants 4G and `+CEREG` and `+CREG` are both registered at the
+start, the radio mode is left alone (`s_sms_reg_from_power_on`), counted as 4G in 1 s; `sim7600_prepare_sms_listen()`
+then only checks `+CREG` (no CNMP, no re-attach). `sim7600_power_off()` sends `AT+CNMP=2` before `AT+CPOF` (the modem
+keeps its mode over a power-off), so the next self-registration includes SMS. `SMS_LISTEN_ALL_SLOTS 1` (user,
+2026-11-14). `TESTING_DEBUG_LOG` removed: `PRODUCTION_BUILD` is the only build switch; test cards carry `DEBUGLOG.ON`.
+SMS send (same build, 14 Nov 08:30): BSNL on LTE confirmed a reply (`+CMGS`) 102 s after Ctrl+Z; the 60 s wait had
+given up, the modem (still busy, so silent) was restarted and the reply sent again (4 copies reached the Jio phone).
+Now `send_sms_to_number()` waits `SMS_CMGS_MORE_MS` (120 s) more, and once the text is handed over
+(`s_sms_handed_over`) `sim7600_send_sms()` never repeats it; only `+CMS ERROR` or no `>` prompt allows the second try.
+The UI's deferred power save also waits for `!sim7600_is_busy()` (it had retried every 50 ms, 340 log lines).
+Build 3 (14 Nov 08:50): at 08:45 the modem's own registration was on 3G (`CEREG 0,4`, `CREG 0,1`), so the LTE-only
+check failed, 4G was forced, none in 6 s, then 2G: SMS registration lost again (GET_GPS/GET_NUM not delivered).
+Now `auto_registration_kept()`: CREG registered at the start, then up to max(10 s, plan's 4G wait) for CEREG or
+CGREG, any access technology (COPS AcT); kept unless the plan says no 4G and it is on 4G. Kept on 3G/2G:
+`s_net_mode` 0, nothing learned. Policy message: "Sent on 2G (no 4G this time)" unless `datafail4` caused it.
+Build 4 (14 Nov 09:10, user decision): 09:00 kept 4G in automatic mode, data dropped after CGACT (`CEREG 0,4`), all 3
+attempts failed, and the window (SMS-registered since power-on) still got the 08:55 Jio SMS: none. Jio delivery
+delays 20-57 min match its own retry timer, not an alert on re-registration, so keeping registration gains nothing.
+Reverted: `auto_registration_kept`, `CNMP=2` before `CPOF`, the no-re-attach window. Kept: every slot listens,
+no repeat of a handed-over SMS (`s_sms_handed_over`, `SMS_CMGS_MORE_MS`), UI sleep waits for the modem, the policy
+message, one build switch. Known limit: other operators' SMS 20-60 min; BSNL next slot.
+Build 5 (14 Nov 09:55): `SMS_LISTEN_SEC` 10 (was 25; user): every SMS that came today was on the SIM at the first
+check after registering, so the wait caught nothing; slots had taken ~36 s (data ~7 s). Office list default adds
+9980052058 (Airtel, 5 of 5). Airtel->BSNL measured 12 and 17 min (retry timer, like Jio).
+Build 14 (16 Nov, SMS flow review): `SMS_LISTEN_SEC` 20 (4 slots a day listen now, not 96; first SMS came up to
+10 s after the fresh join), `SMS_LISTEN_MORE_SEC` 60 and `SMS_LISTEN_MAX_SEC` 240 (the next queued SMS comes
+30-50 s after the reply to the one before: 14 Nov 10:37-10:39; with 8 s the unit switched off 14 s after the last
+SMS and the rest of the queue waited a slot or a day). `sms_listen()` reads the SIM again (twice at most, inside
+the slot's time) when its last check took any. `list_sms()`: the `AT+CMGL` wait ends on the list's own
+`\r\nOK\r\n`, and only an error line ends it early (`s_list_wait`): `ERROR` inside a message's text used to
+stop the list being read, leaving that message on the SIM to block all later commands.
+Build 6 (14 Nov 11:00): Airtel re-delivered 3 commands (same SMSC stamp) after first deliveries that coincided
+with `COPS=2` (09:31:17) or our `AT+CMGS` in progress (+CMTI at 10:37:29, 10:38:14); the SMSC, without the
+acknowledgement, fell back to its retry timer and held its FIFO for the number (1 h+), released by a new SMS.
+Now: `sim7600_prepare_sms_listen()` CNMP=2 and waits `SMS_REG_WAIT_SEC` (15) for CREG before any COPS=2/0;
+`note_sms_arrival()` (+CMTI seen in `wait_response`/`clear_rx`, or messages listed) gates replies and power-off
+(`wait_sms_quiet`, `SMS_QUIET_MS` 4 s, max 15 s); the list is re-read until it stops growing; repeats (sender,
+stamp, text in the last 10, `sms_seen_*` in sms_cmd.c, host-tested, `SMSSEEN.DAT` fixed 350 B) are not answered.
+User idea parked: unit-originated SMS after HTTP as a trigger (doubtful: goes via BSNL's SMSC, not Airtel's).
 
 Office numbers start as `SMS_OFFICE_NUMBERS` (user_config.h, = the status SMS number) and live, with server 2 and the
 mode, in the settings sector's second page 0x1100 (`remote_settings_t`, CRC; blank or damaged = defaults). Every

@@ -129,6 +129,45 @@ int main(void)
     strcpy(u, "12345678");             /* Hex but not 00xx */
     T(!sms_decode_ucs2(u));
 
+    /* v6.9.55: repeats delivered by the network (Airtel, 001903, 14 Nov) */
+    sms_seen_t seen;
+    bool ch = false;
+    sms_seen_clear(&seen);
+    T(!sms_seen_repeat(&seen, "+919980052058", "26/11/14,09:19:02+22", "VARSHA GET_GPS", &ch) && ch);
+    T(sms_seen_repeat(&seen, "+919980052058", "26/11/14,09:19:02+22", "VARSHA GET_GPS\r\n", &ch));  /* Same, line end */
+    T(!sms_seen_repeat(&seen, "+919980052058", "26/11/14,09:33:04+22", "VARSHA GET_NUM", &ch));
+    T(!sms_seen_repeat(&seen, "+919980052058", "26/11/14,09:33:30+22", "VARSHA GET_GPS", &ch));
+    T(sms_seen_repeat(&seen, "+919980052058", "26/11/14,09:33:30+22", "VARSHA GET_GPS", &ch));    /* Again */
+    T(sms_seen_repeat(&seen, "+919980052058", "26/11/14,09:19:02+22", "VARSHA GET_GPS", &ch));    /* Repeat of an older one */
+    T(!sms_seen_repeat(&seen, "+919980052058", "26/11/14,08:40:00+22", "VARSHA GET_NUM", &ch));   /* Late but genuine: runs */
+    T(!sms_seen_repeat(&seen, "+919980052058", "26/11/14,09:33:30+22", "VARSHA GET_STATUS", &ch)); /* Same second, other text */
+    T(!sms_seen_repeat(&seen, "9108052058", "26/11/14,09:19:02+22", "VARSHA GET_GPS", &ch));      /* Other sender */
+    ch = false;
+    T(!sms_seen_repeat(&seen, "+919980052058", "", "VARSHA GET_GPS", &ch) && !ch);                 /* No stamp: run */
+    T(!sms_seen_repeat(&seen, "ADVERT", "26/11/14,09:19:02+22", "x", &ch) && !ch);                 /* No number */
+    char st[SMS_SEEN_TEXT_LEN + 8];
+    T(sms_seen_format(&seen, st, sizeof(st)) == SMS_SEEN_TEXT_LEN);
+    sms_seen_t back;
+    sms_seen_parse(&back, st);
+    T(sms_seen_repeat(&back, "+919980052058", "26/11/14,09:33:30+22", "VARSHA GET_STATUS", &ch));
+    T(sms_seen_repeat(&back, "9108052058", "26/11/14,09:19:02+22", "VARSHA GET_GPS", &ch));
+    T(!sms_seen_repeat(&back, "9108052058", "26/11/14,10:00:00+22", "VARSHA GET_GPS", &ch));
+    sms_seen_parse(&back, "garbage\r\n12345\r\n");
+    T(!sms_seen_repeat(&back, "9108052058", "26/11/14,09:19:02+22", "VARSHA GET_GPS", &ch));
+    /* Full table: the oldest stamp makes room */
+    sms_seen_clear(&seen);
+    char nb[16];
+    for (int i = 0; i < SMS_SEEN_MAX; i++) {
+        snprintf(nb, sizeof(nb), "98000000%02d", i);
+        char tsb[24];
+        snprintf(tsb, sizeof(tsb), "26/11/14,10:%02d:00+22", 10 + i);
+        T(!sms_seen_repeat(&seen, nb, tsb, "A", &ch));
+    }
+    T(!sms_seen_repeat(&seen, "9899999999", "26/11/14,11:00:00+22", "A", &ch));
+    T(sms_seen_repeat(&seen, "9800000005", "26/11/14,10:15:00+22", "A", &ch));    /* Kept */
+    T(sms_seen_repeat(&seen, "9899999999", "26/11/14,11:00:00+22", "A", &ch));    /* The newest, kept */
+    T(!sms_seen_repeat(&seen, "9800000000", "26/11/14,10:10:00+22", "A", &ch));   /* Oldest, made room: runs again */
+
     printf(s_fail ? "FAILED: %d\n" : "ALL PASS\n", s_fail);
     return s_fail != 0;
 }

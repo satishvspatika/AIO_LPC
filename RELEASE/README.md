@@ -25,7 +25,8 @@ RELEASE/
 1. Raise the versions in the source: `FIRMWARE_VERSION` in `LPC1768/user_config.h`, `FW845_VERSION` in
    `LPC845/boot/fw845_app.h` (if the CTRL changed), `MIG_VERSION` in `TEST_JIG/migrate/main.c` (if the
    migration or the CTRL changed).
-2. For a production release set `TESTING_DEBUG_LOG 0` in `LPC1768/user_config.h`.
+2. `PRODUCTION_BUILD` must be 1 in `LPC1768/user_config.h` (the script refuses otherwise). Test units get the debug
+   log by putting an empty `DEBUGLOG.ON` file on their cards; nothing is rebuilt for that.
 3. Write `RELEASE/<version>/RELEASE_NOTES.md`: what changed, how to install, what to test, known limits.
 4. Commit the source, then run `RELEASE/make_release.sh`. It stops if the notes are missing or any host test
    fails. `BUILD_INFO.txt` records the commit, and says so if there were uncommitted changes.

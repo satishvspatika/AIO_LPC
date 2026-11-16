@@ -70,6 +70,18 @@ __attribute__((naked)) void HardFault_Handler(void)
     );
 }
 
+/* v6.9.55 build 13: the core sleeps whenever no task has work (the kernel's idle task calls this).
+ * It ran flat out at 100 MHz for the whole time the board is on, most of which is waiting: the hold to
+ * +62 s, the modem's answers, every delay. Any interrupt wakes it, the 1 ms tick at the latest, and
+ * every clock, timer, UART and the watchdog keeps running in this mode, so nothing is later than
+ * before. Not with a debug probe attached: the bench scripts read memory while it runs. */
+void vApplicationIdleHook(void)
+{
+    if ((CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) == 0) {
+        __WFI();
+    }
+}
+
 static uint32_t s_reset_reason; /* Set first thing in main() */
 
 /* After a crash or watchdog restart the LPC845 is still running, but its first status frame with the
@@ -499,9 +511,10 @@ static bool is_listening_slot(int slot)
     (void)slot;
     return true;
 #else
-    static const uint8_t hours[] = { SMS_LISTEN_HOURS };
-    for (size_t i = 0; i < sizeof(hours); i++) {
-        if (slot == hours[i] * 4) {     /* The slot at hh:00 */
+    /* v6.9.55 (build 8): slots named hhmm (unit's local time) */
+    static const uint16_t hhmm[] = { SMS_LISTEN_SLOTS };
+    for (size_t i = 0; i < sizeof(hhmm) / sizeof(hhmm[0]); i++) {
+        if (slot == (hhmm[i] / 100) * 4 + (hhmm[i] % 100) / 15) {
             return true;
         }
     }
@@ -542,7 +555,14 @@ static void __attribute__((noinline)) sms_listen(const telemetry_data_t *telem, 
             vTaskDelay(5000 / portTICK_RATE_MS);
         }
     }
-    sim7600_check_incoming_sms(telem, true);
+    /* Build 14: one that came while this check's replies went out is read now too, not left on the
+     * SIM for the next listening slot (14 Nov 16:05:33: one arrived during a reply, the unit switched
+     * off 21 s later without reading it). Twice at most, and not past the slot's time. */
+    int taken = sim7600_check_incoming_sms(telem, true);
+    for (int extra = 0; taken > 0 && extra < 2 && (long)(budget_end - xTaskGetTickCount()) > 0; extra++) {
+        hal_power_heartbeat();
+        taken = sim7600_check_incoming_sms(telem, false);
+    }
 }
 
 /* Server 2 (v6.9.41, set by SMS): mode 0 server 1 only, 1 server 2 only (live and backlog), 2 both
@@ -1678,7 +1698,8 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     int elapsed_sec = (min % 15) * 60 + sec + (int)((xTaskGetTickCount() - slot_begin) / configTICK_RATE_HZ);
     if (elapsed_sec < SLOT_HOLD_GUARD_SEC) {
         int wait_sec = SLOT_HOLD_GUARD_SEC - elapsed_sec;
-        snprintf(s_slot_line, sizeof(s_slot_line), "Slot boundary reached, holding %ds for sensors", wait_sec);
+        /* Build 12: was "for sensors"; the record was closed at the boundary, the wait is the server's */
+        snprintf(s_slot_line, sizeof(s_slot_line), "Slot boundary reached, holding %ds (server takes records from +%ds)", wait_sec, SLOT_HOLD_GUARD_SEC);
         storage_log_debug("SLOT", s_slot_line);
         for (int w = 0; w < wait_sec; w++) {
             wd_checkin();
@@ -1888,6 +1909,12 @@ static void vMain_Task(void *pvParameters)
             snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 link: %lu bytes, %lu frames, %lu good, %lu damaged, woke=%c 845reset=%d. Last: %s",
                      (unsigned long)bytes, (unsigned long)frames, (unsigned long)good, (unsigned long)intermcu_get_bad_frames(), wake, reset_status, last);
             storage_log_debug(good ? "LINK" : "ERROR", s_slot_line);
+            /* CTRL v1.15+ slot wake delay: set at power-off if it differs (hal_power_sleep_system) */
+            const int slot_wake = intermcu_get_845_slot_wake();
+            if (slot_wake > 0 && slot_wake != SLOT_WAKE_DELAY_SEC) {
+                snprintf(s_slot_line, sizeof(s_slot_line), "CTRL slot wake is %ds: set to %ds at power-off", slot_wake, SLOT_WAKE_DELAY_SEC);
+                storage_log_debug("LINK", s_slot_line);
+            }
         }
         link_log_sec++;
 

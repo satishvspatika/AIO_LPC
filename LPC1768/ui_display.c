@@ -2152,8 +2152,10 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         /* Keep the UI running while waiting: the keypad must work as soon as the LCD is up */
     }
 
-    /* Operator-requested power save, deferred while a slot was running */
-    if (s_sleep_deferred && !s_slot_busy && !slot_scheduler_is_due() && !fw_app_trial_unconfirmed()) {
+    /* Operator-requested power save, deferred while a slot was running. v6.9.55: and while the modem is
+     * held (an SMS send waiting on the network): tried every 50 ms, it logged "Entering sleep" 340
+     * times in 18 s and filled the log buffer (001903, 14 Nov 08:23) */
+    if (s_sleep_deferred && !s_slot_busy && !sim7600_is_busy() && !slot_scheduler_is_due() && !fw_app_trial_unconfirmed()) {
         s_sleep_deferred = false;
         ui_enter_sleep();
         return;

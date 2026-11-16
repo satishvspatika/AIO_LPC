@@ -433,6 +433,32 @@ static void wait_tx_idle(void)
 }
 
 
+/* Slot wake delay in seconds (v1.15): see "Late slot wake" below */
+#define SLOT_WAKE_DEFAULT_S    30U
+#define SLOT_WAKE_MIN_S        10U
+#define SLOT_WAKE_MAX_S        55U
+static volatile uint8_t slot_wake_s = SLOT_WAKE_DEFAULT_S;
+
+/* v1.15: $Sccyymmddhhmmss; only with 14 digits, ';' after them and a real date and time */
+static bool set_time_cmd_ok(const char *b)
+{
+	for(int k = 2; k < 16; k++){
+		if(b[k] < '0' || b[k] > '9'){
+			return false;
+		}
+	}
+	if(b[16] != ';'){
+		return false;
+	}
+	int cc = (b[2]-'0')*10 + (b[3]-'0');
+	int mo = (b[6]-'0')*10 + (b[7]-'0');
+	int dd = (b[8]-'0')*10 + (b[9]-'0');
+	int hh = (b[10]-'0')*10 + (b[11]-'0');
+	int mi = (b[12]-'0')*10 + (b[13]-'0');
+	int ss = (b[14]-'0')*10 + (b[15]-'0');
+	return cc == 20 && mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31 && hh <= 23 && mi <= 59 && ss <= 59;
+}
+
 void decode_command(void)
 {
 
@@ -455,7 +481,23 @@ void decode_command(void)
 			break;
 
 
+		case 'W':{									//v1.15: $W<seconds>; slot wake delay (see slot_wake_s)
+			uint32_t v = 0;
+			int k = 2;
+			for(; k < 5 && gc_recv_buf[k] >= '0' && gc_recv_buf[k] <= '9'; k++){
+				v = v*10 + (uint32_t)(gc_recv_buf[k]-'0');
+			}
+			if(k > 2 && gc_recv_buf[k] == ';' && v >= SLOT_WAKE_MIN_S && v <= SLOT_WAKE_MAX_S){
+				slot_wake_s = (uint8_t)v;
+			}
+			break;
+		}
+
 		case 'S':
+			//v1.15: a damaged $S (a byte lost or changed on the cable) used to set whatever it held
+			if(!set_time_cmd_ok(gc_recv_buf)){
+				break;
+			}
 			Set_Date_Time.century = ((gc_recv_buf[2]-'0')*10 + (gc_recv_buf[3]-'0'));
 			Set_Date_Time.year = ((gc_recv_buf[4]-'0')*10 + (gc_recv_buf[5]-'0'));
 			Set_Date_Time.month = ((gc_recv_buf[6]-'0')*10 + (gc_recv_buf[7]-'0'));
@@ -1229,8 +1271,14 @@ volatile uint32_t bad_clock_wakes = 0;		//safety-net wakes with an invalid clock
 /* Late slot wake (845-v1.7). The slot is still closed at the boundary (store_data), but an LPC1768
  * that is off is powered this long after it, not at once: the server takes nothing before +62 s, and
  * it used to sit through a 55 s hold. The modem boots with its rail and needs about 16-18 s to answer
- * and 20-27 s to register (bench logs, 2026-11-08), so 30 s still leaves it registered by +62 s. */
-#define SLOT_WAKE_DELAY_100MS  300U
+ * and 20-27 s to register (bench logs, 2026-11-08), so 30 s still leaves it registered by +62 s.
+ * v1.15: set by the LPC1768 ($W<seconds>;), so it can be tuned without another CTRL release. The
+ * LPC1768 (v6.9.55 build 12 on) asks for its own value at every boot and sees the one in force in
+ * every status frame (bits 10-15 of the reset-status field), so it puts it right after any CTRL
+ * restart. This firmware starts at 30 s, as v1.7-v1.14: with an older LPC1768, which never sends $W,
+ * nothing changes. Accepted only within SLOT_WAKE_MIN_S..SLOT_WAKE_MAX_S: the modem needs time to
+ * register before +62 s, and the LPC1768 must still be woken well inside the slot. (Defined near
+ * decode_command, which sets it.) */
 static volatile uint8_t late_wake_pending = 0;
 static volatile uint16_t late_wake_ticks = 0;
 volatile uint32_t late_wakes = 0;			//slot wakes made late (read by probe)
@@ -1306,6 +1354,68 @@ void init_ext_rtc(void){
 }
 
 
+/* RTC_CHECK_BEGIN */
+/* CTRL v1.16. A read that the RTC acknowledged can still carry a wrong byte (I2C0 is the bus that
+ * jams while the modem is on). Before this, a time with today's date was taken whatever its hour and
+ * minute: one flipped bit could show a slot boundary that wasn't there, close the slot early under
+ * a wrong time and wake the LPC1768 for it.
+ *  - rtc_bcd_ok: every register must be real BCD within its range, or the read isn't a time at all.
+ *  - rtc_step_ok: the time must follow the one we hold, 0 to RTC_STEP_MAX_S seconds on (the clock is
+ *    read every 100 ms). Anything else (a set clock, a first read, a long wait) is taken only when a
+ *    second read says the same (rtc_reads_agree). */
+#define RTC_STEP_MAX_S	3
+static int rtc_bcd_ok(const uint8_t *r)	//r[0..6] = registers 0-6, halt bit and 12/24 bit already masked
+{
+	static const uint8_t lo[7] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00};
+	static const uint8_t hi[7] = {0x59, 0x59, 0x23, 0xFF, 0x31, 0x12, 0x99};
+	for(int i = 0; i < 7; i++){
+		if(i == 3){
+			continue;		//week day: not used
+		}
+		if((r[i] & 0x0F) > 9 || (r[i] >> 4) > 9 || r[i] < lo[i] || r[i] > hi[i]){
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static long rtc_day_secs(const xDateTime_def *t)
+{
+	return ((long)t->hour * 60L + t->minute) * 60L + t->sec;
+}
+
+static int rtc_same_day(const xDateTime_def *a, const xDateTime_def *b)
+{
+	return a->date == b->date && a->month == b->month && a->year == b->year;
+}
+
+/* now: the time held; rd: the time just read; next_day: the day after now's */
+static int rtc_step_ok(const xDateTime_def *now, const xDateTime_def *rd, const xDateTime_def *next_day)
+{
+	long d;
+	if(rtc_same_day(now, rd)){
+		d = rtc_day_secs(rd) - rtc_day_secs(now);
+	}
+	else if(rtc_same_day(next_day, rd)){
+		d = rtc_day_secs(rd) + 86400L - rtc_day_secs(now);
+	}
+	else{
+		return 0;
+	}
+	return d >= 0 && d <= RTC_STEP_MAX_S;
+}
+
+/* Two reads one after the other: the same day, hour and minute, at most a second apart */
+static int rtc_reads_agree(const xDateTime_def *a, const xDateTime_def *b)
+{
+	long d = rtc_day_secs(b) - rtc_day_secs(a);
+	return rtc_same_day(a, b) && d >= 0 && d <= 1;
+}
+/* RTC_CHECK_END */
+volatile uint32_t rtc_bad_fields = 0;		//reads that weren't a real date and time (read by probe)
+volatile uint32_t rtc_steps_refused = 0;	//times not taken: a second read didn't agree (read by probe)
+static uint8_t s_rtc_fields_ok = 0;		//the last good read held a real date and time
+
 int Get_Cur_Date_Time(xDateTime_def *DateTime)
 {
 	int i;
@@ -1336,6 +1446,19 @@ int Get_Cur_Date_Time(xDateTime_def *DateTime)
 		return 0;
 	}
 	s_rtc_last_ok_ticks = 0;
+
+	//v1.16: the watch below still sees this read (halt bit, seconds moving); whether it is a time
+	//Get_Time can use is a separate matter
+	{
+		uint8_t r[7];
+		memcpy(r, &i2c_clkval[1], 7);
+		r[0] &= 0x7F;		//halt bit
+		r[2] &= 0x3F;		//12/24 hour bits
+		s_rtc_fields_ok = (uint8_t)rtc_bcd_ok(r);
+		if(!s_rtc_fields_ok){
+			rtc_bad_fields++;
+		}
+	}
 
 	DateTime->year		= (i2c_clkval[7]/16)*10+(i2c_clkval[7]%16);
 	DateTime->month	= (i2c_clkval[6]/16)*10+(i2c_clkval[6]%16);
@@ -1542,7 +1665,7 @@ static void rtc_watch_100ms(void)
 void Get_Time()
 {
 
-	int i,j;
+	// (v1.16: the loop counters that were here are gone with the wait they no longer made)
 
 	next_date.date = Present_Date_Time.date;
 	next_date.month = Present_Date_Time.month;
@@ -1561,7 +1684,13 @@ void Get_Time()
 	}
 
 
-	if((Present_Date_Time.date == rtc_read_date.date) && (Present_Date_Time.month == rtc_read_date.month) && (Present_Date_Time.year == rtc_read_date.year)){
+	if(!s_rtc_fields_ok){
+		return;		//v1.16: not a real date and time (see rtc_bcd_ok)
+	}
+
+	//v1.16: taken at once only if it follows the time held (see rtc_step_ok). Before, any time with
+	//today's or tomorrow's date was.
+	if(rtc_step_ok(&Present_Date_Time, &rtc_read_date, &next_date)){
 		Present_Date_Time.date = rtc_read_date.date;
 		Present_Date_Time.month = rtc_read_date.month;
 		Present_Date_Time.year = rtc_read_date.year;
@@ -1569,32 +1698,22 @@ void Get_Time()
 		Present_Date_Time.minute = rtc_read_date.minute;
 		Present_Date_Time.sec = rtc_read_date.sec;
 	}
-
-	else if((next_date.date == rtc_read_date.date) && (next_date.month == rtc_read_date.month) && (next_date.year == rtc_read_date.year)){
-		Present_Date_Time.date = rtc_read_date.date;
-		Present_Date_Time.month = rtc_read_date.month;
-		Present_Date_Time.year = rtc_read_date.year;
-		Present_Date_Time.hour = rtc_read_date.hour;
-		Present_Date_Time.minute = rtc_read_date.minute;
-		Present_Date_Time.sec = rtc_read_date.sec;
-	}
-
 	else{
-		for(i=0;i<500;i++)
-			for(j=0;j<600;j++);
-
+		//Anything else (just set, first read after a start, a long wait): only if a second read
+		//says the same
 		if(!Get_Cur_Date_Time(&rtc_read_date_copy)){
 			return;
 		}
-
-		if((rtc_read_date_copy.date == rtc_read_date.date) && (rtc_read_date_copy.month == rtc_read_date.month) && (rtc_read_date_copy.year == rtc_read_date.year)){
+		if(s_rtc_fields_ok && rtc_reads_agree(&rtc_read_date, &rtc_read_date_copy)){
 			Present_Date_Time.date = rtc_read_date_copy.date;
 			Present_Date_Time.month = rtc_read_date_copy.month;
 			Present_Date_Time.year = rtc_read_date_copy.year;
 			Present_Date_Time.hour = rtc_read_date_copy.hour;
 			Present_Date_Time.minute = rtc_read_date_copy.minute;
 			Present_Date_Time.sec = rtc_read_date_copy.sec;
-
+		}
+		else{
+			rtc_steps_refused++;
 		}
 	}
 
@@ -2283,6 +2402,7 @@ void USART1_IRQHandler(void)
 			if(c == ';'){
 
 				pckt_recvd = 1;
+				uart_recv_state1 = CMD_RECVD1;	//v1.16: held until the main loop has read it (it went on receiving over it)
 				/*		sscanf(gc_recv_buf1,"$B%c,%04d,%04d%;",
 						&solar_status,
 						&sc_bat1,
@@ -2531,6 +2651,16 @@ int main(void)
 
 		//	gc_recv_buf1[3] = solar_status;
 
+			//v1.16: only a whole $B<s>,dddd,dddd; frame. sc_bat1 becomes the battery voltage in the
+			//record when it is above 0, so noise on this input must never get that far.
+			bool sc_ok = (gc_recv_buf1[1] == 'B') && (gc_recv_buf1[3] == ',') && (gc_recv_buf1[8] == ',') &&
+					(gc_recv_buf1[13] == ';');
+			for(k = 4; sc_ok && k <= 12; k++){
+				if(k != 8 && (gc_recv_buf1[k] < '0' || gc_recv_buf1[k] > '9')){
+					sc_ok = false;
+				}
+			}
+			if(sc_ok){
 			solar_status = gc_recv_buf1[2];
 			sc_bat1 =	(gc_recv_buf1[4]-'0')*1000+
 									(gc_recv_buf1[5]-'0')*100+
@@ -2541,6 +2671,7 @@ int main(void)
 									(gc_recv_buf1[10]-'0')*100+
 									(gc_recv_buf1[11]-'0')*10+
 									(gc_recv_buf1[12]-'0');
+			}
 
 
 		/*	sscanf(gc_recv_buf1,"$B%c,%04d,%04d%;",
@@ -2583,7 +2714,7 @@ int main(void)
 				if(!GPIO_PinRead(GPIO, LPC845_PORT, LPC1768_PWR_STDN)){
 					late_wake_pending = 0;
 				}
-				else if(++late_wake_ticks >= SLOT_WAKE_DELAY_100MS){
+				else if(++late_wake_ticks >= (uint16_t)(slot_wake_s * 10U)){
 					late_wake_pending = 0;
 					late_wakes++;
 					time_since_reset_interval = 0;
@@ -2751,7 +2882,7 @@ int main(void)
 					//v1.11: the clock state rides in bits 8-9 of this field (0 RTC, 1 software clock
 					//as the RTC is silent, 2 as it is stuck). The frame must keep exactly 27 commas:
 					//every LPC1768 firmware drops a frame with any other count (frame_checksum_ok)
-					(int)((reset_status & 0xFFU) | ((uint32_t)rtc_state << 8)),
+					(int)((reset_status & 0xFFU) | ((uint32_t)rtc_state << 8) | ((uint32_t)(slot_wake_s & 0x3FU) << 10)),
 					(int)rf_val,	//Tips so far in this slot, for the LCD
 					(int)rain_total_restored);
 
@@ -2905,6 +3036,12 @@ int main(void)
 			gi_get_rec = 0;
 
 		}
+
+		/* CTRL v1.16: sleep until the next interrupt (the 1 ms tick at the latest). This chip is the
+		 * only one powered all day and this loop used to spin flat out. Rain, wind, the wake key and
+		 * all timing run in the tick interrupt and the UART in its own, so nothing waits on the loop
+		 * for more than 1 ms; every clock keeps running in sleep (the watchdog too). */
+		__WFI();
 
 	}
 }

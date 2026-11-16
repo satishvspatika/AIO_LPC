@@ -19,11 +19,14 @@ REL="${ROOT}/RELEASE"
 MAIN_VER=$(awk '$1=="#define" && $2=="FIRMWARE_VERSION" {gsub(/"/,"",$3); print $3}' "${ROOT}/LPC1768/user_config.h")
 CTRL_VER=$(awk '$1=="#define" && $2=="FW845_VERSION" {gsub(/"/,"",$3); print $3}' "${ROOT}/LPC845/boot/fw845_app.h")
 MIG_VER=$(awk '$1=="#define" && $2=="MIG_VERSION" {gsub(/"/,"",$3); print $3}' "${ROOT}/TEST_JIG/migrate/main.c")
-TESTING=$(awk '$1=="#define" && $2=="TESTING_DEBUG_LOG" {print $3}' "${ROOT}/LPC1768/user_config.h")
+PROD=$(awk '$1=="#define" && $2=="PRODUCTION_BUILD" {print $3}' "${ROOT}/LPC1768/user_config.h")
 OUT="${REL}/${MAIN_VER}"
 NAME="LPC-AIO_${MAIN_VER}_CTRL_${CTRL_VER}_${MIG_VER}"
 
-echo "=== Release ${NAME} ($( [ "${TESTING}" = "1" ] && echo "TESTING build: debug log on" || echo "production build" )) ==="
+if [ "${PROD}" != "1" ]; then
+    echo "[ERROR] PRODUCTION_BUILD is not 1 in LPC1768/user_config.h: a bench build can't be released"; exit 1
+fi
+echo "=== Release ${NAME} (production build; debug log only on cards with DEBUGLOG.ON) ==="
 if [ ! -f "${OUT}/RELEASE_NOTES.md" ]; then
     echo "[ERROR] Write ${OUT}/RELEASE_NOTES.md first"; exit 1
 fi

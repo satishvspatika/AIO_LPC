@@ -89,6 +89,12 @@ static uint16_t adc_to_wind_dir(int adc)
 
 static volatile char s_845_wake = '?';
 static volatile int s_845_reset_status = -1;
+static volatile int s_845_slot_wake_s = -1;   /* CTRL v1.15+: its slot wake delay; 0 = older CTRL */
+
+int intermcu_get_845_slot_wake(void)
+{
+    return s_845_slot_wake_s;
+}
 
 void intermcu_get_845_wake(char *out_reason, int *out_reset_status)
 {
@@ -570,6 +576,8 @@ static void parse_d_packet(const char *frame)
             s_845_reset_status = reset_status & 0xFF;
             if (reset_status >= 0) {
                 s_845_rtc_state = (reset_status >> 8) & 0x03;
+                /* CTRL v1.15: its slot wake delay in seconds in bits 10-15 (older CTRLs: 0) */
+                s_845_slot_wake_s = (reset_status >> 10) & 0x3F;
             }
             s_latest_telemetry.rf_cum_mm = rain_day_tips * RF_BUCKET_RESOLUTION;
         }
