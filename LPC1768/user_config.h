@@ -96,13 +96,22 @@
  * the unit's reply to the one before (Airtel, 14 Nov 10:37-10:39 with the LCD on: 31 s and 46 s). With
  * 8 s the unit switched off 14 s after the last one (14 Nov 16:16, 15 Nov 11:01), the rest of the queue
  * met a unit that was off, and came a slot or a day later. Costs nothing on a slot with no SMS. */
-#define SMS_LISTEN_MORE_SEC       60
+#define SMS_LISTEN_MORE_SEC       60   /* Build 20: only for a command; any other SMS adds nothing */
 #define SMS_LISTEN_MAX_SEC        240   /* Build 14: was 90. Inside the slot's 300 s; the window also ends with the slot's time */
 /* A GET_ command already answered to the same sender this long ago or less isn't answered again (build 9) */
 #define SMS_GET_REPEAT_MIN        10
 /* No window with less of the slot's time left than this (the SIM is still read once). Setting up
  * the window (fresh registration) can take about 90 s at worst (review, v6.9.52) */
 #define SMS_LISTEN_MIN_BUDGET_SEC 120
+/* Build 16: longest wait for voice/SMS registration after the window's leave-and-join. An Airtel IoT
+ * SIM was still searching after 20 s (1922, 16 Nov 16:02); BSNL takes about 4 s. */
+#define SMS_REJOIN_WAIT_SEC       60
+/* Build 18: the signal is asked again, 1 s apart, up to this many times while the modem answers 99
+ * ("not known yet", just after it changes between 2G and 4G). Was 3. */
+#define CSQ_RETRY_MAX             10
+/* Build 17: 1 = the listening window leaves the network and joins again on an Airtel IoT SIM too
+ * (as on every other SIM). 0 while the slow searches on 1922 after such a window are not explained. */
+#define SMS_REJOIN_AIRTEL_IOT     0
 /* v6.9.55: an SMS centre needs the modem's acknowledgement of each SMS it delivers. Replies wait
  * until none has arrived for SMS_QUIET_MS (at most SMS_QUIET_MAX_MS), and so does power-off */
 #define SMS_QUIET_MS              4000
@@ -120,8 +129,17 @@
  * network and joins again, which makes Jio/Airtel deliver what they hold; the second slot of each pair
  * catches what the first didn't (Airtel hands its queue over in order). Commands wait at most ~19 h
  * (16:15 to 11:00). All 96 slots cost ~26 min/day of modem time; these 4 about 1 min. */
+/* Build 18 (user, 2026-11-16): every slot listens again, so a command waits 15 min at most. Costs
+ * about 20 s of modem time a slot (~30 min a day) when no SMS comes. */
+/* Build 20 (user, 2026-11-17): back to 4 slots a day, now 11:00, 12:00, 16:00 and 17:00. 1922 overnight
+ * on build 19 (BSNL, 38 slots): the window was 23-29 s of the 70 s each slot was on, and the automatic
+ * mode it leaves the modem in was followed by "no network service" at the next slot's data in 29 of
+ * them. A command waits 18 h at most (17:00 to 11:00). */
 #define SMS_LISTEN_ALL_SLOTS      0
-#define SMS_LISTEN_SLOTS          1100, 1115, 1600, 1615
+/* Build 19: with every slot listening, the leave-and-join only in one slot of this many (4 = the
+ * hh:00 slot). The other slots listen without it. */
+#define SMS_REJOIN_EVERY_SLOTS    4
+#define SMS_LISTEN_SLOTS          1100, 1200, 1600, 1700
 
 /* Debug log on the card (LOG/YYMMDD.TXT, HTTPLOG.TXT): about 1 MB a day of card writes.
  * Production: off unless the card holds DEBUGLOG.ON at its root (checked at every boot, so every slot):
@@ -143,6 +161,9 @@
 #define GPS_AUTO_SEARCH         0
 
 #define RAT_MODE_FILENAME       "RATMODE.DAT"
+/* Build 21: the APN that last delivered a record on this SIM (SIM number + APN), tried first from
+ * then on. As the ESP32's apn_config.txt. */
+#define APN_SAVED_FILENAME      "APN.DAT"
 #define LAST_SLOT_FILENAME      "LASTSLOT.DAT"
 #define FLASH_SYNC_FILENAME     "FLASHSYN.DAT"
 #define SD_CHECK_FILENAME       "SDCHECK.DAT"

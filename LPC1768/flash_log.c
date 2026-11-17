@@ -378,7 +378,7 @@ bool flash_log_note_rejected(uint32_t record_seq, int strikes_allowed)
     int strikes = 1;
     for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
         const flash_log_page_t *p = page_at(i);
-        if (page_valid(p) && p->type == TYPE_STRIKE && (uint32_t)p->slot_id == record_seq) {
+        if (p->magic == LOG_MAGIC && p->type == TYPE_STRIKE && (uint32_t)p->slot_id == record_seq && page_valid(p)) {
             strikes++;
         }
     }
@@ -482,7 +482,8 @@ static const flash_log_page_t *find_record(uint32_t seq)
 {
     for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
         const flash_log_page_t *p = page_at(i);
-        if (page_valid(p) && p->type == TYPE_RECORD && p->seq == seq) {
+        /* Build 19: the page's check sum last, only for a page that matches (see oldest_pending) */
+        if (p->magic == LOG_MAGIC && p->type == TYPE_RECORD && p->seq == seq && page_valid(p)) {
             return p;
         }
     }
@@ -493,7 +494,7 @@ static bool marked_sent(uint32_t record_seq)
 {
     for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
         const flash_log_page_t *p = page_at(i);
-        if (page_valid(p) && p->type == TYPE_SENT && (uint32_t)p->slot_id == record_seq) {
+        if (p->magic == LOG_MAGIC && p->type == TYPE_SENT && (uint32_t)p->slot_id == record_seq && page_valid(p)) {
             return true;
         }
     }
@@ -515,13 +516,17 @@ bool flash_log_mark_sent(uint32_t record_seq)
 }
 
 /* Finds the oldest pending record still held and not yet sent */
+/* Build 19: each pending mark looks through the whole log twice (sent mark, its record), and every
+ * page looked at had its check sum worked out first: with 72 old pending marks in the log (1922,
+ * 16 Nov) that was 7-8 s of modem-on time after every send, until the log wrapped. The page's type
+ * and number are now compared first and the check sum only for a page that matches: same result. */
 static const flash_log_page_t *oldest_pending(uint32_t *out_count)
 {
     const flash_log_page_t *best = NULL;
     uint32_t count = 0;
     for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
         const flash_log_page_t *p = page_at(i);
-        if (!page_valid(p) || p->type != TYPE_PENDING) {
+        if (p->magic != LOG_MAGIC || p->type != TYPE_PENDING || !page_valid(p)) {
             continue;
         }
         uint32_t ref = (uint32_t)p->slot_id;

@@ -289,11 +289,11 @@ static void ctrl_step(uint32_t uptime_sec, uint32_t good_frames)
             s_ctrl_state_known = true;
             strncpy(s_845_version, state.version, sizeof(s_845_version) - 1);
             s_845_version[sizeof(s_845_version) - 1] = '\0';
-            snprintf(line, sizeof(line), "LPC845 running %s", state.version);
+            snprintf(line, sizeof(line), "CTRL running %s", state.version);
             storage_log_debug("FW", line);
         }
         if (state.state == FW_J_TRIAL_BOOT) {
-            storage_log_debug("FW", "New LPC845 firmware confirmed healthy");
+            storage_log_debug("FW", "New CTRL firmware confirmed healthy");
             fw_ctrl_tx("$UC;\n");
             return;
         }

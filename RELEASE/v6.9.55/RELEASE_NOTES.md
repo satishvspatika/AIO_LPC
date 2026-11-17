@@ -56,6 +56,100 @@
   battery value replaces the CTRL's own reading in the record, so noise on that input could have been
   sent as the battery voltage.
 
+### Signal read again when the modem has no reading yet (build 15)
+- On 16 Nov at 09:46 (Airtel SIM) the record went out with signal -113. The unit asked for the signal in the
+  second the modem moved from 2G to 4G, and the modem answered "not measured yet". The send itself was fine.
+- The unit now asks again, 1 s apart, up to 3 more times. A slot with a normal first reading is not slower.
+
+### APN handling: three things taken from the ESP32 firmware (build 21)
+- **The APN that last delivered on a SIM is remembered** (`APN.DAT` on the card: SIM number and APN) and
+  tried first from then on. Before, a SIM the built-in rules placed wrongly, such as an Airtel M2M SIM whose
+  number does not start with 899116, 899110 or 899145, paid a radio restart to reach the right APN in every
+  slot; now once. Log: `APN ... remembered for this SIM`, then `APN ... delivered last on this SIM: tried
+  first`. `airtelgprs.com` is never remembered for a known Airtel M2M SIM. With no card, or after a SIM
+  change, the rules decide as before.
+- **Modem settings are written only when they differ.** The APN and the unused side channels were written
+  to the modem's own memory again, unchanged, twice in every slot. The unit now reads the list once and
+  writes only what is wrong (normally nothing). About 1-2 s shorter per slot and less wear on the modem.
+- **The second data-connection try comes 5 s after a refusal** (it was 2-5 s). On 1922 overnight (BSNL 4G):
+  5 s after `no network service` it worked 14 times of 14; 2 s after, it failed 15 times of 15 and the
+  radio restart that follows cost 22 s.
+- Not yet run on a unit. The host tests do not cover this code.
+
+### Less time on per slot: SMS at 4 slots a day, radio mode set back before power-off (build 20)
+- Measured on 1922 with a BSNL SIM, 38 slots overnight on build 19 (16 Nov 21:30 to 17 Nov 06:45): all
+  sent first try, but the unit and modem were on about 70 s per slot (about 111 minutes a day): 23 s
+  waiting to start, 20 s sending, 26 s SMS listening.
+- **SMS listening is back to 4 slots a day: 11:00, 12:00, 16:00 and 17:00** (it was every slot in builds
+  18 and 19). Each of the four leaves and joins the network, as before. A command waits 18 hours at most,
+  or is answered at once with the LCD on. Build 19's "once an hour" note below no longer applies.
+- **The modem is switched off in the radio mode the next slot starts with.** Listening leaves it in
+  automatic mode and the modem remembers that. In 29 of the 38 slots the next slot showed 4G registered
+  but data refused (`no network service`), costing 13-25 s each. The log shows
+  `Radio mode set back to 4G-only for the next power-on`. Whether this removes the refusals is not yet
+  proven on a unit: the 40 s wake could also be the cause.
+- **Only a command keeps the listening window open longer.** On 17 Nov at 05:31 a promotional SMS kept the
+  unit on 60 s more. Other SMS are still read and deleted.
+- Checked, no change needed (1922, 16 Nov): the Airtel M2M SIM (ICCID 899145...) got `airteliot.com`; after
+  the swap to BSNL the 19:30 slot logged `SIM operator changed (40445 to 40471)`, searched 4G for 16 s, went
+  to 2G and sent first try.
+
+### 7-8 s shorter slot: faster check of the records kept in flash (build 19)
+- After every send the unit looks in its flash record store for records still to send. Each old "to send"
+  mark made it read the whole store twice, working out every page's check sum. With the 72 marks left from
+  16 Nov on unit 1922 this took 7-8 s in every slot, with the modem on, and would have stayed until the store
+  wrapped around.
+- A page's type and number are now compared first and the check sum is worked out only for a page that
+  matches. The result is the same. Not yet timed on a unit.
+
+### Listening leaves and joins the network once an hour only (build 19)
+- Measured on 1922 with a BSNL SIM (16 Nov, 19:30-21:00): every-slot listening added about 44 s to each slot
+  (13-20 s to leave and join again, 20 s listening), about 70 minutes of modem time a day, not the 30 minutes
+  estimated in build 18.
+- Now only the hh:00 slot leaves and joins again (`SMS_REJOIN_EVERY_SLOTS 4`); the other three slots listen
+  without it. SMS from the SIM's own operator come in any slot; one from another operator may wait for the
+  next hh:00 slot.
+- SMS commands on a BSNL SIM were proven on 1922 on 16 Nov (two `VARSHA GET_STATUS`, both answered).
+
+### SMS listening in every slot again (build 18)
+- Every 15-minute slot now listens for SMS commands (it was 11:00, 11:15, 16:00 and 16:15 only), so a command
+  waits 15 minutes at most (`SMS_LISTEN_ALL_SLOTS 1`). Where these notes say "4 listening slots", this replaces it.
+- Cost: about 20 s more modem time in each slot with no SMS, about 30 minutes a day, from the battery.
+- Not changed, and not a firmware fault as far as the logs show: unit 1922's Airtel IoT SIM got no SMS at all
+  on 16 Nov, and its two status SMS were accepted by Airtel (`+CMGS`) but did not reach the phone. That points
+  to the SIM's SMS service; to be checked with a BSNL SIM in the same unit and with Airtel.
+
+### Signal -113 after a change from 2G to 4G, longer wait (build 18)
+- Build 15 asked for the signal 3 more times. On 16 Nov at 17:16 (unit 1922) the modem answered "not known
+  yet" all 4 times in 3 s and the 17:15 record went out with -113.
+- The unit now asks up to 10 more times, 1 s apart (`CSQ_RETRY_MAX`). Only a slot where the modem has no
+  reading waits; a normal slot is not slower.
+
+### "CTRL" in the log and error files (build 18)
+- Lines in `ERRORS.TXT` and the debug log that named the control board by its chip number now say CTRL.
+  The link line's `845reset=` is now `reset=`. Wording only.
+
+### "UPDATE STOPPED / NO MEMORY" in the first seconds after switch-on (build 17)
+- An update is two steps (check the file, then install) and each needs the same block of memory. In the
+  first 15 seconds after switch-on the memory of the first step was not yet handed back, so EN at the `FOUND`
+  prompt gave `UPDATE STOPPED / NO MEMORY` (unit 1922, 16 Nov, three times, each 10-11 s after switch-on).
+- The unit now shows `PLEASE WAIT...` and starts the step by itself as soon as the memory is back (up to 30 s).
+- A unit still on an older build has the fault: wait 30 s after switch-on before starting the update.
+
+### No leave-and-join in the SMS listening window on an Airtel IoT SIM (build 17)
+- On unit 1922 (Airtel IoT SIM, 13-digit number) the 16:02 listening window left the network and had not
+  joined again when the unit switched off. The next three switch-ons took 65-90 s to find the network and two
+  ended on 2G, where the 16:30 record could not be sent. Before that window the SIM joined 4G in about 15 s.
+- It is not proven that the window caused this. Until it is, a unit with an Airtel IoT SIM listens without
+  leaving the network (`SMS_REJOIN_AIRTEL_IOT 0`). Other SIMs are unchanged.
+
+### SMS listening waits longer to join the network again (build 16)
+- On 16 Nov at 16:02 (unit 1922, Airtel IoT SIM) the listening window left the network and joined again as
+  designed, but the modem was still searching 20 s later. The unit gave up, and a `VARSHA GET_STATUS` sent to
+  it was not delivered. On BSNL the same step takes about 4 s.
+- The unit now waits up to 60 s for the network. The log shows how long it took: `registered for SMS Ns
+  after joining again`. A unit that joins quickly is not slower.
+
 ### Fixes from the build 12 review
 - SMS reply wait: a leftover reply from the modem could be read as "network refused", and the reply sent
   twice. It is now cleared before the wait.
@@ -146,8 +240,15 @@
 
 ## 2. What to test
 
+0. **Build 20, any BSNL unit, a few hours of slots:** in the log, `no network service` should be rare
+   in the slot after a non-listening slot, and boot to `$f7 sent` about 30-45 s (was about 70 s).
+   SLOTS.CSV still `SENT`, attempt 1.
+0b. **Build 21:** after the first sent slot the card holds `APN.DAT` with the SIM number and APN. After a
+   SIM change to another operator the first slot still sends and `APN.DAT` shows the new SIM. In the log,
+   a slot with `no network service` should show the second `AT+CGACT=1,1` about 5 s later answering `OK`,
+   with no `Fresh attach`.
 1. **BSNL phone, unit asleep:** send `VARSHA GET_STATUS` before 11:00 or 16:00: one reply in that slot.
-2. **Jio or Airtel phone, unit asleep:** one reply at 11:00/11:15 or 16:00/16:15, never two.
+2. **Jio or Airtel phone, unit asleep:** one reply at 11:00/12:00 or 16:00/17:00, never two.
    Build 14: send 3 commands a minute apart from one Jio or Airtel phone before 11:00: all 3 should be
    answered in the 11:00 slot (the log shows each `In #` up to about 50 s after the reply before it).
 3. Slots still send on 4G first try (SLOTS.CSV `SENT`, attempt 1).
@@ -168,5 +269,5 @@
 ---
 
 ## 3. Known limits
-- Commands are answered only at 11:00, 11:15, 16:00 and 16:15 (or at once with the LCD on).
+- Commands are answered only at 11:00, 12:00, 16:00 and 17:00 (or at once with the LCD on).
 - `=== BOOT` and `Free heap` lines are missing from the debug log on most scheduled boots (cosmetic, since v6.9.37).

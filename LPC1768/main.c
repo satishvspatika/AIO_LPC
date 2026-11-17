@@ -537,7 +537,11 @@ static void __attribute__((noinline)) sms_listen(const telemetry_data_t *telem, 
      * the slot's time must not keep an office command waiting another 6-18 h). */
     if ((long)(budget_end - xTaskGetTickCount()) > (long)(SMS_LISTEN_MIN_BUDGET_SEC * 1000 / portTICK_RATE_MS)) {
         /* Counted from SMS registration: in 4G-only mode (the slot's data) none is delivered at all */
-        sim7600_prepare_sms_listen();
+#if SMS_LISTEN_ALL_SLOTS
+        sim7600_prepare_sms_listen((slot % SMS_REJOIN_EVERY_SLOTS) == 0);
+#else
+        sim7600_prepare_sms_listen(true);
+#endif
         const portTickType start = xTaskGetTickCount();
         const portTickType latest = start + (SMS_LISTEN_MAX_SEC * 1000 / portTICK_RATE_MS);
         portTickType until = start + (SMS_LISTEN_SEC * 1000 / portTICK_RATE_MS);
@@ -545,7 +549,9 @@ static void __attribute__((noinline)) sms_listen(const telemetry_data_t *telem, 
             /* An SMS centre hands queued messages over one at a time, seconds apart: each one taken
              * keeps the window open SMS_LISTEN_MORE_SEC more (001903, 13 Nov: of 4 queued Jio
              * commands one came per window) */
-            if (sim7600_check_incoming_sms(telem, false) > 0) {
+            /* Build 20: only a command does. 1922, 17 Nov 05:31: a promotional SMS kept the unit
+             * on 60 s more. */
+            if (sim7600_check_incoming_sms(telem, false) > 0 && sim7600_last_sms_check_had_command()) {
                 portTickType more = xTaskGetTickCount() + (SMS_LISTEN_MORE_SEC * 1000 / portTICK_RATE_MS);
                 if ((long)(more - until) > 0) {
                     until = ((long)(more - latest) > 0) ? latest : more;
@@ -1215,7 +1221,7 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
         return; /* First run on this card, or nothing missed */
     }
     if (intermcu_get_845_system() < 0) {
-        storage_log_debug("ERROR", "Slots were missed, but this LPC845 firmware can't supply stored samples");
+        storage_log_debug("ERROR", "Slots were missed, but this CTRL firmware can't supply stored samples");
         return;
     }
 
@@ -1223,7 +1229,7 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
     if (missed > GAP_MAX_SLOTS) {
         missed = GAP_MAX_SLOTS;
     }
-    snprintf(s_slot_line, sizeof(s_slot_line), "%d slot(s) missed since last run, requesting from LPC845", (int)missed);
+    snprintf(s_slot_line, sizeof(s_slot_line), "%d slot(s) missed since last run, requesting from CTRL", (int)missed);
     storage_log_debug("GAP", s_slot_line);
 
     const char *p = telem->present_time;
@@ -1337,7 +1343,7 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
             storage_log_slot(s_slot_line);
             off_filled++;
         } else {
-            storage_log_debug("ERROR", "LPC845 did not answer a stored-sample request, stopping gap fill");
+            storage_log_debug("ERROR", "CTRL did not answer a stored-sample request, stopping gap fill");
             break;
         }
     }
@@ -1412,14 +1418,14 @@ static void rain_total_restore_step(const telemetry_data_t *telem)
         intermcu_rain_close_date(ts, stored_close, sizeof(stored_close)) &&
         intermcu_rain_close_date(telem->present_time, current_close, sizeof(current_close)) &&
         strcmp(stored_close, current_close) == 0) {
-        snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 restarted: returning CUM_RF of %lu tips from record %.12s", tips, ts);
+        snprintf(s_slot_line, sizeof(s_slot_line), "CTRL restarted: returning CUM_RF of %lu tips from record %.12s", tips, ts);
     } else {
         tips = 0;
-        snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 restarted: no stored total for this rain day");
+        snprintf(s_slot_line, sizeof(s_slot_line), "CTRL restarted: no stored total for this rain day");
     }
 #else
     (void)telem;
-    snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 restarted: this profile has no rain total");
+    snprintf(s_slot_line, sizeof(s_slot_line), "CTRL restarted: this profile has no rain total");
 #endif
     storage_log_debug("RAIN", s_slot_line);
     hal_power_rain_restore(tips);
@@ -1534,7 +1540,7 @@ static bool __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data
         storage_log_debug("ERROR", s_slot_line);
         return true;
     }
-    snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 clock was lost or not yet set (its slot %.14s): slot named %.14s from this clock",
+    snprintf(s_slot_line, sizeof(s_slot_line), "CTRL clock was lost or not yet set (its slot %.14s): slot named %.14s from this clock",
              was[0] ? was : "none", telem->slot_time);
     storage_log_debug("ERROR", s_slot_line);
     return true;
@@ -1558,7 +1564,7 @@ static void __attribute__((noinline)) note_values_out_of_range(const telemetry_d
 #if (UNIT_CFG != KSNDMC_TWS)
     if (telem->rf_15m_mm > SANE_RAIN_15M_MAX_MM) {
         fmt_fixed(v, sizeof(v), telem->rf_15m_mm, 5, 2);
-        snprintf(s_slot_line, sizeof(s_slot_line), "15-min rain %s mm is beyond any real rain: check the gauge and LPC845", v);
+        snprintf(s_slot_line, sizeof(s_slot_line), "15-min rain %s mm is beyond any real rain: check the gauge and CTRL", v);
         storage_log_debug("ERROR", s_slot_line);
     }
 #else
@@ -1674,7 +1680,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
      * total to report, and a record of zeros would pull CUM_RF down. So nothing is sent or stored.
      * This slot stays unmarked, so the first good slot afterwards fills it in the usual way. */
     if (!lpc845_link_alive()) {
-        snprintf(s_slot_line, sizeof(s_slot_line), "No status frames from LPC845: no record for slot %ld", (long)slot_id);
+        snprintf(s_slot_line, sizeof(s_slot_line), "No status frames from CTRL: no record for slot %ld", (long)slot_id);
         storage_log_debug("ERROR", s_slot_line);
         sms_only_session(telem, slot_id);
         do_requested_erase();   /* An ERASE_DATA heard just now, before the power-off */
@@ -1906,7 +1912,7 @@ static void vMain_Task(void *pvParameters)
             char wake = '?';
             int reset_status = -1;
             intermcu_get_845_wake(&wake, &reset_status);
-            snprintf(s_slot_line, sizeof(s_slot_line), "LPC845 link: %lu bytes, %lu frames, %lu good, %lu damaged, woke=%c 845reset=%d. Last: %s",
+            snprintf(s_slot_line, sizeof(s_slot_line), "CTRL link: %lu bytes, %lu frames, %lu good, %lu damaged, woke=%c reset=%d. Last: %s",
                      (unsigned long)bytes, (unsigned long)frames, (unsigned long)good, (unsigned long)intermcu_get_bad_frames(), wake, reset_status, last);
             storage_log_debug(good ? "LINK" : "ERROR", s_slot_line);
             /* CTRL v1.15+ slot wake delay: set at power-off if it differs (hal_power_sleep_system) */

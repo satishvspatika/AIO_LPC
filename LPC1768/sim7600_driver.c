@@ -35,10 +35,15 @@ static void save_net_policy(void)
  * CNMP=13): the modem stayed in automatic mode, the slot went out on 3G, and that taught "2G first".
  * Tried 3 times; if the mode still isn't taken, this slot teaches the radio-mode learning nothing. */
 static bool s_rat_unsure = false;
+/* Build 20: automatic mode (AT+CNMP=2) was set this power-on: see sim7600_power_off() */
+static bool s_radio_mode_auto = false;
+/* Build 20: the last SMS check took a command for this unit (not just any SMS) */
+static bool s_last_check_command = false;
 
 static void send_raw(const char *cmd);
 static void clear_rx(void);
 static bool wait_response(const char *expected, uint32_t timeout_ms, char *out_capture, size_t cap_size);
+static bool set_pdp_contexts(const char *apn);
 
 static bool set_rat_mode(const char *rat_cmd)
 {
@@ -57,8 +62,13 @@ static bool set_rat_mode(const char *rat_cmd)
     return false;
 }
 
+static void saved_apn_note_delivery(void);
+
 void sim7600_note_slot_delivery(bool delivered, bool network_fault)
 {
+    if (delivered) {
+        saved_apn_note_delivery();
+    }
     if (s_net_mode == 0 || s_rat_unsure) {
         return;
     }
@@ -114,6 +124,7 @@ static char s_rx_temp[RX_BUFFER_SIZE];
 static char s_http_req[1024];
 static char s_http_capture[1024];
 static const char *s_active_apn = "";
+static const char *s_pdp_set_apn = NULL;    /* APN the contexts were set for at this modem power-on */
 static bool s_bearer_ready = false; /* AT+CGACT done since the modem last started or changed APN */
 static char s_sms_capture[1024];   /* An SMS list: about 8 messages (v6.9.41; 512 held 4) */
 static char s_sms_capture2[1024];  /* The list taken again while more arrive (v6.9.55) */
@@ -661,6 +672,7 @@ static void sim7600_ntp_sync_step(void)
 /* The SIM's operator, from its ICCID/IMSI: data recovery tries only that operator's APNs */
 typedef enum { APN_OP_UNKNOWN = 0, APN_OP_BSNL, APN_OP_AIRTEL, APN_OP_JIO, APN_OP_VI } apn_op_t;
 static apn_op_t s_apn_op = APN_OP_UNKNOWN;
+static bool s_sim_airtel_iot = false;   /* Airtel IoT/M2M SIM (by ICCID): see SMS_REJOIN_AIRTEL_IOT */
 
 static const char *select_apn(const char *iccid, const char *imsi)
 {
@@ -678,6 +690,7 @@ static const char *select_apn(const char *iccid, const char *imsi)
     }
 
     s_apn_op = APN_OP_UNKNOWN;
+    s_sim_airtel_iot = false;
     if (bsnl) {
         apn = "bsnlnet";
         carrier = "BSNL";
@@ -687,6 +700,7 @@ static const char *select_apn(const char *iccid, const char *imsi)
         apn = "airteliot.com";
         carrier = "Airtel";
         s_apn_op = APN_OP_AIRTEL;
+        s_sim_airtel_iot = true;
     } else if (strncmp(imsi, "40586", 5) == 0 || strncmp(imsi, "40587", 5) == 0) {
         apn = "jionet";
         carrier = "Jio";
@@ -704,6 +718,85 @@ static const char *select_apn(const char *iccid, const char *imsi)
         strncpy(s_modem_status.carrier, carrier, sizeof(s_modem_status.carrier) - 1);
     }
     return apn;
+}
+
+/* Build 21: the APN that last delivered on this SIM is tried first (ESP32 apn_config.txt). A SIM the
+ * rules above place wrongly (an Airtel M2M SIM outside the three known ICCID prefixes starts on
+ * airtelgprs.com) paid a radio restart to reach the right APN in every slot; now once. Kept in
+ * APN.DAT on the card as "<ICCID> <APN>", fixed length (the file is overwritten in place). With no
+ * card, or another SIM, the rules decide as before. Never kept or used: airtelgprs.com for a known
+ * Airtel M2M SIM (the ESP32's guard: a one-off fallback must not become that SIM's APN). */
+static const char *const s_saved_apn_names[] = {"airteliot.com", "airtelgprs.com", "bsnlnet", "bsnlm2m", "jionet", "www", NULL};
+static char s_saved_apn_iccid[24] = "";
+static const char *s_saved_apn = NULL;      /* One of s_saved_apn_names, for s_saved_apn_iccid */
+static bool s_saved_apn_loaded = false;
+
+static void saved_apn_load(void)
+{
+    static char text[64];       /* Static: Modem task stack */
+    char iccid[24] = "", name[20] = "";
+    s_saved_apn_loaded = true;
+    s_saved_apn = NULL;
+    s_saved_apn_iccid[0] = '\0';
+    if (!storage_state_load(APN_SAVED_FILENAME, text, sizeof(text)) || sscanf(text, "%23s %19s", iccid, name) != 2) {
+        return;
+    }
+    for (int i = 0; s_saved_apn_names[i]; i++) {
+        if (strcmp(name, s_saved_apn_names[i]) == 0) {
+            s_saved_apn = s_saved_apn_names[i];
+            strncpy(s_saved_apn_iccid, iccid, sizeof(s_saved_apn_iccid) - 1);
+            s_saved_apn_iccid[sizeof(s_saved_apn_iccid) - 1] = '\0';
+        }
+    }
+}
+
+static bool saved_apn_refused(const char *apn)
+{
+    return s_sim_airtel_iot && strcmp(apn, "airtelgprs.com") == 0;
+}
+
+/* The APN to start with: the one remembered for this SIM, else by the rules */
+static const char *apn_for_sim(const char *iccid, const char *imsi)
+{
+    const char *apn = select_apn(iccid, imsi);
+    if (!s_saved_apn_loaded) {
+        saved_apn_load();
+    }
+    if (s_saved_apn && iccid[0] && strcmp(iccid, s_saved_apn_iccid) == 0 && !saved_apn_refused(s_saved_apn)
+        && strcmp(s_saved_apn, apn) != 0) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "APN %s delivered last on this SIM: tried first (by the SIM's numbers: %s)", s_saved_apn, apn);
+        storage_log_debug("APN", msg);
+        apn = s_saved_apn;
+    }
+    return apn;
+}
+
+/* After a delivered record: remember the APN it went out on, if that isn't what is remembered */
+static void saved_apn_note_delivery(void)
+{
+    static char text[64];
+    const char *iccid = s_modem_status.iccid;
+    const char *apn = NULL;
+    for (int i = 0; s_saved_apn_names[i]; i++) {
+        if (strcmp(s_active_apn, s_saved_apn_names[i]) == 0) {
+            apn = s_saved_apn_names[i];
+        }
+    }
+    if (!apn || !iccid[0] || !s_saved_apn_loaded || saved_apn_refused(apn)) {
+        return;
+    }
+    if (s_saved_apn == apn && strcmp(iccid, s_saved_apn_iccid) == 0) {
+        return;
+    }
+    snprintf(text, sizeof(text), "%-22.22s %-16.16s\r\n", iccid, apn);
+    if (storage_state_save(APN_SAVED_FILENAME, text)) {
+        s_saved_apn = apn;
+        strncpy(s_saved_apn_iccid, iccid, sizeof(s_saved_apn_iccid) - 1);
+        s_saved_apn_iccid[sizeof(s_saved_apn_iccid) - 1] = '\0';
+        snprintf(text, sizeof(text), "APN %s remembered for this SIM", apn);
+        storage_log_debug("APN", text);
+    }
 }
 
 static bool s_sim_missing = false;
@@ -888,31 +981,17 @@ bool sim7600_power_on(void)
         }
     }
 
-    const char *apn = select_apn(s_modem_status.iccid, imsi);
+    const char *apn = apn_for_sim(s_modem_status.iccid, imsi);
 
     char log_apn[64];
     snprintf(log_apn, sizeof(log_apn), "APN Selected: %s (IMSI: %s, ICCID: %s)", apn, imsi, s_modem_status.iccid);
     storage_log_debug("APN", log_apn);
 
-    /* Configure PDP Context 1 */
-    char apn_cmd[64];
+    /* PDP context 1 and the socket context, before the search (the modem attaches with them).
+     * Build 21: written only where they differ: see set_pdp_contexts() */
     s_active_apn = apn;
     s_bearer_ready = false;
-    snprintf(apn_cmd, sizeof(apn_cmd), "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", apn);
-    clear_rx();
-    send_raw(apn_cmd);
-    wait_response("OK", 2000, NULL, 0);
-
-    /* Also configure Socket PDP Context and Active Profile (critical for SIM7600 TCP stack) */
-    char sock_cmd[64];
-    snprintf(sock_cmd, sizeof(sock_cmd), "AT+CGSOCKCONT=1,\"IP\",\"%s\"\r\n", apn);
-    clear_rx();
-    send_raw(sock_cmd);
-    wait_response("OK", 2000, NULL, 0);
-
-    clear_rx();
-    send_raw("AT+CSOCKSETPN=1\r\n");
-    wait_response("OK", 1000, NULL, 0);
+    set_pdp_contexts(apn);
 
     /* 7. Radio mode, learned per site (net_policy.c): 4G first, for about twice its usual registration
      * time; where 2G is what works, a short 4G look or none, with a full 4G search every 16th power-on.
@@ -1057,19 +1136,31 @@ bool sim7600_power_on(void)
 
     /* 9. Read Signal Quality (AT+CSQ) */
     report_progress("READING CSQ...  ");
-    clear_rx();
-    send_raw("AT+CSQ\r\n");
-    if (wait_response("+CSQ:", 1000, capture, sizeof(capture))) {
+    /* Build 15: 99 means "not measured yet", which the modem answers just after it changes between
+     * 2G and 4G (001903 on Airtel, 16 Nov 09:46: asked in the second it registered on LTE, and the
+     * record went out with -113). Asked again, 1 s apart, 3 more times at most; only when registered.
+     * Build 18: CSQ_RETRY_MAX more times (10). 1922, 16 Nov 17:16: just after 2G to LTE it answered
+     * 99 all 4 times in 3 s and that record too went out with -113. */
+    for (int tries = 0; tries <= CSQ_RETRY_MAX; tries++) {
         int csq = 99, ber = 99;
-        char *p = strstr(capture, "+CSQ: ");
-        if (p) {
-            sscanf(p, "+CSQ: %d,%d", &csq, &ber);
-            s_modem_status.csq_val = csq;
-            s_modem_status.csq_dbm = (csq == 99) ? -113 : (-113 + 2 * csq);
-            char csq_msg[48];
-            snprintf(csq_msg, sizeof(csq_msg), "CSQ: %d (%d dBm)", csq, s_modem_status.csq_dbm);
-            storage_log_debug("MODEM", csq_msg);
+        clear_rx();
+        send_raw("AT+CSQ\r\n");
+        if (wait_response("+CSQ:", 1000, capture, sizeof(capture))) {
+            char *p = strstr(capture, "+CSQ: ");
+            if (p) {
+                sscanf(p, "+CSQ: %d,%d", &csq, &ber);
+                s_modem_status.csq_val = csq;
+                s_modem_status.csq_dbm = (csq == 99) ? -113 : (-113 + 2 * csq);
+                char csq_msg[48];
+                snprintf(csq_msg, sizeof(csq_msg), "CSQ: %d (%d dBm)", csq, s_modem_status.csq_dbm);
+                storage_log_debug("MODEM", csq_msg);
+            }
         }
+        if (csq != 99 || !registered || tries == CSQ_RETRY_MAX) {
+            break;
+        }
+        hal_power_heartbeat();
+        delay_ms(1000);
     }
 
     /* 10. Synchronize time from cellular network base station (NITZ) and query carrier */
@@ -1112,7 +1203,9 @@ void sim7600_power_off(void)
         wait_sms_quiet(SMS_QUIET_MS, SMS_QUIET_MS);
     }
     storage_log_debug("MODEM", "Powering down SIM7600 cellular engine...");
+    const bool was_answering = s_modem_answered;
     s_modem_answered = false;
+    s_pdp_set_apn = NULL;
 
     clear_rx();
     close_socket_quiet(500);
@@ -1120,6 +1213,23 @@ void sim7600_power_off(void)
     clear_rx();
     send_raw("AT+NETCLOSE\r\n");
     wait_response("OK", 500, NULL, 0);
+
+    /* Build 20: the modem keeps its radio mode over power-off. Left in automatic mode (SMS listening,
+     * LCD-on sessions), it starts the next slot in that mode and is switched to 4G-only about 23 s
+     * later; on BSNL it then showed 4G registered but refused data ("no network service") in 29 of 38
+     * slots, 13-25 s each (1922, 16-17 Nov, every slot listening). So it goes off in the mode the
+     * next power-on asks for first. The plan is worked out on a copy: the learning isn't touched. */
+    if (was_answering && s_radio_mode_auto) {
+        net_policy_t peek = s_net;
+        const bool to_4g = (peek.primary == 0) || net_policy_plan(&peek).search_4g;
+        clear_rx();
+        send_raw(to_4g ? "AT+CNMP=38\r\n" : "AT+CNMP=13\r\n");
+        const bool taken = wait_response("OK", 1000, NULL, 0);
+        storage_log_debug("MODEM", !taken ? "Radio mode not set back before power-off (no OK)"
+                                   : (to_4g ? "Radio mode set back to 4G-only for the next power-on"
+                                            : "Radio mode set back to 2G-only for the next power-on"));
+        s_radio_mode_auto = false;
+    }
 
     /* Software Power Off: AT+CPOF */
     clear_rx();
@@ -1207,6 +1317,7 @@ void sim7600_worker_step(void)
             send_raw("AT+COPS=3,0\r\n");
             wait_response("OK", 500, NULL, 0);
             send_raw("AT+CNMP=2\r\n");
+            s_radio_mode_auto = true;
             wait_response("OK", 1000, NULL, 0);
 
             /* Read ICCID and IMSI for smart APN resolution */
@@ -1226,7 +1337,7 @@ void sim7600_worker_step(void)
                 if (*p) sscanf(p, "%15s", imsi);
             }
 
-            const char *apn = select_apn(s_modem_status.iccid, imsi);
+            const char *apn = apn_for_sim(s_modem_status.iccid, imsi);
 
             char apn_cmd[64];
             s_active_apn = apn;
@@ -1383,42 +1494,50 @@ static void log_bearer_details(void)
     (void)log_bearer_details_apn(NULL);
 }
 
-/* ESP32 try_activate_apn, plus AT+CGSOCKCONT and AT+CSOCKSETPN, which the SIM7600's own socket
- * stack needs. CID 1's APN is only rewritten if it differs: this runs up to 96 times a day, and
- * the modem keeps it in flash. */
-static bool __attribute__((noinline)) activate_apn(const char *apn)
+/* Build 21: the modem keeps its PDP contexts in its own flash, and this ran in full twice in every
+ * slot (192 times a day): CID 1 and the socket context written again unchanged, CID 5 deleted, CIDs
+ * 8 and 9 blanked. Now the list is read once and only what differs is written (the ESP32's
+ * read-before-write rule); on a unit in service that is nothing. The socket context and
+ * AT+CSOCKSETPN are sent once per power-on and APN (they can't be read back in the same list).
+ * Returns true if CID 1 was written. */
+#define CGACT_RETRY_GAP_MS 5000
+
+static bool __attribute__((noinline)) set_pdp_contexts(const char *apn)
 {
+    static char list[512];      /* Static: Modem task stack. The list is about 300 characters. */
     const char *pdp_type = (strcmp(apn, "jionet") == 0) ? "IPV4V6" : "IP";
     char cmd[64];
-    char reply[256] = "";
-    char log_msg[72];
+    bool wrote_cid1 = false;
 
-    snprintf(log_msg, sizeof(log_msg), "Activating data connection on APN %s", apn);
-    storage_log_debug("APN", log_msg);
-    report_progress("ACTIVATING DATA ");
-
-    /* The ESP32 blanks these side channels. CID 5 came from older firmware here: delete it. */
-    clear_rx();
-    send_raw("AT+CGDCONT=5\r\n");
-    wait_response("OK", 1000, NULL, 0);
-    clear_rx();
-    send_raw("AT+CGDCONT=8,\"IP\",\"\"\r\n");
-    wait_response("OK", 1000, NULL, 0);
-    clear_rx();
-    send_raw("AT+CGDCONT=9,\"IP\",\"\"\r\n");
-    wait_response("OK", 1000, NULL, 0);
-
-    snprintf(cmd, sizeof(cmd), "+CGDCONT: 1,\"%s\",\"%s\"", pdp_type, apn);
+    list[0] = '\0';
     clear_rx();
     send_raw("AT+CGDCONT?\r\n");
-    bool apn_stored = wait_response("OK", 2000, reply, sizeof(reply)) && strstr(reply, cmd);
-    if (!apn_stored) {
+    const bool listed = wait_response("OK", 2000, list, sizeof(list));
+
+    /* The ESP32 blanks these side channels. CID 5 came from older firmware here: delete it. */
+    if (!listed || strstr(list, "+CGDCONT: 5,")) {
+        clear_rx();
+        send_raw("AT+CGDCONT=5\r\n");
+        wait_response("OK", 1000, NULL, 0);
+    }
+    if (!listed || !strstr(list, "+CGDCONT: 8,\"IP\",\"\"")) {
+        clear_rx();
+        send_raw("AT+CGDCONT=8,\"IP\",\"\"\r\n");
+        wait_response("OK", 1000, NULL, 0);
+    }
+    if (!listed || !strstr(list, "+CGDCONT: 9,\"IP\",\"\"")) {
+        clear_rx();
+        send_raw("AT+CGDCONT=9,\"IP\",\"\"\r\n");
+        wait_response("OK", 1000, NULL, 0);
+    }
+    snprintf(cmd, sizeof(cmd), "+CGDCONT: 1,\"%s\",\"%s\"", pdp_type, apn);
+    if (!listed || !strstr(list, cmd)) {
         snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"%s\",\"%s\"\r\n", pdp_type, apn);
         clear_rx();
         send_raw(cmd);
         wait_response("OK", 3000, NULL, 0);
+        wrote_cid1 = true;
     }
-    delay_ms(800);
 
     snprintf(cmd, sizeof(cmd), "AT+CGSOCKCONT=1,\"%s\",\"%s\"\r\n", pdp_type, apn);
     clear_rx();
@@ -1427,20 +1546,51 @@ static bool __attribute__((noinline)) activate_apn(const char *apn)
     clear_rx();
     send_raw("AT+CSOCKSETPN=1\r\n");
     wait_response("OK", 1000, NULL, 0);
+    s_pdp_set_apn = apn;
+    return wrote_cid1;
+}
+
+/* ESP32 try_activate_apn, plus AT+CGSOCKCONT and AT+CSOCKSETPN, which the SIM7600's own socket
+ * stack needs. CID 1's APN is only rewritten if it differs: this runs up to 96 times a day, and
+ * the modem keeps it in flash. */
+static bool __attribute__((noinline)) activate_apn(const char *apn)
+{
+    char reply[256] = "";
+    char log_msg[72];
+
+    snprintf(log_msg, sizeof(log_msg), "Activating data connection on APN %s", apn);
+    storage_log_debug("APN", log_msg);
+    report_progress("ACTIVATING DATA ");
+
+    /* Build 21: already set for this APN at this power-on (before the search): nothing to send */
+    if (s_pdp_set_apn != apn && set_pdp_contexts(apn)) {
+        delay_ms(800);
+    }
 
     /* Two tries, with an attach between. BSNL's "no network service" on 1922 (2026-11-09) cleared on
      * the second try once (10:45); 3 times only the radio restart that follows cleared it, and 5
-     * tries over 13 s (v6.9.24, 14:00) didn't help, so more tries only add time. */
+     * tries over 13 s (v6.9.24, 14:00) didn't help, so more tries only add time.
+     * Build 21: the second try comes CGACT_RETRY_GAP_MS after a refusal (was 2-5 s, by how long
+     * AT+CGATT took). 1922, 16-17 Nov, BSNL 4G: tried again 5 s after "no network service" it worked
+     * 14 times of 14; 2 s after, it failed 15 times of 15 and the radio restart cost 22 s. The ESP32
+     * notes say the same of BSNL (registered, data not ready for 3-5 s). A try that timed out (25 s)
+     * goes on as before. */
     bool active = false;
     for (int attempt = 0; attempt < 2 && !active; attempt++) {
         clear_rx();
+        const portTickType asked = xTaskGetTickCount();
         send_raw("AT+CGACT=1,1\r\n");
         active = wait_response("OK", 25000, NULL, 0);
         if (!active && attempt == 0) {
+            const portTickType refused = xTaskGetTickCount();
+            const bool quick_refusal = (refused - asked) < (5000 / portTICK_RATE_MS);
             clear_rx();
             send_raw("AT+CGATT=1\r\n");
             wait_response("OK", 3000, NULL, 0);
             delay_ms(1500);
+            while (quick_refusal && (xTaskGetTickCount() - refused) < (CGACT_RETRY_GAP_MS / portTICK_RATE_MS)) {
+                delay_ms(250);
+            }
         }
     }
 
@@ -1497,6 +1647,7 @@ static bool __attribute__((noinline)) reattach_on_apn(const char *apn)
 
     s_active_apn = apn;
     s_bearer_ready = false;
+    s_pdp_set_apn = NULL;       /* The socket context is set for the new APN by activate_apn() */
 
     for (int i = 0; i < 15; i++) {
         delay_ms(2000);
@@ -2727,6 +2878,7 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
 
     clear_rx();
     send_raw("AT+CNMP=2\r\n");
+    s_radio_mode_auto = true;
     wait_response("OK", 2000, NULL, 0);
 
     char reg[48];
@@ -2935,11 +3087,12 @@ const char *sim7600_build_gps_sms(char kind, const char *present_time)
  * arrived in any slot; at 12:16 with the LCD on, in automatic mode, on LTE with +CREG: 0,1, both came at
  * once). After the slot's data, automatic mode (CNMP=2) for the listening window, until CREG shows
  * voice/SMS registration (10 s at most). True if registered for SMS. */
-bool sim7600_prepare_sms_listen(void)
+bool sim7600_prepare_sms_listen(bool rejoin)
 {
     char cap[48];
     clear_rx();
     send_raw("AT+CNMP=2\r\n");
+    s_radio_mode_auto = true;
     wait_response("OK", 2000, NULL, 0);
     /* v6.9.55 (build 7): always leave the network and join again (COPS=2, COPS=0), as v6.9.47, once
      * no SMS is arriving. Build 6 joined again only when automatic mode showed no CREG in 15 s;
@@ -2965,6 +3118,23 @@ bool sim7600_prepare_sms_listen(void)
         storage_log_debug("SMS", "Listening: automatic mode, SMS still arriving: staying on the network");
         return true;
     }
+    /* Build 19: with every slot listening, only one slot in SMS_REJOIN_EVERY_SLOTS leaves and joins
+     * again (13-20 s of modem time each on BSNL, 1922, 16 Nov evening). The others listen as they
+     * are: SMS from the SIM's own operator come anyway, another operator's at the next re-join. */
+    if (!rejoin) {
+        storage_log_debug("SMS", "Listening: automatic mode, staying on the network (joins again once an hour)");
+        return true;
+    }
+#if !SMS_REJOIN_AIRTEL_IOT
+    /* Build 17: not on an Airtel IoT SIM, until it is known whether the leave-and-join is what made
+     * its searches slow. 1922, 16 Nov: after the 16:02 window (still searching 20 s after COPS=0,
+     * then power-off) the next three switch-ons took 65-90 s to register and two ended on 2G with
+     * data refused; before it, about 15 s on LTE. No SMS has reached that SIM either way. */
+    if (s_sim_airtel_iot) {
+        storage_log_debug("SMS", "Listening: Airtel IoT SIM, staying on the network (no leave and join)");
+        return true;
+    }
+#endif
     storage_log_debug("SMS", "Listening: leaving the network and joining again (tells other operators' SMS centres)");
     clear_rx();
     send_raw("AT+COPS=2\r\n");
@@ -2984,16 +3154,25 @@ bool sim7600_prepare_sms_listen(void)
     if (!auto_ok) {
         storage_log_debug("ERROR", "Modem did not take automatic network selection (COPS=0) after 2 tries");
     }
-    for (int i = 0; i < 20; i++) {
+    /* Build 16: 60 checks, was 20. On an Airtel IoT SIM the modem was still searching (+CREG: 0,2)
+     * 20 s after COPS=0 and the window ran with no SMS registration, so a command sent to the unit
+     * was not delivered (1922, 16 Nov 16:02; BSNL re-joins in about 4 s). */
+    const portTickType joined_from = xTaskGetTickCount();
+    for (int i = 0; i < SMS_REJOIN_WAIT_SEC; i++) {
         clear_rx();
         send_raw("AT+CREG?\r\n");
         if (wait_response("+CREG: ", 1000, cap, sizeof(cap)) && (strstr(cap, ",1") || strstr(cap, ",5"))) {
-            storage_log_debug("SMS", "Listening: automatic mode, registered for SMS");
+            static char msg[72];   /* Static: keeps this path's stack as it was */
+            snprintf(msg, sizeof(msg), "Listening: automatic mode, registered for SMS %lus after joining again",
+                     (unsigned long)((xTaskGetTickCount() - joined_from) / configTICK_RATE_HZ));
+            storage_log_debug("SMS", msg);
             return true;
         }
+        hal_power_heartbeat();
         delay_ms(1000);
     }
-    storage_log_debug("SMS", "Listening: automatic mode, no SMS registration after 20 checks");
+    snprintf(cap, sizeof(cap), "Listening: no SMS registration in %ds", SMS_REJOIN_WAIT_SEC);
+    storage_log_debug("SMS", cap);
     return false;
 }
 
@@ -3379,9 +3558,26 @@ static bool list_sms(char *cap, size_t cap_size)
     return listed;
 }
 
+/* True if the message is a command for this unit, whoever sent it and whether or not it will be run */
+static bool sms_is_command(const sms_in_t *m)
+{
+    static char arg[96];                 /* Static: Modem task stack */
+    static char body[sizeof(m->body)];
+    memcpy(body, m->body, sizeof(body));
+    body[sizeof(body) - 1] = '\0';
+    sms_decode_ucs2(body);
+    return sms_cmd_parse(body, arg, sizeof(arg)) != SMS_CMD_NONE;
+}
+
+bool sim7600_last_sms_check_had_command(void)
+{
+    return s_last_check_command;
+}
+
 int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
 {
     static bool s_list_error_logged = false;
+    s_last_check_command = false;
     /* Polled every few seconds with the LCD on: wait for the end of the list, and log only a message */
     clear_rx();
     s_log_quiet = true;
@@ -3492,6 +3688,8 @@ int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
     bool seen_changed = false;
     for (int i = 0; i < n; i++) {
         hal_power_heartbeat();
+        /* Build 20: a repeat of a command counts too (the centre is working through its queue) */
+        s_last_check_command = s_last_check_command || sms_is_command(&s_inbox[i]);
         if (sms_seen_repeat(&s_seen, s_inbox[i].from, s_inbox[i].ts, s_inbox[i].body, &seen_changed)) {
             char msg[96];
             snprintf(msg, sizeof(msg), "Sent again by the network (%s, %.17s): already answered, not again",

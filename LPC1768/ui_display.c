@@ -856,7 +856,7 @@ static void vFwUpdate_Task(void *pvParameters)
         if (r == FW_OK) {
             fw_show(FW_UI_BUSY, "INSTALLING CTRL", "DO NOT POWER OFF");
             strncpy(s_status_sms_substep, "DO NOT POWER OFF", sizeof(s_status_sms_substep) - 1);
-            storage_log_debug("FW", "New LPC845 firmware sent and checked, restarting it to install");
+            storage_log_debug("FW", "New CTRL firmware sent and checked, restarting it to install");
             storage_log_flush();
             fw_ctrl_restart_lpc845();
             /* The LPC845 cuts this chip's power as it restarts. If that hasn't happened, restart
@@ -906,16 +906,52 @@ static void vFwUpdate_Task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+/* Build 17: the update is two jobs in a row (check, then install) and there is memory for one
+ * (about 3.7 KB each of 6.8 KB free). A finished job's memory comes back only when the idle task
+ * runs, and in the first 15 s after switch-on it doesn't: EN at the FOUND prompt then gave
+ * "UPDATE STOPPED / NO MEMORY" (1922, 16 Nov 15:26, 16:34 twice, each 10-11 s after switch-on).
+ * A job that can't start now is tried again every 50 ms from ui_display_task_step, with
+ * PLEASE WAIT on the LCD, for FW_START_WAIT_TICKS before it is given up. */
+#define FW_START_WAIT_TICKS (30 * 20)
+static const char *s_fw_first_step = "";
+static uint16_t s_fw_start_wait = 0;        /* 50 ms steps left to start a waiting job; 0 = none */
+
+static bool fw_try_start(void)
+{
+    if (xTaskCreate(vFwUpdate_Task, (const signed char *)"FwTask", 896, NULL, 1, &s_sms_task_handle) != pdPASS) {
+        s_sms_task_handle = NULL;
+        return false;
+    }
+    strncpy(s_status_sms_substep, s_fw_first_step, sizeof(s_status_sms_substep) - 1);
+    s_status_sms_substep[sizeof(s_status_sms_substep) - 1] = '\0';
+    return true;
+}
+
 static void fw_start_task(fw_task_op_t op, const char *first_step)
 {
     s_fw_op = op;
     s_fw_running = true;
     s_fw_ui = FW_UI_BUSY;
+    s_fw_first_step = first_step;
     snprintf(s_fw_line1, sizeof(s_fw_line1), "FIRMWARE UPDATE");
-    strncpy(s_status_sms_substep, first_step, sizeof(s_status_sms_substep) - 1);
     s_status_sms_substep[sizeof(s_status_sms_substep) - 1] = '\0';
-    if (xTaskCreate(vFwUpdate_Task, (const signed char *)"FwTask", 896, NULL, 1, &s_sms_task_handle) != pdPASS) {
-        s_sms_task_handle = NULL;
+    if (!fw_try_start()) {
+        strncpy(s_status_sms_substep, "PLEASE WAIT...", sizeof(s_status_sms_substep) - 1);
+        s_fw_start_wait = FW_START_WAIT_TICKS;
+        storage_log_debug("FW", "Update job waiting for memory from the job before it");
+    }
+}
+
+/* Every 50 ms from the UI task, the same task as fw_start_task */
+static void fw_start_waiting_job(void)
+{
+    if (s_fw_start_wait == 0) {
+        return;
+    }
+    if (fw_try_start()) {
+        s_fw_start_wait = 0;
+        storage_log_debug("FW", "Update job started after waiting for memory");
+    } else if (--s_fw_start_wait == 0) {
         s_fw_running = false;
         storage_log_debug("ERROR", "Not enough memory to start the firmware update task");
         fw_show(FW_UI_MESSAGE, "UPDATE STOPPED", "NO MEMORY");
@@ -1600,7 +1636,7 @@ void ui_enter_sleep(void)
         NVIC_SystemReset();
     }
 
-    storage_log_debug("PWR", "Power cut command $f7 sent to LPC845");
+    storage_log_debug("PWR", "Power cut command $f7 sent to CTRL");
     storage_log_flush();
     storage_power_off_mark(); /* v6.9.31: so the log's last block isn't the card's last write */
     /* v6.9.29: a second for the card before power goes. It did not stop BIHAR's card losing the
@@ -1628,7 +1664,7 @@ void ui_enter_sleep(void)
         wd_checkin();   /* Waiting here is not a hang: no false "stopped responding" restart */
         if (intermcu_is_rails_active()) {
             s_system_asleep = false;
-            storage_log_debug("PWR", "LPC845 awakened rails -> resetting LPC1768");
+            storage_log_debug("PWR", "CTRL awakened rails -> resetting LPC1768");
             NVIC_SystemReset();
         }
         since_f7_ms += 200;
@@ -2129,6 +2165,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
     if (s_system_asleep) {
         return;
     }
+    fw_start_waiting_job();
 
     /* Boot type comes from the LCD rail in the LPC845's first status frame. Its slot wake
      * leaves the LCD off; a DSP wake or first power-up has it on. */
@@ -2144,7 +2181,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             lcd_init_hw();
             s_boot_mode_known = true;
         } else if (++s_boot_wait_ticks >= (3 * 20)) {
-            storage_log_debug("ERROR", "No status from LPC845 after 3s: assuming OPERATOR boot, check UART3 link");
+            storage_log_debug("ERROR", "No status from CTRL after 3s: assuming OPERATOR boot, check UART3 link");
             hal_power_lcd_on();
             lcd_init_hw();
             s_boot_mode_known = true;

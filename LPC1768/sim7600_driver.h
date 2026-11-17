@@ -27,7 +27,7 @@ bool sim7600_modem_answered(void);
 /* Server time sets the clock (default on). Off for server 2's copy in mode 2. */
 void sim7600_set_server_clock_sync(bool on);
 /* After the slot's data: automatic radio mode so SMS can be delivered (BSNL: none in 4G-only) */
-bool sim7600_prepare_sms_listen(void);
+bool sim7600_prepare_sms_listen(bool rejoin);
 /* While sending is stopped: corrects the clock from the network's time, past the drift limit */
 void sim7600_correct_clock_from_network(void);
 
@@ -87,6 +87,9 @@ const char *sim7600_build_gps_sms(char kind, const char *present_time);
 bool sim7600_transmit_status_sms(const telemetry_data_t *telem, int csq_dbm);
 /* Reads and runs waiting SMS commands. Returns how many messages were taken. */
 int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot);
+/* Build 20: true if that check took a command for this unit; false for other SMS (operator and
+ * promotional messages), which no longer keep the listening window open */
+bool sim7600_last_sms_check_had_command(void);
 
 #endif /* SIM7600_DRIVER_H */
 
