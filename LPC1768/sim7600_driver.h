@@ -48,6 +48,7 @@ bool sim7600_post_answered(void);
  * NULL when no complete reply came. *status is the HTTP status when the server answered. */
 const char *sim7600_http_get(const char *host, uint16_t port, const char *path, int *len, int *status);
 void sim7600_http_get_close(void);
+const char *sim7600_http_get_fail_text(void);   /* Why the last sim7600_http_get() failed ("" if it did not) */
 
 /* Asks the modem whether it's still on the network */
 bool sim7600_still_registered(void);

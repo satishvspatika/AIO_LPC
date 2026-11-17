@@ -218,6 +218,7 @@ const char *sim7600_http_get(const char *host, uint16_t port, const char *path, 
     return s_reply;
 }
 void sim7600_http_get_close(void) { s_closes++; }
+const char *sim7600_http_get_fail_text(void) { return s_server_dead ? "CIPOPEN: +CIPOPEN: 0,4 ERROR" : ""; }
 
 /* ---- helpers ---- */
 static const int DAILY = OTA_DAILY_FIRST_SLOT + 1922 % OTA_DAILY_SPREAD_SLOTS;
@@ -386,6 +387,40 @@ int main(void)
     fresh(); s_server = SRV_OFFER; s_running = s_fw_image_crc;
     CHECK(!step(DAILY)); CHECK(s_piece_calls == 0 && phase() == '?');
     fresh(); s_server = SRV_OFFER; { uint32_t keep = s_fw_size; s_fw_size = 700000; CHECK(!step(DAILY)); CHECK(s_piece_calls == 0); s_fw_size = keep; }
+
+    /* 12. v6.9.57: a failed daily check is tried at the next 3 slots that day, then not; the reason is logged */
+    fresh(); s_server_dead = true;
+    CHECK(!step(DAILY)); CHECK(s_get_calls == 1 && file_find(OTA_RETRY_FILENAME) >= 0);
+    CHECK(strstr(s_log, "no answer from") && strstr(s_log, "CIPOPEN: +CIPOPEN: 0,4 ERROR") && strstr(s_log, "ask again"));
+    s_tick += 900000; set_clock(16, 10);
+    CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 2);
+    s_tick += 900000; set_clock(31, 10);
+    CHECK(!step(DAILY + 2)); CHECK(s_get_calls == 3);
+    s_tick += 900000; set_clock(46, 10);
+    CHECK(!step(DAILY + 3)); CHECK(s_get_calls == 4 && file_find(OTA_RETRY_FILENAME) < 0);
+    s_tick += 900000; set_clock(1, 10);
+    CHECK(!step(DAILY + 4)); CHECK(s_get_calls == 4);
+    /* ... and an answer on a retry ends the tries, and takes the offer */
+    fresh(); s_server_dead = true;
+    CHECK(!step(DAILY)); s_server_dead = false; s_server = SRV_OFFER; s_tick += 900000; set_clock(16, 10);
+    CHECK(step(DAILY + 1)); CHECK(s_check_calls == 1 && s_staged == 1 && file_find(OTA_RETRY_FILENAME) < 0);
+    /* ... a try left from another day is not taken */
+    fresh(); file_set(OTA_RETRY_FILENAME, "20261116 1\r\n", 12);
+    CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 0);
+    /* ... a check that is not due (OTA.NOW) leaves no tries behind */
+    fresh(); s_server_dead = true; file_set(OTA_NOW_FILENAME, "", 0);
+    CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 1 && file_find(OTA_RETRY_FILENAME) < 0);
+    /* Put off for records still to send: said in the log; the install report waits for it */
+    fresh(); s_backlog = 2;
+    CHECK(!step(DAILY)); CHECK(s_get_calls == 0 && strstr(s_log, "2 record(s) still to send"));
+    fresh(); s_backlog = 0; CHECK(!step(DAILY + 1)); CHECK(!strstr(s_log, "still to send"));   /* Not due: silent */
+    fresh(); s_server = SRV_OFFER; CHECK(step(DAILY)); s_running = s_fw_image_crc; s_server = SRV_NONE;
+    s_backlog = 1; s_tick += 900000; set_clock(16, 10);
+    CHECK(!step(DAILY + 1)); CHECK(phase() == 'I' && s_check_calls == 1);
+    s_backlog = 0; s_tick += 900000; set_clock(31, 10);
+    CHECK(!step(DAILY + 2)); CHECK(phase() == '-' && s_check_calls == 2 && strstr(s_last_check, "&c=22220001&s=0"));
+    /* No SD card on the daily slot: said */
+    fresh(); s_sd_ok = false; CHECK(!step(DAILY)); CHECK(strstr(s_log, "SD card is not working"));
 
     printf("%s: ota_test, %d checks, %d failed\n", s_fails ? "FAILED" : "ALL PASS", s_checks_run, s_fails);
     return s_fails ? 1 : 0;

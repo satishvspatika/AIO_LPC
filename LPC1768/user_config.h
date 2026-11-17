@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.56"
+#define FIRMWARE_VERSION "v6.9.57"
 
 /* THE production switch. 1 = field build:
  *   - MENU > KEY TEST hidden (and TEST SEND can't be switched on)
@@ -191,6 +191,8 @@
 #define OTA_FILE_FILENAME       "OTA.TMP"     /* The firmware file as it comes in */
 #define OTA_STATE_FILENAME      "OTA.DAT"
 #define OTA_NOW_FILENAME        "OTA.NOW"     /* On the card (any content, or empty): check at every slot (bench) */
+#define OTA_RETRY_FILENAME      "OTARETRY.DAT" /* v6.9.57: "YYYYMMDD n": the daily check failed, n tries since */
+#define OTA_RETRIES             3             /* Further tries that day after a failed daily check */
 /* The daily check: 13:00 + 15 min x (station number mod 8), so 13:00 to 14:45. By day, when the battery
  * is charged, clear of the SMS hours, and spread so a fleet doesn't ask at once. */
 #define OTA_DAILY_FIRST_SLOT    52

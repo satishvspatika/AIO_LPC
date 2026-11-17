@@ -2242,20 +2242,50 @@ static size_t __attribute__((noinline)) get_collect(uint32_t timeout_ms, int *st
     return 0;
 }
 
+/* Why the last sim7600_http_get() failed, for the log (its modem replies are not logged: a download
+ * is hundreds of requests). v6.9.57: a check on 1922 failed in under a second with nothing to show why. */
+static char s_get_fail[88];
+
+const char *sim7600_http_get_fail_text(void)
+{
+    return s_get_fail;
+}
+
+/* The step, then what the modem said (wait_response leaves it in s_rx_temp, on an error or a timeout) */
+static void get_fail_note(const char *step)
+{
+    size_t n = (size_t)snprintf(s_get_fail, sizeof(s_get_fail), "%s: ", step);
+    bool space = true;
+    for (const char *p = s_rx_temp; *p && n < sizeof(s_get_fail) - 1; p++) {
+        const bool blank = (*p == '\r' || *p == '\n' || *p == ' ');
+        if (blank ? !space : (*p > ' ' && *p < 127)) {
+            s_get_fail[n++] = blank ? ' ' : *p;
+            space = blank;
+        }
+    }
+    if (n == strlen(step) + 2) {
+        n += (size_t)snprintf(s_get_fail + n, sizeof(s_get_fail) - n, "no answer");
+    }
+    s_get_fail[n < sizeof(s_get_fail) ? n : sizeof(s_get_fail) - 1] = '\0';
+}
+
 const char *sim7600_http_get(const char *host, uint16_t port, const char *path, int *len, int *status)
 {
     char cmd[80];
     *len = 0;
     *status = 0;
+    s_get_fail[0] = '\0';
     s_log_quiet = true;
-    for (int attempt = 0; attempt < 2; attempt++) {
+    for (int attempt = 0; attempt < 3; attempt++) {
         if (!s_get_open) {
             clear_rx();
             send_raw("AT+NETOPEN?\r\n");
             if (!wait_response("+NETOPEN: 1", 2000, NULL, 0)) {
                 clear_rx();
                 send_raw("AT+NETOPEN\r\n");
-                wait_response("+NETOPEN: 0", 20000, NULL, 0);
+                if (!wait_response("+NETOPEN: 0", 20000, NULL, 0)) {
+                    get_fail_note("NETOPEN");
+                }
             }
             close_socket_quiet(1000);
             s_log_quiet = true;
@@ -2263,7 +2293,16 @@ const char *sim7600_http_get(const char *host, uint16_t port, const char *path, 
             clear_rx();
             send_raw(cmd);
             if (!wait_response("+CIPOPEN: 0,0", 20000, NULL, 0)) {
-                break;
+                get_fail_note("CIPOPEN");
+                /* v6.9.57: socket 0 still closing after the data post (1922 on 2G, 17 Nov 14:46) is
+                 * refused at once ("+CIPOPEN: 0,4 ERROR"); this gave up there. Closing the network
+                 * clears it, as for the post (BIHAR, 9 Nov); the next attempt opens it again. */
+                clear_rx();
+                send_raw("AT+NETCLOSE\r\n");
+                wait_response("+NETCLOSE", 3000, NULL, 0);
+                s_log_quiet = true;
+                delay_ms(1000);
+                continue;
             }
             s_get_open = true;
         }
@@ -2278,10 +2317,15 @@ const char *sim7600_http_get(const char *host, uint16_t port, const char *path, 
             const size_t total = get_collect(15000, status, &body_at);
             if (total > 0) {
                 s_rx_temp[total] = '\0';
+                s_get_fail[0] = '\0';
                 *len = (int)(total - (size_t)body_at);
                 s_log_quiet = false;
                 return &s_rx_temp[body_at];
             }
+            snprintf(s_get_fail, sizeof(s_get_fail), "REPLY: %s, HTTP %d",
+                     (body_at < 0) ? "none or cut short in 15 s" : "incomplete", *status);
+        } else {
+            get_fail_note("CIPSEND");
         }
         /* The server ends a kept connection after a while: one more try on a new one */
         s_get_open = true;

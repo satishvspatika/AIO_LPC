@@ -43,7 +43,7 @@ typedef struct {
 } ota_state_t;
 
 /* Static: this runs on the main task's stack, under the slot */
-static char s_text[112];
+static char s_text[176];   /* v6.9.57: room for the modem's reason */
 static char s_path[96];
 static char s_host[44];
 static uint16_t s_port;
@@ -216,8 +216,9 @@ static void ota_download(const char *stn_id)
         }
         storage_ota_close();
         if ((uint32_t)have < s_st.size) {
-            snprintf(s_text, sizeof(s_text), "OTA: stopped at %ld of %lu bytes (%s): goes on at the next slot", have,
-                     (unsigned long)s_st.size, (bad >= 3) ? "no good reply" : "next slot is near");
+            snprintf(s_text, sizeof(s_text), "OTA: stopped at %ld of %lu bytes (%s%.88s): goes on at the next slot", have,
+                     (unsigned long)s_st.size, (bad >= 3) ? "no good reply: " : "next slot is near",
+                     (bad >= 3) ? sim7600_http_get_fail_text() : "");
             ota_log("OTA", s_text);
             return;
         }
@@ -246,10 +247,33 @@ void ota_slot_step(int slot)
     const uint32_t running = fw_app_running_crc();
     bool due = (slot == OTA_DAILY_FIRST_SLOT + (int)(strtoul(stn_id, NULL, 10) % OTA_DAILY_SPREAD_SLOTS));
 
-    if (!storage_sd_is_ok() || fw_app_trial_unconfirmed() || storage_backlog_get_pending_count() != 0 || strlen(t) < 14) {
+    if (!storage_sd_is_ok() || strlen(t) < 14) {
+        if (due) {
+            ota_log("OTA", "OTA: check due but the SD card is not working: not checked");
+        }
         return;
     }
+    if (fw_app_trial_unconfirmed()) {
+        return;     /* Only just after an install: the report waits until it is confirmed */
+    }
     ota_load();
+    /* v6.9.57: a failed daily check is tried again at the next slots that day (was: the next day) */
+    unsigned retries = 0;
+    if (storage_state_load(OTA_RETRY_FILENAME, s_text, sizeof(s_text)) && strncmp(s_text, t, 8) == 0 &&
+        s_text[8] == ' ' && s_text[9] >= '1' && s_text[9] <= '0' + OTA_RETRIES) {
+        retries = (unsigned)(s_text[9] - '0');
+        due = true;
+    }
+    if (!due && s_st.phase != 'D' && s_st.phase != 'I' && storage_file_size(OTA_NOW_FILENAME) < 0) {
+        return;
+    }
+    /* v6.9.57: said, not silent (1922 on 17 Nov: a check put off for an hour with nothing in the log) */
+    const uint32_t pending = storage_backlog_get_pending_count();
+    if (pending != 0) {
+        snprintf(s_text, sizeof(s_text), "OTA: check put off: %lu record(s) still to send first", (unsigned long)pending);
+        ota_log("OTA", s_text);
+        return;
+    }
     if (s_st.phase == 'I') {
         /* An install was started: did the new image stay? */
         if (s_st.image_crc == running) {
@@ -260,9 +284,6 @@ void ota_slot_step(int slot)
             ota_forget_file('F');
         }
         due = true;     /* Tell the server now */
-    }
-    if (!due && s_st.phase != 'D' && storage_file_size(OTA_NOW_FILENAME) < 0) {
-        return;
     }
     if (telem->bat1_volt >= BATTERY_SENSE_FAULT_V && telem->bat1_volt < GPS_MIN_BATTERY_V) {
         ota_log("OTA", "OTA: battery low, not checking for firmware");
@@ -280,9 +301,22 @@ void ota_slot_step(int slot)
     hal_power_heartbeat();
     const char *body = sim7600_http_get(s_host, s_port, s_path, &len, &status);
     const char *answer = (body && status == 200) ? strstr(body, "OTA ") : NULL;
+    if (answer && retries != 0) {
+        storage_state_delete(OTA_RETRY_FILENAME);   /* Answered: no more tries today */
+    }
     if (!answer) {
-        snprintf(s_text, sizeof(s_text), "OTA: no answer from %.40s (HTTP %d)", s_host, status);
+        snprintf(s_text, sizeof(s_text), "OTA: no answer from %.40s (HTTP %d) %.88s", s_host, status,
+                 sim7600_http_get_fail_text());
         ota_log("OTA", s_text);
+        if (due) {
+            if (retries < OTA_RETRIES) {
+                snprintf(s_text, sizeof(s_text), "%.8s %u\r\n", t, retries + 1U);
+                storage_state_save(OTA_RETRY_FILENAME, s_text);
+                ota_log("OTA", "OTA: will ask again after the next slot");
+            } else {
+                storage_state_delete(OTA_RETRY_FILENAME);
+            }
+        }
     } else if (sscanf(answer, "OTA FW %lu %8lx %8lx", &size, &file_crc, &image_crc) != 3) {
         ota_log("OTA", "OTA: nothing new");
         if (s_st.phase == 'D') {
