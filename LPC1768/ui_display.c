@@ -224,6 +224,9 @@ static volatile bool s_boot_mode_known = false;
 static volatile bool s_scheduled_boot = false;
 static volatile bool s_slot_busy = false;
 static bool s_sleep_deferred = false;
+/* v6.9.59: an unattended slot ended before new firmware was confirmed: power off once it is, unless an
+ * operator has come (1922, 17 Nov: on 12 minutes after each OTA install, 13:33 and 15:18) */
+static bool s_sleep_after_confirm = false;
 static uint32_t s_boot_wait_ticks = 0;
 static uint32_t s_lcd_rail_off_ticks = 0;
 static bool s_operator_touched_key = false;
@@ -1536,6 +1539,11 @@ void ui_set_slot_busy(bool busy)
     s_slot_busy = busy;
 }
 
+void ui_sleep_when_confirmed(void)
+{
+    s_sleep_after_confirm = true;
+}
+
 void ui_enter_sleep(void)
 {
     if (s_system_asleep) {
@@ -2196,6 +2204,14 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
         s_sleep_deferred = false;
         ui_enter_sleep();
         return;
+    }
+    if (s_sleep_after_confirm && !s_slot_busy && !sim7600_is_busy() && !slot_scheduler_is_due() && !fw_app_trial_unconfirmed()) {
+        s_sleep_after_confirm = false;
+        if (!s_display_active && !s_operator_touched_key) {
+            storage_log_debug("PWR", "New firmware confirmed: entering sleep");
+            ui_enter_sleep();
+            return;
+        }
     }
 
     /* The LPC845's slot wake also cuts the LCD rail when someone is using the unit:

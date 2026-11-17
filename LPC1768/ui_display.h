@@ -31,6 +31,7 @@ bool ui_is_operator_active(void);
 bool ui_is_display_active(void);
 bool ui_is_operator_touched(void);
 void ui_enter_sleep(void);
+void ui_sleep_when_confirmed(void);   /* Power off once new firmware is confirmed, if no operator came (v6.9.59) */
 
 /* Boot type, known once the LPC845's first status frame arrives (within about 3s) */
 bool ui_is_boot_mode_known(void);

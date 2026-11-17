@@ -1155,6 +1155,16 @@ uint32_t clock_set_by_hand(const char *ts14)
     return seq;
 }
 
+/* The card says this very slot already finished (LASTSLOT.DAT is written at the end of a slot, before
+ * an OTA install restarts the unit). Only the card's word counts: a record in flash from a run cut off
+ * mid-send must still go out, and that re-run is what sends it. */
+static bool slot_finished_on_card(int32_t slot_id)
+{
+    char line[16];
+    return storage_state_load(LAST_SLOT_FILENAME, line, sizeof(line)) && strlen(line) >= 10 &&
+           (int32_t)atol(line) == slot_id;
+}
+
 static int32_t load_last_slot(void)
 {
     /* The newer of the two: with the card out, slots still reach flash but not this file */
@@ -1719,6 +1729,22 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     char own_name[16];
     snprintf(own_name, sizeof(own_name), "%.10s%02d00", telem->present_time, ((min % 60) / 15) * 15);
 
+    /* v6.9.59: restarted inside a slot that had already finished (an OTA install restarts the unit at
+     * the slot's end, and the scheduler then found the slot due again): its record is not sent twice
+     * (1922, 17 Nov: 13:30 and 15:15 records each sent twice) */
+    if (slot_finished_on_card(slot_id)) {
+        snprintf(s_slot_line, sizeof(s_slot_line), "Slot %ld already finished before the restart: not sent again", (long)slot_id);
+        storage_log_debug("SLOT", s_slot_line);
+        ui_set_slot_busy(false);
+        if (!ui_is_display_active() && !ui_is_operator_touched()) {
+            if (fw_app_trial_unconfirmed()) {
+                ui_sleep_when_confirmed();
+            }
+            ui_enter_sleep();
+        }
+        return;
+    }
+
     /* With the LPC845 silent (hung, or on a failed firmware trial) there's no rain, battery or
      * total to report, and a record of zeros would pull CUM_RF down. So nothing is sent or stored.
      * This slot stays unmarked, so the first good slot afterwards fills it in the usual way. */
@@ -1851,6 +1877,9 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
      * enter sleep. If operator is browsing or display is active, stay awake! */
     if (!ui_is_display_active() && !ui_is_operator_touched()) {
         storage_log_debug("PWR", "Unattended slot transmission complete -> entering sleep");
+        if (fw_app_trial_unconfirmed()) {
+            ui_sleep_when_confirmed();  /* Refused below: retried once the firmware is confirmed (v6.9.59) */
+        }
         ui_enter_sleep();
     } else {
         storage_log_debug("PWR", "Operator active on keypad/LCD, remaining awake");
