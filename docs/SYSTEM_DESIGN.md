@@ -464,10 +464,11 @@ new build by `OTASRV.DAT` on the card (`host port`), written by SMS `SET_OTA_SER
 (office numbers only). Source and set-up: `ota_server/`.
 
 **When the unit asks** (`ota_slot_step`, after a slot whose record was delivered, after the SMS check, modem still
-held): on its daily slot (13:00 + 15 min x (station number mod 8)), on every slot while a download is unfinished,
+held): on its check slots (00:30 and 12:30 + 15 min x (station number mod 8); v6.9.60: 01:00 and 13:00), on every slot while a download is unfinished,
 at the first slot after an install (to report), and on every slot if the card holds `OTA.NOW` (bench). Never with
 backlog pending, a card fault, firmware on trial, or the battery under 11.8 V (a reading under 2 V is a broken
-sense line and is allowed, as for the SD update).
+sense line and is allowed, as for the SD update). v6.9.61: the check always goes on its slots; only a download
+waits, and only below 11.0 V (`OTA_MIN_BATTERY_V`). The keypad SD update uses the same 11.0 V (was 11.8 V).
 
 **Protocol** (plain HTTP GET, text, one socket kept open; `sim7600_http_get`):
 
@@ -550,10 +551,19 @@ Image +1.9 KB (128.7-129.0 KB of 128 KB slot, 2.1 KB left on BIHAR); main task w
 slot rows, unit off, queued, restart counts, location signs, damaged rows) and new cases in `ota_test.c`.
 
 Office (`ota_server/lpc_ota.py`): `HEALTH_FIELDS` names each field, `HEALTH_RULES` sets when it needs a look
-(battery under 11.8 V, lowest under 11.5 V, 4+ slots missed, 4+ records waiting, signal -105 dBm or weaker, any
+(battery under 11.0 V, lowest under 11.0 V (v6.9.61; were 11.8 and 11.5 V), 4+ slots missed, 4+ records waiting, signal -105 dBm or weaker, any
 watchdog restart, SD fault, `hs` not OK; plus no check-in for 26 h and a failed update). Stations page: a tab per
 type with counts, "Needs attention" across all types, one row per station; a page per station with the latest
 report, 60 past reports (kept 400 days) and its events.
+
+v6.9.61 (first night of v6.9.60 on 1922, 17 Nov): two ways a half-day's report was lost, now closed.
+- A battery under 11.8 V (`GPS_MIN_BATTERY_V`) skipped the whole check. 1922 dropped 4 of 9 checks at 11.5-11.8 V.
+  Now a low battery (under 11.0 V, `OTA_MIN_BATTERY_V`, user's choice) holds back only a download ("download put off: battery low"): the check, the health report
+  and an install report still go. On an ordinary slot a download under way still waits for a good battery.
+- A check slot whose record was not delivered never ran the check. `ota_slot_not_sent()` (from `run_slot`, on
+  BACKLOG or LOST) writes OTARETRY.DAT for today, so the next delivered slot that day asks, with the usual 3 tries.
+- Check times moved half an hour earlier (user, 17 Nov): 00:30 and 12:30 plus the station's offset (station
+  number mod 8 slots), so 00:30-02:15 and 12:30-14:15. 1922: 01:00 and 13:00.
 
 ---
 

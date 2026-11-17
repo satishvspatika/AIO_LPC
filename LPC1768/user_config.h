@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.60"
+#define FIRMWARE_VERSION "v6.9.61"
 
 /* THE production switch. 1 = field build:
  *   - MENU > KEY TEST hidden (and TEST SEND can't be switched on)
@@ -193,11 +193,13 @@
 #define OTA_NOW_FILENAME        "OTA.NOW"     /* On the card (any content, or empty): check at every slot (bench) */
 #define OTA_RETRY_FILENAME      "OTARETRY.DAT" /* v6.9.57: "YYYYMMDD n": the daily check failed, n tries since */
 #define OTA_RETRIES             3             /* Further tries that day after a failed daily check */
-#define OTA_NIGHT_FIRST_SLOT    4             /* v6.9.60: 01:00; a second check (with the health report) at night */
+#define OTA_NIGHT_FIRST_SLOT    2             /* 00:30 (v6.9.61; was 01:00): a second check (with the health report) at night */
+#define OTA_MIN_BATTERY_V       11.0f         /* v6.9.61 (was GPS_MIN_BATTERY_V, 11.8 V): no OTA download or keypad SD update below this */
 #define HEALTH_FILENAME         "HEALTH.DAT"  /* v6.9.60: restart counts since the last health report */
-/* The daily check: 13:00 + 15 min x (station number mod 8), so 13:00 to 14:45. By day, when the battery
- * is charged, clear of the SMS hours, and spread so a fleet doesn't ask at once. */
-#define OTA_DAILY_FIRST_SLOT    52
+/* The daily check: 12:30 + 15 min x (station number mod 8), so 12:30 to 14:15 (v6.9.61; was 13:00). By
+ * day, when the battery is charged, clear of the SMS hours (11:00, 12:00, 16:00, 17:00), and spread so a
+ * fleet doesn't ask at once. Night: 00:30 to 02:15 the same way. */
+#define OTA_DAILY_FIRST_SLOT    50
 #define OTA_DAILY_SPREAD_SLOTS  8
 
 /* Timing & Safety Watchdog Limits (in milliseconds) */

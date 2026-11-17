@@ -983,7 +983,7 @@ static bool fw_safe_to_install(const telemetry_data_t *telemetry)
      * the fix, so that one is logged and allowed; a real low battery still stops the update. */
     if (telemetry->bat1_volt < BATTERY_SENSE_FAULT_V) {
         storage_log_debug("ERROR", "Battery reads below 2 V (sense line?): updating anyway");
-    } else if (telemetry->bat1_volt < GPS_MIN_BATTERY_V) {
+    } else if (telemetry->bat1_volt < OTA_MIN_BATTERY_V) {    /* v6.9.61: 11.0 V, as OTA (was 11.8 V) */
         fw_show(FW_UI_MESSAGE, "BATTERY LOW", "NOT UPDATING");
         return false;
     }

@@ -14,4 +14,8 @@ void ota_slot_step(int slot);
  * any earlier would have the slot taken for unfinished and sent again. */
 void ota_install_step(void);
 
+/* After a slot whose record was not delivered: if it was the unit's check slot, the check (and its
+ * health report) is asked at the next delivered slot that day instead */
+void ota_slot_not_sent(int slot, const char *time14);
+
 #endif /* OTA_H */

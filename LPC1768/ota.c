@@ -235,6 +235,29 @@ void ota_install_step(void)
     }
 }
 
+/* v6.9.60: twice a day (night and day), each with the health report */
+static bool check_slot(int slot)
+{
+    const int offset = (int)(strtoul(flash_nvram_get_station_id(), NULL, 10) % OTA_DAILY_SPREAD_SLOTS);
+    return slot == OTA_DAILY_FIRST_SLOT + offset || slot == OTA_NIGHT_FIRST_SLOT + offset;
+}
+
+void ota_slot_not_sent(int slot, const char *time14)
+{
+    /* v6.9.61: the check slot's record didn't go, so neither did the check. Without this the health
+     * report was lost until the next half day: the next delivered slot today asks instead. */
+    if (!check_slot(slot) || !storage_sd_is_ok() || strlen(time14) < 14) {
+        return;
+    }
+    char text[24];
+    if (storage_state_load(OTA_RETRY_FILENAME, text, sizeof(text)) && strncmp(text, time14, 8) == 0) {
+        return;     /* Already waiting to ask again today */
+    }
+    snprintf(text, sizeof(text), "%.8s 1\r\n", time14);
+    storage_state_save(OTA_RETRY_FILENAME, text);
+    ota_log("OTA", "OTA: check slot not sent: will ask after the next slot that goes");
+}
+
 void ota_slot_step(int slot)
 {
     /* Taken now: the slot's own copy is from its start, and this needs the time left to the next slot */
@@ -246,9 +269,7 @@ void ota_slot_step(int slot)
     const char *stn_id = flash_nvram_get_station_id();
     const char *t = telem->present_time;
     const uint32_t running = fw_app_running_crc();
-    const int offset = (int)(strtoul(stn_id, NULL, 10) % OTA_DAILY_SPREAD_SLOTS);
-    /* v6.9.60: twice a day (night and day), each with the health report */
-    bool due = (slot == OTA_DAILY_FIRST_SLOT + offset || slot == OTA_NIGHT_FIRST_SLOT + offset);
+    bool due = check_slot(slot);
 
     if (!storage_sd_is_ok() || strlen(t) < 14) {
         if (due) {
@@ -272,7 +293,7 @@ void ota_slot_step(int slot)
         return;
     }
     /* The health report goes with the twice-daily check and its retries, and on a bench unit (OTA.NOW)
-     * with every check, so a test needn't wait for 01:00 or 13:00 */
+     * with every check, so a test needn't wait for 00:30 or 12:30 */
     const bool report = due || bench;
     /* v6.9.57: said, not silent (1922 on 17 Nov: a check put off for an hour with nothing in the log).
      * v6.9.60: the twice-daily check (health report, install report) goes anyway: a station with records
@@ -294,7 +315,12 @@ void ota_slot_step(int slot)
         }
         due = true;     /* Tell the server now */
     }
-    if (telem->bat1_volt >= BATTERY_SENSE_FAULT_V && telem->bat1_volt < GPS_MIN_BATTERY_V) {
+    /* v6.9.61: a low battery holds back only a download. The check is one short request on the network
+     * the slot already has, and a weak battery is what the office most needs to see (1922 on 17 Nov:
+     * 4 of 9 checks dropped at 11.5-11.8 V, the health report with them). The limit is 11.0 V (user,
+     * 17 Nov; was 11.8 V): 1922 swings 11.5-13.2 V from slot to slot and would seldom have downloaded. */
+    const bool battery_low = (telem->bat1_volt >= BATTERY_SENSE_FAULT_V && telem->bat1_volt < OTA_MIN_BATTERY_V);
+    if (battery_low && !report && !due) {     /* due: also set by an install report above */
         ota_log("OTA", "OTA: battery low, not checking for firmware");
         return;
     }
@@ -343,6 +369,8 @@ void ota_slot_step(int slot)
         ota_log("OTA", "OTA: offer ignored (size, or the image already running)");
     } else if (s_st.phase == 'F' && s_st.image_crc == image_crc) {
         ota_log("OTA", "OTA: the offered firmware failed here before: not taken");
+    } else if (battery_low) {
+        ota_log("OTA", "OTA: download put off: battery low");
     } else if (pending != 0) {
         snprintf(s_text, sizeof(s_text), "OTA: download put off: %lu record(s) still to send first", (unsigned long)pending);
         ota_log("OTA", s_text);

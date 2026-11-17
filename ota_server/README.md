@@ -28,7 +28,7 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
 - **Firmware files**: upload the file that goes on the SD card (`fw_ksn_trg.hex`, `fw_bihar.hex`,
   `fw_ksn_tws.hex`). It is refused unless it is a whole main-firmware file with the right header and CRC.
   Uploading sends it to nobody.
-- A station checks once a day (13:00 to 14:45, by station number), or after every delivered slot with `OTA.NOW`
+- A station checks twice a day (00:30 to 02:15 and 12:30 to 14:15, by station number; v6.9.60 and earlier: 01:00 and 13:00), or after every delivered slot with `OTA.NOW`
   on its card. It appears on the page by itself at its first check (firmware v6.9.55 build 23 and later).
 
 A station that went back to its old firmware is not offered the same build again: upload a new one.

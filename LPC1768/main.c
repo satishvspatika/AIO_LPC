@@ -1846,6 +1846,11 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     int csq = -113;
     const char *reason = "UNKNOWN";
     slot_result_t result = execute_slot_transmission(telem, &attempts, &csq, &reason);
+#if ENABLE_OTA
+    if (result == SLOT_BACKLOG || result == SLOT_LOST) {
+        ota_slot_not_sent(slot_of_day(s_archive_slot_id), telem->present_time);
+    }
+#endif
     unsigned int duration_sec = (unsigned int)((xTaskGetTickCount() - start_tick) / configTICK_RATE_HZ);
 
     static const char *const result_names[] = {"SENT", "BACKLOG", "LOST", "STOPPED"};

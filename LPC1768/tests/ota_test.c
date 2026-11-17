@@ -281,7 +281,7 @@ int main(void)
     CHECK(strstr(s_last_check, "id=001922&p=") && strstr(s_last_check, "&v=" FIRMWARE_VERSION "&c=11111111&s=0&t=00000000"));
     CHECK(file_find(OTA_FILE_FILENAME) < 0);
     fresh(); file_set(OTA_NOW_FILENAME, "", 0); CHECK(!step(3)); CHECK(s_check_calls == 1);
-    fresh(); s_battery = 11.5f; CHECK(!step(DAILY)); CHECK(s_get_calls == 0);
+    fresh(); s_battery = 10.8f; CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 0);  /* Ordinary slot, low battery: nothing */
     fresh(); s_battery = 0.2f; CHECK(!step(DAILY)); CHECK(s_check_calls == 1);     /* Broken sense line: allowed */
     fresh(); s_backlog = 2; CHECK(!step(DAILY)); CHECK(s_check_calls == 1 && s_piece_calls == 0);   /* v6.9.60: report goes */
     fresh(); s_trial = true; CHECK(!step(DAILY)); CHECK(s_get_calls == 0);
@@ -457,6 +457,43 @@ int main(void)
     fresh(); s_server = SRV_OFFER; CHECK(step(DAILY)); s_running = s_fw_image_crc; s_server = SRV_NONE;
     s_tick += 900000; set_clock(16, 10); s_health_built = 0;
     CHECK(!step(DAILY + 1)); CHECK(s_check_calls == 2 && s_health_built == 0);
+    /* 14. v6.9.61: a low battery holds back only the download; the check and health report still go */
+    fresh(); s_battery = 10.8f; s_server = SRV_OFFER;
+    CHECK(!step(DAILY)); CHECK(s_check_calls == 1 && s_piece_calls == 0 && s_health_sent == 1 && phase() == '?');
+    CHECK(strstr(s_log, "download put off: battery low") && strstr(s_log, "health report sent"));
+    s_battery = 12.4f; s_tick += 900000; set_clock(1, 10);
+    CHECK(step(NIGHT)); CHECK(s_staged == 1);                    /* Good battery at the next check: taken */
+    /* ... a download under way stops on a low battery at an ordinary slot, goes on at the next good one */
+    fresh(); s_server = SRV_OFFER; s_piece_ms = 60000; CHECK(!step(DAILY)); CHECK(phase() == 'D' && s_piece_calls > 0);
+    s_piece_ms = 500; s_battery = 10.8f; s_tick += 900000; set_clock(16, 10);
+    { int before = s_get_calls; CHECK(!step(DAILY + 1)); CHECK(s_get_calls == before && strstr(s_log, "battery low")); }
+    s_battery = 12.4f; s_tick += 900000; set_clock(31, 10);
+    CHECK(step(DAILY + 2)); CHECK(card_has_whole_file());
+    /* ... the install report goes on a low battery */
+    fresh(); s_server = SRV_OFFER; CHECK(step(DAILY)); s_running = s_fw_image_crc; s_server = SRV_NONE;
+    s_battery = 10.8f; s_tick += 900000; set_clock(16, 10);
+    CHECK(!step(DAILY + 1)); CHECK(phase() == '-' && s_check_calls == 2);
+
+    /* ... 11.0 V is the limit (v6.9.61; was 11.8 V): 11.5 V downloads */
+    fresh(); s_battery = 11.5f; s_server = SRV_OFFER; CHECK(step(DAILY)); CHECK(s_staged == 1);
+    fresh(); s_battery = 11.0f; s_server = SRV_OFFER; CHECK(step(DAILY)); CHECK(s_staged == 1);
+    fresh(); s_battery = 10.99f; s_server = SRV_OFFER; CHECK(!step(DAILY)); CHECK(s_piece_calls == 0 && s_health_sent == 1);
+
+    /* 15. v6.9.61: the check slot's record not delivered: the next delivered slot that day asks, with the report */
+    fresh(); ota_slot_not_sent(NIGHT, "20261117013102");
+    CHECK(file_find(OTA_RETRY_FILENAME) >= 0 && strstr(s_log, "check slot not sent"));
+    CHECK(!step(NIGHT + 1)); CHECK(s_check_calls == 1 && s_health_sent == 1 && file_find(OTA_RETRY_FILENAME) < 0);
+    fresh(); ota_slot_not_sent(NIGHT + 1, "20261117014602"); CHECK(file_find(OTA_RETRY_FILENAME) < 0);   /* Not its check slot */
+    fresh(); file_set(OTA_RETRY_FILENAME, "20261117 2\r\n", 12); ota_slot_not_sent(DAILY, "20261117133102");
+    { char t[24]; CHECK(storage_state_load(OTA_RETRY_FILENAME, t, sizeof(t)) && !strncmp(t, "20261117 2", 10)); }   /* Tries kept */
+    fresh(); s_sd_ok = false; ota_slot_not_sent(DAILY, "20261117133102"); CHECK(file_find(OTA_RETRY_FILENAME) < 0);
+    s_sd_ok = true;
+    /* ... unanswered after that: the usual 3 tries */
+    fresh(); ota_slot_not_sent(DAILY, "20261117133102"); s_server_dead = true;
+    CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 1 && file_find(OTA_RETRY_FILENAME) >= 0);
+    s_tick += 900000; set_clock(16, 10); CHECK(!step(DAILY + 2));
+    s_tick += 900000; set_clock(31, 10); CHECK(!step(DAILY + 3)); CHECK(s_get_calls == 3 && file_find(OTA_RETRY_FILENAME) < 0);
+
     /* No SD card on the daily slot: said */
     fresh(); s_sd_ok = false; CHECK(!step(DAILY)); CHECK(strstr(s_log, "SD card is not working"));
 
