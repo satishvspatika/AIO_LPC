@@ -507,6 +507,44 @@ Memory: image 125.6-126.0 KB of 128 KB (was 121.2-121.5); +0.4 KB RAM; main task
 server, card and clock: resume, bad replies, withdrawn or changed file, rollback, time limit; mutation-checked)
 and `tests/ota_get_test.c` (the reply parser as it stands in the driver, cut at every position).
 
+**v6.9.57-v6.9.59 (2026-11-17, 1922):** the request closes the network and tries again when the modem refuses
+to open the connection (`+CIPOPEN: 0,4 ERROR`, socket 0 still closing after the data post on 2G), 3 attempts;
+the failing step and the modem's reply go into the `OTA:` log line; a failed daily check is retried at the next
+3 delivered slots that day (`OTARETRY.DAT`); a check put off for records still to send is logged. After an
+install the unit powers off once the new firmware is confirmed (it stayed on to the next slot), and a slot that
+`LASTSLOT.DAT` shows finished is not sent again after the install restart. Proven by OTA on 2G, 16:45.
+
+### 7.7 Health report (planned, v6.9.60; office side ready)
+
+The daily report rides on the OTA check: the same `GET /lpc/check`, with more short fields after the update
+ones. No second connection, no second server. A unit without them is unaffected. Planned twice a day (the
+13:00-14:45 check and one around 01:00, so the night battery is seen); decision pending.
+
+| Field | Meaning | Source on the unit |
+|---|---|---|
+| `hs` | `OK`, or fault codes joined by `.` (as the ESP32's `health_sts`), e.g. `RTC_FAIL.WDOG` | flags below |
+| `bv`, `bmin` | battery now; lowest of the last 24 h (V) | telemetry; `SLOTS.CSV` battery column |
+| `sv` | solar (V), TWS | telemetry |
+| `sig`, `net`, `op` | signal (dBm), 2 or 4 (G), operator | this slot |
+| `ok`, `late`, `miss` | of the last 96 slots: sent in their own slot, sent later from the queue, missed or unit off | last 96 rows of `SLOTS.CSV` |
+| `q` | records waiting now | backlog count |
+| `dur` | average time on per slot (s) | `SLOTS.CSV` duration column |
+| `rst`, `wdt` | restarts and watchdog restarts, 24 h | `SLOTS.CSV` boot column, reset reason |
+| `sd` | SD card 1 working, 0 fault | storage |
+| `ctrl` | CTRL firmware version | link |
+| `clk` | clock corrected by (s) at the last server correction | RTC check |
+| `sens` | TWS sensors, e.g. `TH-OK,WS-OK,WD-FAIL` | sensor checks |
+| `gps` | `lat,lon` when known | GPS |
+
+Values: up to 40 characters of `0-9 A-Z a-z . , : + -` (others are dropped by the server). The path buffer
+grows from 96 B to about 320 B. Read back from `SLOTS.CSV` at report time, so nothing new is written each slot.
+
+Office (`ota_server/lpc_ota.py`): `HEALTH_FIELDS` names each field, `HEALTH_RULES` sets when it needs a look
+(battery under 11.8 V, lowest under 11.5 V, 4+ slots missed, 4+ records waiting, signal -105 dBm or weaker, any
+watchdog restart, SD fault, `hs` not OK; plus no check-in for 26 h and a failed update). Stations page: a tab per
+type with counts, "Needs attention" across all types, one row per station; a page per station with the latest
+report, 60 past reports (kept 400 days) and its events.
+
 ---
 
 ## 8. Data storage

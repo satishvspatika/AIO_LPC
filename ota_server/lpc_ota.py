@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import hmac
 import html
+import json
 import os
 import re
 import secrets
@@ -141,7 +142,14 @@ def init_db():
             target TEXT DEFAULT 'type', offered_crc TEXT, progress INTEGER DEFAULT 0, result TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, station TEXT, text TEXT);
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS health (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, at INTEGER, data TEXT);
+        CREATE INDEX IF NOT EXISTS health_key ON health (key, id);
         """)
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(stations)")}
+        if "health" not in cols:
+            con.execute("ALTER TABLE stations ADD COLUMN health TEXT DEFAULT ''")
+        if "health_at" not in cols:
+            con.execute("ALTER TABLE stations ADD COLUMN health_at INTEGER DEFAULT 0")
 
 
 def add_event(con, station, text):
@@ -165,6 +173,65 @@ def target_build(con, st):
     if build_id is None:
         return None
     return con.execute("SELECT * FROM builds WHERE id=?", (build_id,)).fetchone()
+
+
+# ---------------------------------------------------------------- health report
+# The daily report rides on the unit's check (/lpc/check), as more short fields after the update ones.
+# One list defines each field: what the unit sends, how the office page names it, and when it needs
+# a look. A unit without them (before v6.9.60) is unaffected. Planned unit side: docs/SYSTEM_DESIGN.md 7.7.
+
+HEALTH_FIELDS = [   # (field, label, unit)
+    ("hs", "Health status", ""),                    # "OK" or fault codes joined by ".", e.g. RTC_FAIL.WDOG (ESP32 health_sts)
+    ("bv", "Battery now", "V"),
+    ("bmin", "Battery lowest, 24 h", "V"),
+    ("sv", "Solar", "V"),
+    ("sig", "Signal", "dBm"),
+    ("net", "Network", ""),                         # 2 or 4 (G)
+    ("op", "Operator", ""),
+    ("ok", "Slots sent on time, 24 h", "of 96"),
+    ("late", "Sent later from the queue, 24 h", ""),
+    ("miss", "Slots missed or unit off, 24 h", ""),
+    ("q", "Records waiting now", ""),
+    ("dur", "Average time on per slot", "s"),
+    ("rst", "Restarts, 24 h", ""),
+    ("wdt", "Watchdog restarts, 24 h", ""),
+    ("sd", "SD card", ""),                          # 1 working, 0 fault
+    ("ctrl", "CTRL firmware", ""),
+    ("clk", "Clock corrected by", "s"),
+    ("sens", "Sensors", ""),                        # TWS: e.g. TH-OK,WS-OK,WD-OK
+    ("gps", "Location", ""),                        # lat,lon
+]
+HEALTH_UNITS = {k: u for k, _, u in HEALTH_FIELDS}
+HEALTH_SHORT = {"bv": "Battery", "bmin": "Lowest", "sig": "Signal", "net": "Net", "ok": "On time", "late": "Later",
+                "miss": "Missed", "q": "Waiting", "rst": "Restarts", "wdt": "Watchdog", "hs": "Health"}
+HEALTH_HISTORY = ["bv", "bmin", "sig", "net", "ok", "late", "miss", "rst", "wdt", "hs"]
+HEALTH_VALUE = re.compile(r"[0-9A-Za-z._,:+-]{0,40}")
+
+
+def _f(v):
+    return float(v)
+
+
+HEALTH_RULES = [    # (field, needs a look if, class, text)
+    ("hs", lambda v: v not in ("OK", ""), "bad", lambda v: v.replace(".", ", ")),
+    ("sd", lambda v: v == "0", "bad", lambda v: "SD card fault"),
+    ("wdt", lambda v: _f(v) > 0, "bad", lambda v: f"{v} watchdog restart(s)"),
+    ("bv", lambda v: _f(v) < 11.8, "bad", lambda v: f"Battery {v} V"),
+    ("bmin", lambda v: _f(v) < 11.5, "wait", lambda v: f"Battery fell to {v} V"),
+    ("miss", lambda v: _f(v) >= 4, "wait", lambda v: f"{v} slots missed"),
+    ("q", lambda v: _f(v) >= 4, "wait", lambda v: f"{v} records waiting"),
+    ("sig", lambda v: _f(v) <= -105, "wait", lambda v: f"Weak signal {v} dBm"),
+]
+
+
+def store_health(con, key, q, now):
+    h = {k: q[k] for k, _, _ in HEALTH_FIELDS if k in q and HEALTH_VALUE.fullmatch(q[k])}
+    if not h:
+        return
+    data = json.dumps(h, separators=(",", ":"))
+    con.execute("INSERT INTO health (key, at, data) VALUES (?,?,?)", (key, now, data))
+    con.execute("UPDATE stations SET health=?, health_at=? WHERE key=?", (data, now, key))
+    con.execute("DELETE FROM health WHERE key=? AND at < ?", (key, now - 400 * 86400))
 
 
 # ---------------------------------------------------------------- unit requests
@@ -200,6 +267,7 @@ def unit_check(q, ip):
                         " tried_crc=?, last_seen=?, last_ip=? WHERE key=?",
                         (stn, profile, version, crc, status, tried, now, ip, key))
             st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
+        store_health(con, key, q, now)
         build = target_build(con, st)
         reply = "OTA NONE\n"
         result = st["result"]
@@ -343,6 +411,17 @@ details summary{cursor:pointer;color:var(--acc);font-size:14px}
 .login{max-width:360px;margin:12vh auto}.login input{width:100%;margin-bottom:10px}.login button{width:100%}
 .pw input{width:100%;max-width:340px}
 @media (max-width:600px){.st{grid-template-columns:1fr}.st .right{text-align:left}}
+.seg{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+.seg a{padding:8px 14px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);text-decoration:none;font-weight:600;font-size:14px}
+.seg a span{color:var(--mute);font-weight:500;margin-left:4px}.seg a.on{background:var(--acc);border-color:var(--acc);color:var(--acc-ink)}
+.seg a.on span{color:var(--acc-ink);opacity:.8}
+table.list td{vertical-align:middle}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:var(--ok)}
+.dot.bad{background:var(--bad)}.dot.wait{background:var(--wait)}
+.kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px 18px}
+.kv>div{display:flex;flex-direction:column;gap:2px}.kv>div>span:first-child{color:var(--mute);font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+td .pill{margin:1px 2px}
+select,input{max-width:100%}.card{min-width:0}.tick{max-width:100%}.tick span{min-width:0;overflow-wrap:anywhere}
 """
 
 TABS = [("stations", "Stations"), ("firmware", "Firmware files"), ("history", "History"), ("password", "Password")]
@@ -377,7 +456,7 @@ def page(title, body, tab=None, message="", script=""):
     if message:
         cls = "msg bad" if message.lower().startswith(("file refused", "wrong", "not ", "no ", "the new", "build #")) and "deleted" not in message else "msg"
         msg = f"<div class='{cls}'>{esc(message)}</div>"
-    return (head + f"<header><div class='top'><b>LPC-AIO firmware updates</b><a href='/logout'>Log out</a></div>"
+    return (head + f"<header><div class='top'><b>LPC-AIO stations &amp; firmware</b><a href='/logout'>Log out</a></div>"
             f"<nav>{nav}</nav></header><main>{msg}{body}</main>{script}</body></html>").encode()
 
 
@@ -418,99 +497,251 @@ def station_state(s, build):
     return "wait", "Waiting for next check", f"It will get {build['version']} at its next check.", None
 
 
-def stations_tab():
+STALE_AFTER_S = 26 * 3600      # A unit checks once a day: no check for longer than this needs a look
+TYPE_SLUG = {0: "ksn-trg", 1: "bihar-trg", 2: "ksn-tws"}
+
+
+def health_of(s):
+    try:
+        return json.loads(s["health"] or "{}")
+    except (ValueError, TypeError, IndexError, KeyError):
+        return {}
+
+
+def attention(s, h):
+    """What needs a look at this station: [(class, text)], worst first. Uses HEALTH_RULES for the report."""
+    out = []
+    now = int(time.time())
+    if not s["last_seen"]:
+        out.append(("wait", "Never checked in"))
+    elif now - s["last_seen"] > STALE_AFTER_S:
+        out.append(("bad", f"No check-in for {(now - s['last_seen']) // 3600} h"))
+    res = s["result"] or ""
+    if res.startswith("FAILED"):
+        out.append(("bad", "Update failed"))
+    elif res.startswith("target is for another"):
+        out.append(("bad", "Wrong firmware type set"))
+    if s["unit_status"] in ("4", "5"):
+        out.append(("bad", UNIT_STATUS[s["unit_status"]].capitalize()))
+    if h and s["health_at"] and now - s["health_at"] <= STALE_AFTER_S + 3600:
+        for key, test, cls, text in HEALTH_RULES:
+            v = h.get(key)
+            if v is None or v == "":
+                continue
+            try:
+                hit = test(v)
+            except ValueError:
+                hit = False
+            if hit:
+                out.append((cls, text(v)))
+    out.sort(key=lambda a: a[0] != "bad")
+    return out
+
+
+def fmt_health(key, v):
+    if v is None or v == "":
+        return "<span class='mute'>—</span>"
+    unit = HEALTH_UNITS.get(key, "")
+    if key == "sd":
+        return "<span class='okt'>OK</span>" if v == "1" else "<span class='badt'>Fault</span>"
+    if key == "hs":
+        return "<span class='okt'>OK</span>" if v == "OK" else f"<span class='badt'>{esc(v.replace('.', ', '))}</span>"
+    if key == "net":
+        return esc(f"{v}G") if v in ("2", "4") else esc(v)
+    if key == "gps" and "," in v:
+        lat, _, lon = v.partition(",")
+        return f"<a href='https://maps.google.com/?q={esc(lat)},{esc(lon)}' target='_blank' rel='noopener'>{esc(v)}</a>"
+    return esc(v) + (f" <span class='mute'>{esc(unit)}</span>" if unit else "")
+
+
+def type_counts(stations):
+    counts = {p: 0 for p in TYPES}
+    for s in stations:
+        if s["profile"] in counts:
+            counts[s["profile"]] += 1
+    return counts
+
+
+def stations_tab(ptype, search):
     with db() as con:
         builds = con.execute("SELECT * FROM builds ORDER BY id DESC").fetchall()
         targets = {r["profile"]: r["build_id"] for r in con.execute("SELECT * FROM type_targets")}
         stations = con.execute("SELECT * FROM stations ORDER BY CAST(key AS INTEGER), key").fetchall()
         st_builds = {s["key"]: target_build(con, s) for s in stations}
     by_id = {b["id"]: b for b in builds}
-    by_crc = {b["image_crc"]: b for b in builds}
+    counts = type_counts(stations)
+    if ptype not in TYPES:
+        ptype = max(TYPES, key=lambda p: (counts[p], -p))     # The busiest type first
     h = []
 
-    # 1. Send an update
-    h.append("<div class='card'><h2>Send an update</h2>")
-    if not builds:
-        h.append("<p class='hint'>First upload a firmware file on the <a href='/?tab=firmware'>Firmware files</a> tab.</p></div>")
-    else:
-        opts = "".join(f"<option value='{b['id']}' data-p='{b['profile']}'>{esc(build_name(b))}"
-                       f"{' · ' + esc(b['note']) if b['note'] else ''}</option>" for b in builds)
-        ticks = "".join(
-            f"<label class='tick' data-p='{s['profile']}'><input type='checkbox' name='stn' value='{esc(s['key'])}'>"
-            f"<span><b>{esc(s['shown_id'])}</b> <span class='mute'>{esc(s['version'] or 'not seen yet')}</span></span></label>"
-            for s in stations)
-        h.append("<p class='hint'>Choose the firmware, tick the stations, press Send. Try one station first.</p>"
-                 "<form method='post' action='/send' class='stack'>"
-                 f"<div><label class='f' for='bsel'>1. Firmware</label><select id='bsel' name='build' required>{opts}</select></div>"
-                 "<div><label class='f'>2. Stations</label>"
-                 f"<div class='ticks' id='ticks'>{ticks}</div>"
-                 "<p class='hint' id='noone' style='display:none;margin-top:8px'>No station of this type has checked in yet.</p></div>"
-                 "<label class='tick' style='align-self:flex-start'><input type='checkbox' name='all' value='1'>"
-                 "<span>Every station of this type, including ones that check in later</span></label>"
-                 "<div><button>Send update</button></div></form>")
-        h.append("</div>")
-
-    # 2. Station list
-    h.append("<div class='card'><h2>Stations</h2><p class='hint'>Updates every 30 seconds. A station appears after its "
-             "first check (once a day, or every slot with OTA.NOW on its card).</p><div class='list'>")
+    # Needs attention: every type, so nothing is missed by looking at one tab
+    flagged = []
     for s in stations:
-        build = st_builds[s["key"]]
-        cls, label, detail, pct = station_state(s, build)
-        running = by_crc.get(s["running_crc"])
-        run = esc(s["version"]) or "<span class='mute'>not seen yet</span>"
-        bar = f"<div class='bar'><i style='width:{pct}%'></i></div>" if pct is not None else ""
-        target_line = ""
-        if build is not None and s["target"] != "hold":
-            how = "for the whole type" if s["target"] == "type" else "for this station"
-            target_line = f"<div class='sub'>Set to get {esc(build['version'])} (#{build['id']}) {how}</div>"
-        action = ""
-        if s["target"] == "hold":
-            action = (f"<form method='post' action='/station'><input type='hidden' name='key' value='{esc(s['key'])}'>"
-                      f"<input type='hidden' name='target' value='type'><button class='plain small'>Resume updates</button></form>")
-        elif build is not None and not label.startswith(("Up to date", "Updated")):
-            action = (f"<form method='post' action='/station'><input type='hidden' name='key' value='{esc(s['key'])}'>"
-                      f"<input type='hidden' name='target' value='hold'><button class='del small'>Stop</button></form>")
-        h.append(f"<div class='st'><div><div class='id'>{esc(s['shown_id'])} "
-                 f"<span class='sub' style='font-weight:400'>{esc(TYPES.get(s['profile'], '?'))}</span></div>"
-                 f"<div>Running <b>{run}</b>{' (#' + str(running['id']) + ')' if running else ''} "
-                 f"<span class='crc'>{esc(s['running_crc'])}</span></div>"
-                 f"<div class='sub'>Last check: {esc(when(s['last_seen']))}</div>{target_line}</div>"
-                 f"<div class='right'><span class='pill {cls}'>{esc(label)}</span>{bar}"
-                 f"{'<div class=sub style=max-width:300px;margin-top:4px>' + esc(detail) + '</div>' if detail else ''}"
-                 f"<div style='margin-top:6px'>{action}</div></div></div>")
-    if not stations:
-        h.append("<p class='mute'>No station has checked in yet.</p>")
+        a = attention(s, health_of(s))
+        if a:
+            flagged.append((s, a))
+    h.append("<div class='card'><h2>Needs attention</h2>")
+    if flagged:
+        h.append("<div class='scroll'><table><tr><th>Station</th><th>Type</th><th>What</th></tr>")
+        for s, a in flagged:
+            pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a)
+            h.append(f"<tr><td class='nw'><a href='/s?k={esc(s['key'])}'><b>{esc(s['shown_id'])}</b></a></td>"
+                     f"<td class='nw'>{esc(TYPES.get(s['profile'], '?'))}</td><td>{pills}</td></tr>")
+        h.append("</table></div>")
+    else:
+        h.append("<p class='hint' style='margin:0'><span class='okt'>Nothing.</span> Every station checked in within "
+                 "26 hours and reports no problem.</p>")
     h.append("</div>")
-    whole = [(p, by_id.get(b)) for p, b in targets.items() if b and by_id.get(b)]
-    if whole:
-        h.append("<p class='hint' style='margin-top:14px'><b>Whole-type updates:</b></p><div class='stack'>")
-        for p, b in whole:
-            h.append(f"<form method='post' action='/type' class='row'><input type='hidden' name='profile' value='{p}'>"
-                     f"<input type='hidden' name='build' value=''><span>Every {esc(TYPES[p])} station gets "
-                     f"<b>{esc(b['version'])}</b> (#{b['id']})</span><button class='del small'>Stop for the type</button></form>")
-        h.append("</div>")
-    h.append("<details style='margin-top:14px'><summary>Add a station that hasn't checked in yet</summary>"
-             "<form method='post' action='/station/add' class='row' style='margin-top:10px'>"
-             "<input name='id' placeholder='Station ID, e.g. 001922' size='18' required pattern='[0-9A-Za-z]{1,12}'>"
-             "<select name='profile'>" + "".join(f"<option value='{p}'>{t}</option>" for p, t in TYPES.items()) +
-             "</select><button class='plain'>Add</button></form></details></div>")
 
-    script = """<script>
-(function(){
-  var sel=document.getElementById('bsel');
-  function filt(){ if(!sel) return; var p=sel.options[sel.selectedIndex].getAttribute('data-p'), n=0;
-    document.querySelectorAll('#ticks .tick').forEach(function(t){ var on=t.getAttribute('data-p')===p;
-      t.classList.toggle('hide',!on); if(!on) t.querySelector('input').checked=false; else n++; });
-    document.getElementById('noone').style.display=n?'none':'block'; }
-  if(sel){ sel.addEventListener('change',filt); filt(); }
-  setInterval(function(){
-    var busy=document.querySelector('input[type=checkbox]:checked')||
-      (document.activeElement&&/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName));
-    if(!busy) location.replace('/?tab=stations');
-  },30000);
-})();
+    # Type tabs
+    h.append("<div class='seg'>" + "".join(
+        f"<a href='/?tab=stations&type={p}' class='{'on' if p == ptype else ''}'>{esc(t)} <span>{counts[p]}</span></a>"
+        for p, t in TYPES.items()) + "</div>")
+
+    # The type's stations
+    rows = [s for s in stations if s["profile"] == ptype]
+    if search:
+        rows = [s for s in rows if search.lstrip("0") in s["shown_id"].lstrip("0")]
+    h.append(f"<div class='card'><div class='row' style='justify-content:space-between;margin-bottom:10px'>"
+             f"<h2 style='margin:0'>{esc(TYPES[ptype])} stations</h2>"
+             f"<form method='get' action='/' class='row'><input type='hidden' name='tab' value='stations'>"
+             f"<input type='hidden' name='type' value='{ptype}'><input name='q' value='{esc(search)}' "
+             f"placeholder='Find a station ID' size='16'><button class='plain'>Find</button></form></div>"
+             "<div class='scroll'><table class='list'><tr><th>Station</th><th>Firmware</th><th>Battery</th>"
+             "<th>Signal</th><th>On time (24 h)</th><th>Last check</th><th>Update</th></tr>")
+    for s in rows:
+        hl = health_of(s)
+        cls, label, _, pct = station_state(s, st_builds[s["key"]])
+        a = attention(s, hl)
+        dot = f"<span class='dot {a[0][0]}' title='{esc(', '.join(t for _, t in a))}'></span>" if a else "<span class='dot'></span>"
+        bar = f"<div class='bar'><i style='width:{pct}%'></i></div>" if pct is not None else ""
+        ontime = (f"{esc(hl['ok'])}<span class='mute'>/96</span>" if hl.get("ok") else "<span class='mute'>—</span>")
+        h.append(f"<tr><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(s['shown_id'])}</b></a></td>"
+                 f"<td class='nw'>{esc(s['version']) or '<span class=mute>—</span>'}</td>"
+                 f"<td class='nw'>{fmt_health('bv', hl.get('bv'))}</td><td class='nw'>{fmt_health('sig', hl.get('sig'))}</td>"
+                 f"<td class='nw'>{ontime}</td><td class='nw'>{esc(when(s['last_seen']))}</td>"
+                 f"<td class='nw'><span class='pill {cls}'>{esc(label)}</span>{bar}</td></tr>")
+    if not rows:
+        h.append(f"<tr><td colspan='7' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
+    h.append("</table></div>")
+    if not any(health_of(s) for s in rows) and rows:
+        h.append("<p class='hint' style='margin:10px 0 0'>Battery, signal and slot counts come in the daily health "
+                 "report, from firmware v6.9.60 on.</p>")
+    h.append("</div>")
+
+    # Send an update, for this type only
+    tb = [b for b in builds if b["profile"] == ptype]
+    h.append(f"<div class='card'><h2>Send an update to {esc(TYPES[ptype])} stations</h2>")
+    if not tb:
+        h.append(f"<p class='hint' style='margin:0'>No {esc(TYPES[ptype])} firmware uploaded yet: see "
+                 "<a href='/?tab=firmware'>Firmware files</a>.</p></div>")
+    else:
+        opts = "".join(f"<option value='{b['id']}'>{esc(build_name(b))}{' · ' + esc(b['note']) if b['note'] else ''}</option>"
+                       for b in tb)
+        ticks = "".join(f"<label class='tick'><input type='checkbox' name='stn' value='{esc(s['key'])}'>"
+                        f"<span><b>{esc(s['shown_id'])}</b> <span class='mute'>{esc(s['version'] or 'not seen yet')}</span></span></label>"
+                        for s in stations if s["profile"] == ptype)
+        h.append("<p class='hint'>Choose the firmware, tick the stations, press Send. Try one station first.</p>"
+                 f"<form method='post' action='/send' class='stack'><input type='hidden' name='back' value='/?tab=stations&type={ptype}'>"
+                 f"<div><label class='f' for='bsel'>1. Firmware</label><select id='bsel' name='build' required>{opts}</select></div>"
+                 f"<div><label class='f'>2. Stations</label><div class='ticks'>{ticks or '<span class=mute>None yet.</span>'}</div></div>"
+                 "<label class='tick' style='align-self:flex-start'><input type='checkbox' name='all' value='1'>"
+                 f"<span>Every {esc(TYPES[ptype])} station, including ones that check in later</span></label>"
+                 "<div><button>Send update</button></div></form>")
+        wb = by_id.get(targets.get(ptype))
+        if wb:
+            h.append(f"<form method='post' action='/type' class='row' style='margin-top:14px'><input type='hidden' name='profile' value='{ptype}'>"
+                     f"<input type='hidden' name='build' value=''><input type='hidden' name='back' value='/?tab=stations&type={ptype}'>"
+                     f"<span>Whole type: every {esc(TYPES[ptype])} station gets <b>{esc(wb['version'])}</b> (#{wb['id']})</span>"
+                     "<button class='del small'>Stop for the type</button></form>")
+        h.append("</div>")
+    h.append("<details><summary>Add a station that hasn't checked in yet</summary>"
+             "<form method='post' action='/station/add' class='row' style='margin-top:10px'>"
+             f"<input type='hidden' name='back' value='/?tab=stations&type={ptype}'>"
+             "<input name='id' placeholder='Station ID, e.g. 001922' size='18' required pattern='[0-9A-Za-z]{1,12}'>"
+             "<select name='profile'>" + "".join(f"<option value='{p}'{' selected' if p == ptype else ''}>{t}</option>"
+                                                 for p, t in TYPES.items()) +
+             "</select><button class='plain'>Add</button></form></details>")
+
+    script = f"""<script>
+setInterval(function(){{
+  var busy=document.querySelector('input[type=checkbox]:checked')||
+    (document.activeElement&&/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName));
+  if(!busy) location.replace('/?tab=stations&type={ptype}' + {json.dumps('&q=' + search) if search else "''"});
+}},30000);
 </script>"""
-    return "".join(h), script
+    return "".join(h), script, ptype
+
+
+def station_page(key, message=""):
+    with db() as con:
+        s = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
+        if s is None:
+            return None
+        build = target_build(con, s)
+        builds = con.execute("SELECT * FROM builds WHERE profile=? ORDER BY id DESC", (s["profile"],)).fetchall()
+        reports = con.execute("SELECT * FROM health WHERE key=? ORDER BY id DESC LIMIT 60", (key,)).fetchall()
+        events = con.execute("SELECT * FROM events WHERE station=? ORDER BY id DESC LIMIT 100", (s["shown_id"],)).fetchall()
+    hl = health_of(s)
+    cls, label, detail, pct = station_state(s, build)
+    a = attention(s, hl)
+    back = f"/?tab=stations&type={s['profile']}"
+    h = [f"<p style='margin:0 0 12px'><a href='{back}'>← {esc(TYPES.get(s['profile'], '?'))} stations</a></p>"]
+
+    # Summary
+    pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a) or "<span class='pill ok'>No problem reported</span>"
+    h.append(f"<div class='card'><div class='row' style='justify-content:space-between'><h2 style='margin:0;font-size:22px'>"
+             f"{esc(s['shown_id'])} <span class='mute' style='font-size:15px;font-weight:400'>{esc(TYPES.get(s['profile'], '?'))}</span></h2>"
+             f"<div>{pills}</div></div>"
+             f"<div class='kv' style='margin-top:14px'>"
+             f"<div><span>Firmware</span><b>{esc(s['version']) or '—'}</b> <span class='crc'>{esc(s['running_crc'])}</span></div>"
+             f"<div><span>Last check</span>{esc(when(s['last_seen']))}</div>"
+             f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware v6.9.60 on)</span>'}</div>"
+             f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
+
+    # Health
+    h.append("<div class='card'><h2>Health</h2><p class='hint'>From the unit's last daily report.</p><div class='kv'>")
+    for key_, label_, _unit in HEALTH_FIELDS:
+        if key_ in ("sens", "sv") and s["profile"] != 2 and not hl.get(key_):
+            continue        # Sensors and solar: TWS only, unless a TRG sends them
+        h.append(f"<div><span>{esc(label_)}</span><span>{fmt_health(key_, hl.get(key_))}</span></div>")
+    h.append("</div></div>")
+
+    # Update
+    opts = [("type", "Same as its type"), ("hold", "Nothing (updates stopped)")] + [
+        (str(b["id"]), build_name(b)) for b in builds]
+    sel = "".join(f"<option value='{esc(v)}'{' selected' if v == s['target'] else ''}>{esc(t)}</option>" for v, t in opts)
+    bar = f"<div class='bar' style='max-width:260px'><i style='width:{pct}%'></i></div>" if pct is not None else ""
+    h.append(f"<div class='card'><h2>Firmware update</h2><p style='margin:0 0 6px'><span class='pill {cls}'>{esc(label)}</span></p>{bar}"
+             f"{'<p class=hint>' + esc(detail) + '</p>' if detail else ''}"
+             f"<form method='post' action='/station' class='row' style='margin-top:10px'><input type='hidden' name='key' value='{esc(s['key'])}'>"
+             f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='tsel'>Gets</label>"
+             f"<select id='tsel' name='target'>{sel}</select><button>Set</button></form></div>")
+
+    # Health history
+    h.append("<div class='card'><h2>Health history</h2><div class='scroll'><table><tr><th>When</th>" +
+             "".join(f"<th>{esc(HEALTH_SHORT[k])}</th>" for k in HEALTH_HISTORY) + "</tr>")
+    for r in reports:
+        try:
+            d = json.loads(r["data"])
+        except ValueError:
+            d = {}
+        h.append(f"<tr><td class='nw'>{esc(when(r['at']))}</td>" +
+                 "".join(f"<td class='nw'>{fmt_health(k, d.get(k))}</td>" for k in HEALTH_HISTORY) + "</tr>")
+    if not reports:
+        h.append(f"<tr><td colspan='{len(HEALTH_HISTORY) + 1}' class='mute'>No health report yet.</td></tr>")
+    h.append("</table></div></div>")
+
+    # Events
+    h.append("<div class='card'><h2>Events</h2><div class='scroll'><table><tr><th>When</th><th>What happened</th></tr>")
+    for e in events:
+        t = e["text"]
+        c = "badt" if t.startswith("FAILED") else "okt" if t.startswith("UPDATED") else ""
+        h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='{c}'>{esc(t)}</td></tr>")
+    if not events:
+        h.append("<tr><td colspan='2' class='mute'>Nothing yet.</td></tr>")
+    h.append("</table></div></div>")
+    return page(f"Station {s['shown_id']}", "".join(h), "stations", message)
 
 
 def firmware_tab():
@@ -575,15 +806,20 @@ def password_tab():
             "<div><button>Change password</button></div></form></div>")
 
 
-def office_page(tab, message=""):
+def office_page(tab, message="", q=None):
+    q = q or {}
     if tab == "firmware":
         return page("Firmware files", firmware_tab(), tab, message)
     if tab == "history":
         return page("History", history_tab(), tab, message)
     if tab == "password":
         return page("Password", password_tab(), tab, message)
-    body, script = stations_tab()
-    return page("LPC-AIO firmware updates", body, "stations", message, script)
+    try:
+        ptype = int(q.get("type", ""))
+    except ValueError:
+        ptype = -1
+    body, script, _ = stations_tab(ptype, q.get("q", "").strip()[:12])
+    return page("LPC-AIO stations", body, "stations", message, script)
 
 
 def login_page(error=""):
@@ -746,7 +982,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self.session():
             return self.redirect("/login")
         if url.path == "/":
-            return self.send(200, office_page(q.get("tab", "stations"), q.get("m", "")))
+            return self.send(200, office_page(q.get("tab", "stations"), q.get("m", ""), q))
+        if url.path == "/s":
+            body = station_page(q.get("k", ""), q.get("m", ""))
+            if body:
+                return self.send(200, body)
         self.send(404, page("Not found", "<div class='card'>Not found. <a href='/'>Back</a></div>"))
 
     do_HEAD = do_GET
@@ -845,7 +1085,10 @@ class Handler(BaseHTTPRequestHandler):
                         SESSIONS.pop(t, None)
                 message = "Password changed. Use the new one from now on."
         from urllib.parse import quote
-        self.redirect(f"/?tab={tab}" + ("&m=" + quote(message) if message else ""))
+        back = f.get("back", "") if isinstance(f.get("back", ""), str) else ""
+        if not re.fullmatch(r"/(\?tab=stations&type=[0-2]|s\?k=[0-9A-Za-z]{1,12})", back):
+            back = f"/?tab={tab}"
+        self.redirect(back + ("&m=" + quote(message) if message else ""))
 
 
 if __name__ == "__main__":
