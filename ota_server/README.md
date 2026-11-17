@@ -18,14 +18,17 @@ Hostinger server `187.127.175.183`:
 
 The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate and were not changed.
 
-## Use
+## Use (office page, tabs)
 
-1. Upload the firmware file that would go on the SD card (`fw_ksn_trg.hex`, `fw_bihar.hex`, `fw_ksn_tws.hex`).
-   It is refused unless it is a whole main-firmware file with the right image header and CRC.
-2. Choose who gets it: one station ("Gets" in the Stations table), or every station of a type ("Whole type").
-   Try a build on one station first.
-3. The station asks once a day (13:00 to 14:45, by station number), downloads, installs, and reports at its
-   next slot. The Stations table shows the version it runs and the result; "Recent events" keeps the history.
+1. **Firmware files**: upload the file that would go on the SD card (`fw_ksn_trg.hex`, `fw_bihar.hex`,
+   `fw_ksn_tws.hex`). It is refused unless it is a whole main-firmware file with the right image header and CRC.
+   Uploading sends it to nobody.
+2. **Stations > Send an update**: choose the firmware, tick the stations (only stations of that file's type are
+   shown), press Send. "Every station of this type" also covers stations that check in later. Try one station first.
+3. Each station card shows what it runs and its state in plain words: Waiting for next check, Downloading N %,
+   Downloaded, Updated, Up to date, Update failed. **Stop** halts an update for that station; **Resume** undoes it.
+4. A station asks once a day (13:00 to 14:45, by station number), or after every delivered slot with `OTA.NOW`
+   on its card. **History** keeps every check, download, install and office change.
 
 A station that went back to its old firmware is not offered the same build again: upload a new one.
 
@@ -38,7 +41,13 @@ Do not open `ota.db` as root while the service runs (files made by root lock the
 
 ## Change the password
 
-Edit `LPCOTA_PASSWORD` in `/opt/lpc-ota/ota.env`, then `systemctl restart lpc-ota`.
+On the **Password** tab (current password, then the new one twice, at least 8 characters). It is kept hashed in
+`ota.db`; other logged-in browsers are logged out. `LPCOTA_PASSWORD` in `ota.env` is used only while no
+password has been set on the page.
+
+Forgotten password: on the server run
+`sudo -u lpcota sqlite3 /opt/lpc-ota/data/ota.db "DELETE FROM settings WHERE key='admin_pw'"`; the
+`ota.env` password works again (`grep PASSWORD /opt/lpc-ota/ota.env`).
 
 ## Test locally
 

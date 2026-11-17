@@ -5,8 +5,8 @@ Units (port 80, through nginx, paths under /lpc/):
   GET /lpc/check?id=&p=&v=&c=&s=&t=   -> "OTA NONE" or "OTA FW <file bytes> <file crc> <image crc>"
   GET /lpc/fw?id=&c=<file crc>&o=<offset>&n=<bytes>
                                       -> "@<crc32 of the piece>\n" + the piece of the .hex file
-Office (port 5002, login): upload a firmware file, choose which stations get it, see each station's
-version and last result.
+Office (port 5002, login): tabs Stations (send an update, see each station's state), Firmware files
+(upload), History, Password (change the admin password; kept hashed in the database, ota.env is the fallback).
 
 A file is accepted only if it is a complete main-firmware .hex whose image header and CRC are right:
 the same checks the unit makes before it installs anything.
@@ -140,6 +140,7 @@ def init_db():
             unit_status TEXT, tried_crc TEXT, last_seen INTEGER, last_ip TEXT,
             target TEXT DEFAULT 'type', offered_crc TEXT, progress INTEGER DEFAULT 0, result TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, station TEXT, text TEXT);
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
         """)
 
 
@@ -256,30 +257,95 @@ def unit_piece(q):
     return 200, b"@%08X\n" % (zlib.crc32(piece) & 0xFFFFFFFF) + piece
 
 
-# ---------------------------------------------------------------- office pages
+# ---------------------------------------------------------------- office login and password
 
 SESSIONS = {}
 FAILED_LOGINS = {}
+PBKDF2_ROUNDS = 200_000
+
+
+def get_setting(key):
+    with db() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def hash_password(pw):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), PBKDF2_ROUNDS).hex()
+    return f"pbkdf2${PBKDF2_ROUNDS}${salt}${digest}"
+
+
+def password_ok(user, pw):
+    """The password set on the Password tab, or the one in ota.env while none has been set there."""
+    if not hmac.compare_digest(user.encode(), ADMIN_USER.encode()):
+        return False
+    stored = get_setting("admin_pw")
+    if stored:
+        try:
+            _, rounds, salt, digest = stored.split("$")
+            test = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), int(rounds)).hex()
+        except ValueError:
+            return False
+        return hmac.compare_digest(test, digest)
+    return bool(ADMIN_PASSWORD) and hmac.compare_digest(
+        hashlib.sha256(pw.encode()).digest(), hashlib.sha256(ADMIN_PASSWORD.encode()).digest())
+
+
+# ---------------------------------------------------------------- office pages
+
 PAGE_CSS = """
-:root{--bg:#f6f7f9;--card:#fff;--ink:#1c2430;--mute:#667085;--line:#e3e6ea;--acc:#1f6feb;--ok:#18794e;--bad:#b42318}
-@media (prefers-color-scheme: dark){:root{--bg:#12161c;--card:#1a2029;--ink:#e6e9ee;--mute:#98a2b3;--line:#2b3340;--acc:#6ea8fe;--ok:#4ac48a;--bad:#f97066}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-header{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--card)}
-header b{font-size:17px}main{max-width:1100px;margin:0 auto;padding:16px}
-section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
-h2{margin:0 0 4px;font-size:16px}p.h{margin:0 0 12px;color:var(--mute);font-size:13px}
+:root{--bg:#f4f6f8;--card:#fff;--ink:#17202b;--mute:#667085;--line:#e2e6ea;--acc:#1f6feb;--acc-ink:#fff;
+--ok:#16794c;--ok-bg:#e6f4ec;--bad:#b42318;--bad-bg:#fdecea;--wait:#9a5b00;--wait-bg:#fff4e0;--busy:#1f5fc4;--busy-bg:#e8f0fd;--off-bg:#eef0f3}
+@media (prefers-color-scheme: dark){:root{--bg:#10141a;--card:#191f27;--ink:#e6e9ee;--mute:#98a2b3;--line:#2a323d;--acc:#5b9cff;--acc-ink:#0b1220;
+--ok:#4ac48a;--ok-bg:#12301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#232a34}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{background:var(--card);border-bottom:1px solid var(--line)}
+.top{max-width:1000px;margin:0 auto;padding:12px 16px 0;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.top b{font-size:17px}.top a{color:var(--mute);text-decoration:none;font-size:14px}
+nav{max-width:1000px;margin:0 auto;padding:0 16px;display:flex;gap:4px;overflow-x:auto}
+nav a{padding:10px 14px;color:var(--mute);text-decoration:none;border-bottom:3px solid transparent;white-space:nowrap;font-weight:500}
+nav a.on{color:var(--ink);border-bottom-color:var(--acc)}
+main{max-width:1000px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+h2{margin:0 0 4px;font-size:17px}.hint{margin:0 0 14px;color:var(--mute);font-size:14px}
+.msg{padding:12px 16px;border-radius:10px;margin-bottom:16px;background:var(--busy-bg);color:var(--ink);border:1px solid var(--line)}
+.msg.bad{background:var(--bad-bg)}
+input,select,button{font:inherit;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+button{background:var(--acc);color:var(--acc-ink);border-color:var(--acc);cursor:pointer;font-weight:600}
+button.plain{background:transparent;color:var(--ink);border-color:var(--line);font-weight:500}
+button.del{background:transparent;color:var(--bad);border-color:var(--line);font-weight:500}
+button.small{padding:4px 10px;font-size:13px}
+label.f{display:block;font-weight:600;margin:14px 0 6px}label.f:first-child{margin-top:0}
+.stack{display:flex;flex-direction:column;gap:12px}
+.list{display:flex;flex-direction:column;gap:10px}
+.st{display:grid;grid-template-columns:1fr auto;gap:6px 16px;align-items:center;padding:14px;border:1px solid var(--line);border-radius:10px}
+.st .id{font-size:17px;font-weight:700}.st .sub{color:var(--mute);font-size:13px}
+.st .right{text-align:right}
+.pill{display:inline-block;padding:3px 11px;border-radius:999px;font-size:13px;font-weight:600;white-space:nowrap}
+.pill.ok{background:var(--ok-bg);color:var(--ok)}.pill.bad{background:var(--bad-bg);color:var(--bad)}
+.pill.wait{background:var(--wait-bg);color:var(--wait)}.pill.busy{background:var(--busy-bg);color:var(--busy)}
+.pill.off{background:var(--off-bg);color:var(--mute)}
+.bar{height:6px;background:var(--off-bg);border-radius:3px;overflow:hidden;margin-top:6px;min-width:140px}
+.bar i{display:block;height:100%;background:var(--busy)}
+.ticks{display:flex;flex-wrap:wrap;gap:8px}
+.tick{display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;cursor:pointer}
+.tick input{margin:0;width:17px;height:17px}
+.tick.hide{display:none}
 .scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:14px}
-th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
-th{color:var(--mute);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
-td.w{white-space:normal;min-width:220px}code{font:13px ui-monospace,Menlo,Consolas,monospace}
-input,select,button{font:inherit;padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:var(--card);color:var(--ink)}
-button{background:var(--acc);color:#fff;border-color:var(--acc);cursor:pointer}button.q{background:transparent;color:var(--bad);border-color:var(--line)}
-form.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.ok{color:var(--ok)}.bad{color:var(--bad)}.mute{color:var(--mute)}
-.msg{padding:10px 14px;border-radius:8px;margin-bottom:16px;border:1px solid var(--line);background:var(--card)}
-.login{max-width:340px;margin:12vh auto;}.login input{width:100%;margin-bottom:10px}
-a{color:var(--acc)}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mute);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap}
+td.nw{white-space:nowrap}code,.crc{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--mute)}
+a{color:var(--acc)}.mute{color:var(--mute)}.okt{color:var(--ok)}.badt{color:var(--bad)}
+.steps{margin:0 0 14px;padding-left:20px;color:var(--mute);font-size:14px}
+details summary{cursor:pointer;color:var(--acc);font-size:14px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.login{max-width:360px;margin:12vh auto}.login input{width:100%;margin-bottom:10px}.login button{width:100%}
+.pw input{width:100%;max-width:340px}
+@media (max-width:600px){.st{grid-template-columns:1fr}.st .right{text-align:left}}
 """
+
+TABS = [("stations", "Stations"), ("firmware", "Firmware files"), ("history", "History"), ("password", "Password")]
 
 
 def esc(v):
@@ -288,105 +354,245 @@ def esc(v):
 
 def when(ts):
     if not ts:
-        return ""
+        return "never"
     age = int(time.time()) - ts
     text = time.strftime("%d %b %H:%M", time.localtime(ts))
+    if age < 60:
+        return f"{text} (just now)"
     if age < 3600:
         return f"{text} ({age // 60} min ago)"
     if age < 172800:
         return f"{text} ({age // 3600} h ago)"
-    return f"{text} ({age // 86400} d ago)"
+    return f"{text} ({age // 86400} days ago)"
 
 
-def page(title, body, logged_in=True):
-    out = "<a href='/logout'>Log out</a>" if logged_in else ""
-    return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+def page(title, body, tab=None, message="", script=""):
+    head = (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title>"
-            f"<style>{PAGE_CSS}</style></head><body><header><b>LPC-AIO firmware updates</b>{out}</header>"
-            f"<main>{body}</main></body></html>").encode()
+            f"<style>{PAGE_CSS}</style></head><body>")
+    if tab is None:
+        return (head + f"<main>{body}</main></body></html>").encode()
+    nav = "".join(f"<a href='/?tab={k}' class='{'on' if k == tab else ''}'>{t}</a>" for k, t in TABS)
+    msg = ""
+    if message:
+        cls = "msg bad" if message.lower().startswith(("file refused", "wrong", "not ", "no ", "the new", "build #")) and "deleted" not in message else "msg"
+        msg = f"<div class='{cls}'>{esc(message)}</div>"
+    return (head + f"<header><div class='top'><b>LPC-AIO firmware updates</b><a href='/logout'>Log out</a></div>"
+            f"<nav>{nav}</nav></header><main>{msg}{body}</main>{script}</body></html>").encode()
 
 
-def build_label(b):
-    note = f" · {b['note']}" if b["note"] else ""
-    return f"#{b['id']} {TYPES.get(b['profile'], '?')} {b['version']} ({b['image_crc']}){note}"
+def build_name(b):
+    return f"{b['version']} · {TYPES.get(b['profile'], '?')} (#{b['id']})"
 
 
-def dashboard(message=""):
+def station_state(s, build):
+    """(pill class, pill text, detail line, download percent or None) in plain words."""
+    res = s["result"] or ""
+    us = s["unit_status"]
+    if res.startswith("FAILED"):
+        return "bad", "Update failed", "The new firmware did not run, so the unit went back to its old one. Upload a new build to try again.", None
+    if res.startswith("target is for another"):
+        return "bad", "Wrong type", "The chosen firmware is for a different station type. Choose another.", None
+    if us == "4":
+        return "bad", "File refused", "The unit refused the downloaded file. It will try again at its next check.", None
+    if us == "5":
+        return "bad", "No SD card", "The unit has no working SD card, so it can't update.", None
+    if s["target"] == "hold":
+        return "off", "Updates stopped", "This station won't update until you resume it.", None
+    if build is None:
+        return "off", "No update set", "", None
+    if res.startswith("updated"):
+        return "ok", f"Updated to {build['version']}", "", None
+    if res == "running the target":
+        return "ok", "Up to date", "", None
+    if res.startswith("downloading"):
+        pct = s["progress"] * 100 // build["size"] if build["size"] else 0
+        pct = max(0, min(100, pct))
+        if pct >= 100:
+            return "busy", "Downloaded", "Installs when this slot ends, then reports the new version at its next check.", 100
+        return "busy", f"Downloading {pct}%", "", pct
+    if us == "2":
+        return "busy", "Installing", "", None
+    if res.startswith("offered"):
+        return "busy", "Starting download", "", None
+    return "wait", "Waiting for next check", f"It will get {build['version']} at its next check.", None
+
+
+def stations_tab():
     with db() as con:
         builds = con.execute("SELECT * FROM builds ORDER BY id DESC").fetchall()
         targets = {r["profile"]: r["build_id"] for r in con.execute("SELECT * FROM type_targets")}
         stations = con.execute("SELECT * FROM stations ORDER BY CAST(key AS INTEGER), key").fetchall()
-        events = con.execute("SELECT * FROM events ORDER BY id DESC LIMIT 60").fetchall()
+        st_builds = {s["key"]: target_build(con, s) for s in stations}
+    by_id = {b["id"]: b for b in builds}
     by_crc = {b["image_crc"]: b for b in builds}
     h = []
-    if message:
-        h.append(f"<div class='msg'>{esc(message)}</div>")
 
-    h.append("<section><h2>Stations</h2><p class='h'>A station appears here after its first daily check. "
-             "\"Follow its type\" gives it whatever is set for the whole type below.</p><div class='scroll'><table>"
-             "<tr><th>Station</th><th>Type</th><th>Running</th><th>Last check</th><th>Unit says</th>"
-             "<th>Gets</th><th>Result</th></tr>")
-    for s in stations:
-        running = by_crc.get(s["running_crc"])
-        run_text = f"{esc(s['version'])} <code>{esc(s['running_crc'])}</code>" + (f" · build #{running['id']}" if running else "")
-        opts = [("type", "Follow its type"), ("hold", "Nothing (hold)")] + [
-            (str(b["id"]), build_label(b)) for b in builds if b["profile"] == s["profile"]]
-        sel = "".join(f"<option value='{esc(v)}'{' selected' if v == s['target'] else ''}>{esc(t)}</option>" for v, t in opts)
-        res = esc(s["result"])
-        cls = "bad" if res.startswith("FAILED") else "ok" if "running the target" in res else ""
-        h.append(f"<tr><td><b>{esc(s['shown_id'])}</b></td><td>{esc(TYPES.get(s['profile'], '?'))}</td><td>{run_text}</td>"
-                 f"<td>{esc(when(s['last_seen']))}</td><td>{esc(UNIT_STATUS.get(s['unit_status'], s['unit_status']))}</td>"
-                 f"<td><form class='row' method='post' action='/station'><input type='hidden' name='key' value='{esc(s['key'])}'>"
-                 f"<select name='target'>{sel}</select><button>Set</button></form></td><td class='w {cls}'>{res}</td></tr>")
-    if not stations:
-        h.append("<tr><td colspan='7' class='mute'>No station has checked in yet.</td></tr>")
-    h.append("</table></div><form class='row' method='post' action='/station/add' style='margin-top:12px'>"
-             "<input name='id' placeholder='Station ID' size='12' required pattern='[0-9A-Za-z]{1,12}'>"
-             "<select name='profile'>" + "".join(f"<option value='{p}'>{t}</option>" for p, t in TYPES.items()) +
-             "</select><button>Add a station before it checks in</button></form></section>")
-
-    h.append("<section><h2>Whole type</h2><p class='h'>Every station of the type that follows its type gets this build. "
-             "Try a build on one station first.</p><div class='scroll'><table><tr><th>Type</th><th>Build for all its stations</th></tr>")
-    for p, tname in TYPES.items():
-        opts = "<option value=''>None</option>" + "".join(
-            f"<option value='{b['id']}'{' selected' if targets.get(p) == b['id'] else ''}>{esc(build_label(b))}</option>"
-            for b in builds if b["profile"] == p)
-        h.append(f"<tr><td>{tname}</td><td><form class='row' method='post' action='/type'>"
-                 f"<input type='hidden' name='profile' value='{p}'><select name='build'>{opts}</select>"
-                 f"<button>Set</button></form></td></tr>")
-    h.append("</table></div></section>")
-
-    h.append("<section><h2>Firmware files</h2><p class='h'>Upload the same file that goes on the SD card "
-             "(fw_ksn_trg.hex, fw_bihar.hex or fw_ksn_tws.hex). The type and version are read from the file.</p>"
-             "<form class='row' method='post' action='/upload' enctype='multipart/form-data'>"
-             "<input type='file' name='file' accept='.hex' required><input name='note' placeholder='Note, e.g. build 22' size='24' maxlength='60'>"
-             "<button>Upload</button></form><div class='scroll' style='margin-top:12px'><table>"
-             "<tr><th>Build</th><th>Type</th><th>Version</th><th>Image CRC</th><th>File</th><th>Uploaded</th><th>Note</th><th></th></tr>")
-    for b in builds:
-        h.append(f"<tr><td>#{b['id']}</td><td>{esc(TYPES.get(b['profile'], '?'))}</td><td>{esc(b['version'])}</td>"
-                 f"<td><code>{esc(b['image_crc'])}</code></td><td>{b['size'] // 1024} KB</td><td>{esc(when(b['uploaded_at']))}</td>"
-                 f"<td>{esc(b['note'])}</td><td><form method='post' action='/build/delete' "
-                 f"onsubmit=\"return confirm('Delete build #{b['id']}?')\"><input type='hidden' name='id' value='{b['id']}'>"
-                 f"<button class='q'>Delete</button></form></td></tr>")
+    # 1. Send an update
+    h.append("<div class='card'><h2>Send an update</h2>")
     if not builds:
-        h.append("<tr><td colspan='8' class='mute'>No firmware uploaded yet.</td></tr>")
-    h.append("</table></div></section>")
+        h.append("<p class='hint'>First upload a firmware file on the <a href='/?tab=firmware'>Firmware files</a> tab.</p></div>")
+    else:
+        opts = "".join(f"<option value='{b['id']}' data-p='{b['profile']}'>{esc(build_name(b))}"
+                       f"{' · ' + esc(b['note']) if b['note'] else ''}</option>" for b in builds)
+        ticks = "".join(
+            f"<label class='tick' data-p='{s['profile']}'><input type='checkbox' name='stn' value='{esc(s['key'])}'>"
+            f"<span><b>{esc(s['shown_id'])}</b> <span class='mute'>{esc(s['version'] or 'not seen yet')}</span></span></label>"
+            for s in stations)
+        h.append("<p class='hint'>Choose the firmware, tick the stations, press Send. Try one station first.</p>"
+                 "<form method='post' action='/send' class='stack'>"
+                 f"<div><label class='f' for='bsel'>1. Firmware</label><select id='bsel' name='build' required>{opts}</select></div>"
+                 "<div><label class='f'>2. Stations</label>"
+                 f"<div class='ticks' id='ticks'>{ticks}</div>"
+                 "<p class='hint' id='noone' style='display:none;margin-top:8px'>No station of this type has checked in yet.</p></div>"
+                 "<label class='tick' style='align-self:flex-start'><input type='checkbox' name='all' value='1'>"
+                 "<span>Every station of this type, including ones that check in later</span></label>"
+                 "<div><button>Send update</button></div></form>")
+        h.append("</div>")
 
-    h.append("<section><h2>Recent events</h2><div class='scroll'><table><tr><th>When</th><th>Station</th><th>What</th></tr>")
+    # 2. Station list
+    h.append("<div class='card'><h2>Stations</h2><p class='hint'>Updates every 30 seconds. A station appears after its "
+             "first check (once a day, or every slot with OTA.NOW on its card).</p><div class='list'>")
+    for s in stations:
+        build = st_builds[s["key"]]
+        cls, label, detail, pct = station_state(s, build)
+        running = by_crc.get(s["running_crc"])
+        run = esc(s["version"]) or "<span class='mute'>not seen yet</span>"
+        bar = f"<div class='bar'><i style='width:{pct}%'></i></div>" if pct is not None else ""
+        target_line = ""
+        if build is not None and s["target"] != "hold":
+            how = "for the whole type" if s["target"] == "type" else "for this station"
+            target_line = f"<div class='sub'>Set to get {esc(build['version'])} (#{build['id']}) {how}</div>"
+        action = ""
+        if s["target"] == "hold":
+            action = (f"<form method='post' action='/station'><input type='hidden' name='key' value='{esc(s['key'])}'>"
+                      f"<input type='hidden' name='target' value='type'><button class='plain small'>Resume updates</button></form>")
+        elif build is not None and not label.startswith(("Up to date", "Updated")):
+            action = (f"<form method='post' action='/station'><input type='hidden' name='key' value='{esc(s['key'])}'>"
+                      f"<input type='hidden' name='target' value='hold'><button class='del small'>Stop</button></form>")
+        h.append(f"<div class='st'><div><div class='id'>{esc(s['shown_id'])} "
+                 f"<span class='sub' style='font-weight:400'>{esc(TYPES.get(s['profile'], '?'))}</span></div>"
+                 f"<div>Running <b>{run}</b>{' (#' + str(running['id']) + ')' if running else ''} "
+                 f"<span class='crc'>{esc(s['running_crc'])}</span></div>"
+                 f"<div class='sub'>Last check: {esc(when(s['last_seen']))}</div>{target_line}</div>"
+                 f"<div class='right'><span class='pill {cls}'>{esc(label)}</span>{bar}"
+                 f"{'<div class=sub style=max-width:300px;margin-top:4px>' + esc(detail) + '</div>' if detail else ''}"
+                 f"<div style='margin-top:6px'>{action}</div></div></div>")
+    if not stations:
+        h.append("<p class='mute'>No station has checked in yet.</p>")
+    h.append("</div>")
+    whole = [(p, by_id.get(b)) for p, b in targets.items() if b and by_id.get(b)]
+    if whole:
+        h.append("<p class='hint' style='margin-top:14px'><b>Whole-type updates:</b></p><div class='stack'>")
+        for p, b in whole:
+            h.append(f"<form method='post' action='/type' class='row'><input type='hidden' name='profile' value='{p}'>"
+                     f"<input type='hidden' name='build' value=''><span>Every {esc(TYPES[p])} station gets "
+                     f"<b>{esc(b['version'])}</b> (#{b['id']})</span><button class='del small'>Stop for the type</button></form>")
+        h.append("</div>")
+    h.append("<details style='margin-top:14px'><summary>Add a station that hasn't checked in yet</summary>"
+             "<form method='post' action='/station/add' class='row' style='margin-top:10px'>"
+             "<input name='id' placeholder='Station ID, e.g. 001922' size='18' required pattern='[0-9A-Za-z]{1,12}'>"
+             "<select name='profile'>" + "".join(f"<option value='{p}'>{t}</option>" for p, t in TYPES.items()) +
+             "</select><button class='plain'>Add</button></form></details></div>")
+
+    script = """<script>
+(function(){
+  var sel=document.getElementById('bsel');
+  function filt(){ if(!sel) return; var p=sel.options[sel.selectedIndex].getAttribute('data-p'), n=0;
+    document.querySelectorAll('#ticks .tick').forEach(function(t){ var on=t.getAttribute('data-p')===p;
+      t.classList.toggle('hide',!on); if(!on) t.querySelector('input').checked=false; else n++; });
+    document.getElementById('noone').style.display=n?'none':'block'; }
+  if(sel){ sel.addEventListener('change',filt); filt(); }
+  setInterval(function(){
+    var busy=document.querySelector('input[type=checkbox]:checked')||
+      (document.activeElement&&/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName));
+    if(!busy) location.replace('/?tab=stations');
+  },30000);
+})();
+</script>"""
+    return "".join(h), script
+
+
+def firmware_tab():
+    with db() as con:
+        builds = con.execute("SELECT * FROM builds ORDER BY id DESC").fetchall()
+        targets = {r["build_id"] for r in con.execute("SELECT build_id FROM type_targets WHERE build_id IS NOT NULL")}
+        used_by = {}
+        for s in con.execute("SELECT shown_id, target FROM stations WHERE target NOT IN ('type','hold')"):
+            used_by.setdefault(int(s["target"]), []).append(s["shown_id"])
+    h = ["<div class='card'><h2>Upload firmware</h2>"
+         "<ol class='steps'><li>Use the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
+         "<code>fw_bihar.hex</code> or <code>fw_ksn_tws.hex</code>.</li>"
+         "<li>The station type and version are read from the file. A damaged or wrong file is refused.</li>"
+         "<li>Uploading sends it to nobody. Choose stations on the <a href='/?tab=stations'>Stations</a> tab.</li></ol>"
+         "<form method='post' action='/upload' enctype='multipart/form-data' class='stack'>"
+         "<div><label class='f'>File</label><input type='file' name='file' accept='.hex' required></div>"
+         "<div><label class='f'>Note (optional)</label><input name='note' placeholder='e.g. SMS fix, for test team' size='34' maxlength='60'></div>"
+         "<div><button>Upload</button></div></form></div>"]
+    h.append("<div class='card'><h2>Uploaded firmware</h2><div class='scroll'><table>"
+             "<tr><th>Version</th><th>Type</th><th>Uploaded</th><th>Note</th><th>Set for</th><th></th></tr>")
+    for b in builds:
+        users = []
+        if b["id"] in targets:
+            users.append(f"all {TYPES.get(b['profile'], '?')}")
+        users += used_by.get(b["id"], [])
+        h.append(f"<tr><td class='nw'><b>{esc(b['version'])}</b> <span class='mute'>#{b['id']}</span><br>"
+                 f"<span class='crc'>CRC {esc(b['image_crc'])} · {b['size'] // 1024} KB</span></td>"
+                 f"<td class='nw'>{esc(TYPES.get(b['profile'], '?'))}</td><td>{esc(when(b['uploaded_at']))}</td>"
+                 f"<td>{esc(b['note'])}</td><td>{esc(', '.join(users)) or '<span class=mute>nobody</span>'}</td>"
+                 f"<td><form method='post' action='/build/delete' onsubmit=\"return confirm('Delete {esc(b['version'])} (#{b['id']})?')\">"
+                 f"<input type='hidden' name='id' value='{b['id']}'><button class='del small'>Delete</button></form></td></tr>")
+    if not builds:
+        h.append("<tr><td colspan='6' class='mute'>No firmware uploaded yet.</td></tr>")
+    h.append("</table></div></div>")
+    return "".join(h)
+
+
+def history_tab():
+    with db() as con:
+        events = con.execute("SELECT * FROM events ORDER BY id DESC LIMIT 300").fetchall()
+    h = ["<div class='card'><h2>History</h2><p class='hint'>The newest first.</p><div class='scroll'><table>"
+         "<tr><th>When</th><th>Station</th><th>What happened</th></tr>"]
     for e in events:
-        h.append(f"<tr><td>{esc(when(e['at']))}</td><td>{esc(e['station'])}</td><td class='w'>{esc(e['text'])}</td></tr>")
+        t = e["text"]
+        cls = "badt" if t.startswith("FAILED") else "okt" if t.startswith("UPDATED") else ""
+        h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='nw'>{esc(e['station']) or '<span class=mute>office</span>'}</td>"
+                 f"<td class='{cls}'>{esc(t)}</td></tr>")
     if not events:
         h.append("<tr><td colspan='3' class='mute'>Nothing yet.</td></tr>")
-    h.append("</table></div></section>")
-    return page("LPC-AIO firmware updates", "".join(h))
+    h.append("</table></div></div>")
+    return "".join(h)
+
+
+def password_tab():
+    return ("<div class='card pw'><h2>Change the password</h2>"
+            f"<p class='hint'>The user name stays <b>{esc(ADMIN_USER)}</b>. At least 8 characters. "
+            "Everyone else logged in is logged out.</p>"
+            "<form method='post' action='/password' class='stack'>"
+            "<div><label class='f'>Current password</label><input type='password' name='current' autocomplete='current-password' required></div>"
+            "<div><label class='f'>New password</label><input type='password' name='new' autocomplete='new-password' minlength='8' required></div>"
+            "<div><label class='f'>New password again</label><input type='password' name='new2' autocomplete='new-password' minlength='8' required></div>"
+            "<div><button>Change password</button></div></form></div>")
+
+
+def office_page(tab, message=""):
+    if tab == "firmware":
+        return page("Firmware files", firmware_tab(), tab, message)
+    if tab == "history":
+        return page("History", history_tab(), tab, message)
+    if tab == "password":
+        return page("Password", password_tab(), tab, message)
+    body, script = stations_tab()
+    return page("LPC-AIO firmware updates", body, "stations", message, script)
 
 
 def login_page(error=""):
-    err = f"<p class='bad'>{esc(error)}</p>" if error else ""
-    return page("Log in", f"<section class='login'><h2>Log in</h2>{err}<form method='post' action='/login'>"
+    err = f"<p class='badt'>{esc(error)}</p>" if error else ""
+    return page("Log in", f"<div class='card login'><h2>LPC-AIO firmware updates</h2><p class='hint'>Log in</p>{err}"
+                "<form method='post' action='/login'>"
                 "<input name='user' placeholder='User' autocomplete='username' required>"
                 "<input name='password' type='password' placeholder='Password' autocomplete='current-password' required>"
-                "<button>Log in</button></form></section>", logged_in=False)
+                "<button>Log in</button></form></div>")
 
 
 def parse_multipart(ctype, body):
@@ -420,7 +626,7 @@ def do_upload(parts):
     with _db_lock, db() as con:
         same = con.execute("SELECT id FROM builds WHERE file_crc=? OR image_crc=?", (file_crc, image_crc)).fetchone()
         if same:
-            return f"This firmware is already here as build #{same['id']}."
+            return f"Build #{same['id']} is this same firmware: nothing uploaded."
         cur = con.execute("INSERT INTO builds (profile, version, image_crc, file_crc, size, note, uploaded_at)"
                           " VALUES (?,?,?,?,?,?,?)", (profile, version, image_crc, file_crc, len(data), note, int(time.time())))
         build_id = cur.lastrowid
@@ -429,7 +635,47 @@ def do_upload(parts):
             f.write(data)
         os.replace(tmp, os.path.join(BUILDS_DIR, f"{build_id}.hex"))
         add_event(con, "", f"build #{build_id} uploaded: {TYPES[profile]} {version} ({image_crc}) {note}")
-    return f"Uploaded as build #{build_id}: {TYPES[profile]} {version}, image CRC {image_crc}. No station gets it until you choose one."
+    return (f"Uploaded {version} for {TYPES[profile]} as #{build_id}. "
+            "Nobody gets it yet: send it from the Stations tab.")
+
+
+def do_send(f, stn_keys):
+    if not f.get("build", "").isdigit():
+        return "No firmware chosen."
+    build_id = int(f["build"])
+    all_type = f.get("all") == "1"
+    with _db_lock, db() as con:
+        b = con.execute("SELECT * FROM builds WHERE id=?", (build_id,)).fetchone()
+        if b is None:
+            return "No such firmware."
+        sent, skipped = [], []
+        for key in stn_keys:
+            st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
+            if st is None:
+                continue
+            if st["profile"] != b["profile"]:
+                skipped.append(st["shown_id"])
+                continue
+            con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL WHERE key=?", (str(build_id), key))
+            add_event(con, st["shown_id"], f"office set: gets build #{build_id} {b['version']}")
+            sent.append(st["shown_id"])
+        if all_type:
+            con.execute("INSERT INTO type_targets (profile, build_id) VALUES (?,?) "
+                        "ON CONFLICT(profile) DO UPDATE SET build_id=excluded.build_id", (b["profile"], build_id))
+            for st in con.execute("SELECT * FROM stations WHERE profile=? AND target IN ('type','hold')", (b["profile"],)).fetchall():
+                con.execute("UPDATE stations SET target='type', result='', offered_crc=NULL WHERE key=?", (st["key"],))
+            add_event(con, "", f"office set: all {TYPES[b['profile']]} stations get build #{build_id} {b['version']}")
+    if not sent and not all_type:
+        return "Not sent: tick at least one station of this type." + (f" Skipped (other type): {', '.join(skipped)}." if skipped else "")
+    parts = []
+    if sent:
+        parts.append(f"{b['version']} set for {', '.join(sent)}")
+    if all_type:
+        parts.append(f"{b['version']} set for every {TYPES[b['profile']]} station")
+    msg = ". ".join(parts) + ". Each station takes it at its next check."
+    if skipped:
+        msg += f" Skipped (other type): {', '.join(skipped)}."
+    return msg
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -451,6 +697,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if ctype.startswith("text/html"):
+            self.send_header("Cache-Control", "no-store")
         for k, v in headers:
             self.send_header(k, v)
         self.end_headers()
@@ -460,22 +708,23 @@ class Handler(BaseHTTPRequestHandler):
     def redirect(self, where, headers=()):
         self.send(303, b"", headers=(("Location", where),) + tuple(headers))
 
-    def logged_in(self):
+    def session(self):
         m = re.search(r"(?:^|;\s*)lpcota=([0-9a-f]{48})", self.headers.get("Cookie", ""))
-        if not m:
-            return False
-        expires = SESSIONS.get(m.group(1), 0)
-        return expires > time.time()
+        if m and SESSIONS.get(m.group(1), 0) > time.time():
+            return m.group(1)
+        return None
 
     def form(self):
+        """Returns (first value of each field, all values of each field), or (None, None) if too large."""
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length > MAX_UPLOAD:
-            return None
+            return None, None
         body = self.rfile.read(length)
         ctype = self.headers.get("Content-Type", "")
         if ctype.startswith("multipart/form-data"):
-            return parse_multipart(ctype, body)
-        return {k: v[0] for k, v in parse_qs(body.decode("utf-8", "replace")).items()}
+            return parse_multipart(ctype, body), {}
+        lists = parse_qs(body.decode("utf-8", "replace"))
+        return {k: v[0] for k, v in lists.items()}, lists
 
     def do_GET(self):
         url = urlparse(self.path)
@@ -490,12 +739,15 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/login":
             return self.send(200, login_page())
         if url.path == "/logout":
+            tok = self.session()
+            if tok:
+                SESSIONS.pop(tok, None)
             return self.redirect("/login", (("Set-Cookie", "lpcota=; Path=/; Max-Age=0"),))
-        if not self.logged_in():
+        if not self.session():
             return self.redirect("/login")
         if url.path == "/":
-            return self.send(200, dashboard(q.get("m", "")))
-        self.send(404, page("Not found", "<section>Not found. <a href='/'>Back</a></section>"))
+            return self.send(200, office_page(q.get("tab", "stations"), q.get("m", "")))
+        self.send(404, page("Not found", "<div class='card'>Not found. <a href='/'>Back</a></div>"))
 
     do_HEAD = do_GET
 
@@ -503,18 +755,15 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path.startswith("/lpc/"):
             return self.send(404, b"OTA BAD\n", "text/plain")
-        f = self.form()
+        f, lists = self.form()
         if f is None:
-            return self.send(413, page("Too large", "<section>File too large. <a href='/'>Back</a></section>"))
+            return self.send(413, page("Too large", "<div class='card'>File too large. <a href='/'>Back</a></div>"))
         if url.path == "/login":
             ip = self.client_ip()
             count, since = FAILED_LOGINS.get(ip, (0, 0))
             if count >= 8 and time.time() - since < 900:
                 return self.send(429, login_page("Too many wrong tries. Wait 15 minutes."))
-            ok = bool(ADMIN_PASSWORD) and hmac.compare_digest(
-                hashlib.sha256(f"{f.get('user', '')}\0{f.get('password', '')}".encode()).digest(),
-                hashlib.sha256(f"{ADMIN_USER}\0{ADMIN_PASSWORD}".encode()).digest())
-            if not ok:
+            if not password_ok(f.get("user", ""), f.get("password", "")):
                 FAILED_LOGINS[ip] = (count + 1 if time.time() - since < 900 else 1, time.time())
                 time.sleep(1)
                 return self.send(401, login_page("Wrong user or password."))
@@ -522,22 +771,25 @@ class Handler(BaseHTTPRequestHandler):
             token = secrets.token_hex(24)
             SESSIONS[token] = time.time() + 12 * 3600
             return self.redirect("/", (("Set-Cookie", f"lpcota={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200"),))
-        if not self.logged_in():
+        token = self.session()
+        if not token:
             return self.redirect("/login")
-        message = ""
+        message, tab = "", "stations"
         if url.path == "/upload":
-            message = do_upload({k: (v if isinstance(v, bytes) else v.encode()) for k, v in f.items()})
+            message, tab = do_upload({k: (v if isinstance(v, bytes) else v.encode()) for k, v in f.items()}), "firmware"
+        elif url.path == "/send":
+            message = do_send(f, lists.get("stn", []))
         elif url.path == "/station":
             target = f.get("target", "type")
-            if isinstance(target, bytes):
-                target = target.decode()
             if target in ("type", "hold") or target.isdigit():
                 with _db_lock, db() as con:
                     st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
                     if st:
                         con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL WHERE key=?", (target, st["key"]))
-                        add_event(con, st["shown_id"], f"office set: gets {'its type build' if target == 'type' else 'nothing (hold)' if target == 'hold' else 'build #' + target}")
-                        message = f"Station {st['shown_id']} set. It acts on this at its next check."
+                        add_event(con, st["shown_id"], f"office set: {'updates resumed (follows its type)' if target == 'type' else 'updates stopped' if target == 'hold' else 'gets build #' + target}")
+                        message = (f"Updates stopped for {st['shown_id']}." if target == "hold" else
+                                   f"Updates resumed for {st['shown_id']}." if target == "type" else
+                                   f"Station {st['shown_id']} set. It acts on this at its next check.")
         elif url.path == "/station/add":
             stn = f.get("id", "")
             if re.fullmatch(r"[0-9A-Za-z]{1,12}", stn) and f.get("profile", "") in ("0", "1", "2"):
@@ -554,15 +806,17 @@ class Handler(BaseHTTPRequestHandler):
                                 "ON CONFLICT(profile) DO UPDATE SET build_id=excluded.build_id", (int(f["profile"]), build))
                     add_event(con, "", f"office set: all {TYPES[int(f['profile'])]} stations get "
                                        f"{'build #' + str(build) if build else 'nothing'}")
-                    message = f"{TYPES[int(f['profile'])]} set."
+                    message = (f"Every {TYPES[int(f['profile'])]} station set to get build #{build}." if build else
+                               f"Whole-type update stopped for {TYPES[int(f['profile'])]}.")
         elif url.path == "/build/delete":
+            tab = "firmware"
             if f.get("id", "").isdigit():
                 build_id = int(f["id"])
                 with _db_lock, db() as con:
                     used = con.execute("SELECT 1 FROM type_targets WHERE build_id=? UNION SELECT 1 FROM stations WHERE target=?",
                                        (build_id, str(build_id))).fetchone()
                     if used:
-                        message = f"Build #{build_id} is still set for a station or a type: change that first."
+                        message = f"Build #{build_id} is still set for a station or a type: stop that first on the Stations tab."
                     else:
                         con.execute("DELETE FROM builds WHERE id=?", (build_id,))
                         try:
@@ -571,14 +825,33 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                         add_event(con, "", f"build #{build_id} deleted")
                         message = f"Build #{build_id} deleted."
+        elif url.path == "/password":
+            tab = "password"
+            new = f.get("new", "")
+            if not password_ok(ADMIN_USER, f.get("current", "")):
+                time.sleep(1)
+                message = "Wrong current password: not changed."
+            elif len(new) < 8:
+                message = "The new password must be at least 8 characters: not changed."
+            elif new != f.get("new2", ""):
+                message = "The new password was not the same both times: not changed."
+            else:
+                with _db_lock, db() as con:
+                    con.execute("INSERT INTO settings (key, value) VALUES ('admin_pw', ?) "
+                                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (hash_password(new),))
+                    add_event(con, "", "office password changed")
+                for t in list(SESSIONS):
+                    if t != token:
+                        SESSIONS.pop(t, None)
+                message = "Password changed. Use the new one from now on."
         from urllib.parse import quote
-        self.redirect("/?m=" + quote(message) if message else "/")
+        self.redirect(f"/?tab={tab}" + ("&m=" + quote(message) if message else ""))
 
 
 if __name__ == "__main__":
     init_db()
-    if not ADMIN_PASSWORD:
-        print("LPCOTA_PASSWORD is not set: nobody can log in to the office page")
+    if not ADMIN_PASSWORD and not get_setting("admin_pw"):
+        print("No password set (LPCOTA_PASSWORD in ota.env): nobody can log in to the office page")
     server = ThreadingHTTPServer((BIND, PORT), Handler)
     server.daemon_threads = True
     server.block_on_close = False
