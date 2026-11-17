@@ -40,6 +40,14 @@ bool sim7600_post_rejected(void);
 /* One send by one route: 0 the server's name, 1 its IP, 2 the modem's HTTP commands */
 bool sim7600_http_post_once(const http_endpoint_t *endpoint, const char *payload, int route);
 const char *sim7600_route_name(int route);
+/* Did that send get any HTTP answer at all (a refusal or a 404 too)? */
+bool sim7600_post_answered(void);
+
+/* One HTTP GET to our own server (firmware over the air). The socket stays open for the next call.
+ * Returns the reply's body (text ending in 0, valid until the next modem call) and its length, or
+ * NULL when no complete reply came. *status is the HTTP status when the server answered. */
+const char *sim7600_http_get(const char *host, uint16_t port, const char *path, int *len, int *status);
+void sim7600_http_get_close(void);
 
 /* Asks the modem whether it's still on the network */
 bool sim7600_still_registered(void);

@@ -35,6 +35,11 @@
 
 /* TEMPORARY test-station tool: MENU > TEST SEND posts dummy records. */
 #define ENABLE_TEST_SEND    0
+/* Bench only (2026-11-17, before OTA): after each slot's record, one small request to each of our own
+ * servers, logged under [REACH], to see whether a SIM may reach them. 0 in every release. */
+#ifndef OTA_REACH_TEST
+#define OTA_REACH_TEST      0
+#endif
 #if PRODUCTION_BUILD && ENABLE_TEST_SEND
 #error "TEST SEND is a bench tool: not in a production build"
 #endif
@@ -174,6 +179,22 @@
 #define FW_CTRL_FILENAME        "ctrl.hex"
 #define FW_HISTORY_FILENAME     "UPDATE.TXT"
 #define DEBUG_TRIGGER_FILENAME  "DEBUG.TXT"
+
+/* Firmware over the air (ota.c). 1 = on. The server is ours (user, 2026-11-17: the address itself, no
+ * name yet); a card file OTASRV.DAT holding "host port" replaces it without a new build. */
+#ifndef ENABLE_OTA
+#define ENABLE_OTA              1
+#endif
+#define OTA_SERVER_HOST         "187.127.175.183"
+#define OTA_SERVER_PORT         80
+#define OTA_SERVER_FILENAME     "OTASRV.DAT"
+#define OTA_FILE_FILENAME       "OTA.TMP"     /* The firmware file as it comes in */
+#define OTA_STATE_FILENAME      "OTA.DAT"
+#define OTA_NOW_FILENAME        "OTA.NOW"     /* On the card (any content, or empty): check at every slot (bench) */
+/* The daily check: 13:00 + 15 min x (station number mod 8), so 13:00 to 14:45. By day, when the battery
+ * is charged, clear of the SMS hours, and spread so a fleet doesn't ask at once. */
+#define OTA_DAILY_FIRST_SLOT    52
+#define OTA_DAILY_SPREAD_SLOTS  8
 
 /* Timing & Safety Watchdog Limits (in milliseconds) */
 #define WDT_PERIODIC_LIMIT_MS   (11 * 60 * 1000)  /* 11-min hard power cutoff */

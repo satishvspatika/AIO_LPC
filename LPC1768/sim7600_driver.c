@@ -1772,6 +1772,7 @@ static void collect_http_reply(char *buf, size_t size)
  * as delivered, but it waits for the next slot rather than going straight out again. */
 static bool s_post_unanswered = false;
 static bool s_post_rejected = false;
+static bool s_post_answered = false;   /* The last single send got any HTTP answer, whatever it said */
 
 bool sim7600_post_rejected(void)
 {
@@ -2155,7 +2156,140 @@ bool sim7600_http_post_once(const http_endpoint_t *endpoint, const char *payload
     bool got_reply = false;
     s_post_unanswered = false;
     s_post_rejected = false;
-    return post_by_route(endpoint, payload, route, NULL, 0, &got_reply);
+    bool ok = post_by_route(endpoint, payload, route, NULL, 0, &got_reply);
+    s_post_answered = got_reply;
+    return ok;
+}
+
+bool sim7600_post_answered(void)
+{
+    return s_post_answered;
+}
+
+/* ---- GET from our own server (firmware over the air) ----
+ * Socket 0 stays open between calls, so a file comes in many small pieces without a new connection
+ * for each. The receive mode is left as the data posts use it. The reply is put together in
+ * s_rx_temp from the modem's "+IPD<n>" blocks; only text is expected (a .hex file, short answers). */
+static bool s_get_open = false;
+
+void sim7600_http_get_close(void)
+{
+    if (s_get_open) {
+        s_get_open = false;
+        clear_rx();
+        close_socket_quiet(1000);
+    }
+}
+
+/* Takes the reply off the UART. Returns the HTTP bytes collected (headers and body), 0 if none. */
+static size_t __attribute__((noinline)) get_collect(uint32_t timeout_ms, int *status, int *body_at)
+{
+    char line[40];
+    size_t line_len = 0, have = 0;
+    uint32_t block_left = 0;
+    long content_len = -1;
+    bool closed = false;
+
+    *body_at = -1;
+    for (uint32_t elapsed = 0; elapsed < timeout_ms; elapsed += 10) {
+        while (s_rx_tail != s_rx_head) {
+            const char c = s_rx_buf[s_rx_tail];
+            s_rx_tail = (uint16_t)((s_rx_tail + 1) % RX_BUFFER_SIZE);
+            if (block_left > 0) {
+                block_left--;
+                if (have < sizeof(s_rx_temp) - 1) {
+                    s_rx_temp[have++] = c;
+                }
+            } else if (c == '\n') {
+                line[line_len] = '\0';
+                line_len = 0;
+                if (strncmp(line, "+IPD", 4) == 0) {
+                    block_left = (uint32_t)atoi(line + 4);
+                } else if (strncmp(line, "+IPCLOSE", 8) == 0 || strncmp(line, "+CIPCLOSE", 9) == 0) {
+                    closed = true;
+                } else if (strncmp(line, "+CMTI", 5) == 0) {
+                    note_sms_arrival();
+                }
+            } else if (c != '\r' && line_len < sizeof(line) - 1) {
+                line[line_len++] = c;
+            }
+        }
+        s_rx_temp[have] = '\0';
+        if (*body_at < 0) {
+            const char *end = strstr(s_rx_temp, "\r\n\r\n");
+            if (end) {
+                const char *cl = strstr(s_rx_temp, "Content-Length: ");
+                *body_at = (int)(end + 4 - s_rx_temp);
+                *status = (strncmp(s_rx_temp, "HTTP/1.", 7) == 0) ? atoi(s_rx_temp + 9) : 0;
+                content_len = (cl && cl < end) ? atol(cl + 16) : -1;
+                if (content_len < 0) {
+                    return 0;   /* Our server always gives the length */
+                }
+            }
+        }
+        if (*body_at >= 0 && block_left == 0 && (long)(have - (size_t)*body_at) >= content_len) {
+            if (closed) {
+                s_get_open = false;
+            }
+            return (size_t)*body_at + (size_t)content_len;
+        }
+        if (closed && block_left == 0) {
+            s_get_open = false;
+            return 0;
+        }
+        delay_ms(10);
+    }
+    return 0;
+}
+
+const char *sim7600_http_get(const char *host, uint16_t port, const char *path, int *len, int *status)
+{
+    char cmd[80];
+    *len = 0;
+    *status = 0;
+    s_log_quiet = true;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!s_get_open) {
+            clear_rx();
+            send_raw("AT+NETOPEN?\r\n");
+            if (!wait_response("+NETOPEN: 1", 2000, NULL, 0)) {
+                clear_rx();
+                send_raw("AT+NETOPEN\r\n");
+                wait_response("+NETOPEN: 0", 20000, NULL, 0);
+            }
+            close_socket_quiet(1000);
+            s_log_quiet = true;
+            snprintf(cmd, sizeof(cmd), "AT+CIPOPEN=0,\"TCP\",\"%.40s\",%u\r\n", host, (unsigned)port);
+            clear_rx();
+            send_raw(cmd);
+            if (!wait_response("+CIPOPEN: 0,0", 20000, NULL, 0)) {
+                break;
+            }
+            s_get_open = true;
+        }
+        const int req_len = snprintf(s_http_req, sizeof(s_http_req), "GET %s HTTP/1.1\r\nHost: %.40s\r\n\r\n", path, host);
+        snprintf(cmd, sizeof(cmd), "AT+CIPSEND=0,%d\r\n", req_len);
+        clear_rx();
+        send_raw(cmd);
+        if (wait_response(">", 5000, NULL, 0)) {
+            int body_at = -1;
+            clear_rx();
+            send_raw(s_http_req);
+            const size_t total = get_collect(15000, status, &body_at);
+            if (total > 0) {
+                s_rx_temp[total] = '\0';
+                *len = (int)(total - (size_t)body_at);
+                s_log_quiet = false;
+                return &s_rx_temp[body_at];
+            }
+        }
+        /* The server ends a kept connection after a while: one more try on a new one */
+        s_get_open = true;
+        sim7600_http_get_close();
+        s_log_quiet = true;
+    }
+    s_log_quiet = false;
+    return NULL;
 }
 
 bool sim7600_http_post(const http_endpoint_t *endpoint, const char *payload, char *date_hdr_out, size_t date_hdr_size)
@@ -3445,6 +3579,25 @@ static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
             }
         } else {
             snprintf(out, osz, "STN %s SERVER 2 NOT SET: flash write failed", stn);
+        }
+        break;
+    }
+    case SMS_CMD_SET_OTA_SERVER: {
+        /* Kept on the card (OTASRV.DAT), read by ota.c at each check. Fixed length: the file is
+         * overwritten in place. */
+        char host[44];
+        char text[64];
+        uint16_t port = 80;
+        bool off = false;
+        if (!sms_parse_ota_server(arg, host, sizeof(host), &port, &off)) {
+            snprintf(out, osz, "STN %s OTA SERVER NOT SET: host [port], or OFF", stn);
+        } else if (off) {
+            storage_state_delete(OTA_SERVER_FILENAME);
+            snprintf(out, osz, "STN %s OTA SERVER DEFAULT %s:%d", stn, OTA_SERVER_HOST, OTA_SERVER_PORT);
+        } else {
+            snprintf(text, sizeof(text), "%-43s %5u\r\n", host, (unsigned)port);
+            snprintf(out, osz, storage_state_save(OTA_SERVER_FILENAME, text) ? "STN %s OTA SERVER SET %s:%u" : "STN %s OTA SERVER NOT SET: card write failed (%s:%u)",
+                     stn, host, (unsigned)port);
         }
         break;
     }

@@ -29,6 +29,11 @@ void storage_archive_adopt(const char *day_file, const char *old_day_file);
 /* One CSV line per 15-minute slot in SLOTS.CSV, for auditing gaps */
 void storage_log_slot(const char *csv_line);
 int storage_erase_station_data(void);
+/* The firmware file as it is downloaded (OTA): its size on the card is how far it has got */
+long storage_file_size(const char *name);    /* -1: no such file */
+bool storage_ota_open(const char *name, uint32_t expect_size);   /* 0 starts it afresh */
+bool storage_ota_write(const void *data, uint32_t len);          /* On the card before it returns */
+void storage_ota_close(void);
 void storage_state_delete(const char *name);
 /* Adds one timestamped line to a file on the card */
 void storage_append_stamped(const char *name, const char *text);

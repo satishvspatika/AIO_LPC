@@ -8,6 +8,7 @@
 #include "ctrl_isp.h"
 #include "ui_display.h"
 #include "storage_log.h"
+#include "ota.h"
 #include "fw_app.h"
 #include "errlog.h"
 #include "flash_nvram.h"
@@ -626,6 +627,38 @@ static void __attribute__((noinline)) copy_to_server2(portTickType budget_end)
     storage_log_debug(ok ? "HTTP" : "ERROR", ok ? "Server 2 copy delivered" : "Server 2 copy not delivered (not kept for later)");
 }
 
+#if OTA_REACH_TEST
+/* Bench only: can this SIM reach our own servers (an M2M SIM may be limited to approved addresses)?
+ * One small POST to each, after everything for the data server, sent as the server 2 copy is: no
+ * clock use, nothing kept, no effect on the slot's result. Any answer at all (a 404 too) means
+ * reached; the server's access log shows the request. */
+static void __attribute__((noinline)) reach_test(portTickType budget_end)
+{
+    static const http_endpoint_t targets[2] = {
+        { "187.127.175.183", "187.127.175.183", "/lpc-reach", 80, "", FORMAT_URL_ENCODED },     /* Hostinger, by address */
+        { "devhlt.spatika.net", "75.119.148.192", "/lpc-reach", 80, "", FORMAT_URL_ENCODED }    /* Contabo, by name */
+    };
+    static char body[48];
+    static char line[96];
+    snprintf(body, sizeof(body), "id=%.12s&fw=%s", flash_nvram_get_station_id(), FIRMWARE_VERSION);
+    sim7600_set_server_clock_sync(false);
+    for (int i = 0; i < 2; i++) {
+        if ((long)(budget_end - xTaskGetTickCount()) <= 0 || !sim7600_still_registered()) {
+            storage_log_debug("REACH", "Reach test skipped: no time or network left");
+            break;
+        }
+        vTaskDelay(3000 / portTICK_RATE_MS);    /* Carrier NAT gap between sockets */
+        hal_power_heartbeat();
+        bool ok = sim7600_http_post_once(&targets[i], body, 0);
+        snprintf(line, sizeof(line), "Reach test %s: %s", targets[i].domain,
+                 (ok || sim7600_post_answered()) ? "REACHED (the server answered)" :
+                 sim7600_post_unanswered() ? "CONNECTED, NO ANSWER" : "NOT REACHED (could not connect)");
+        storage_log_debug("REACH", line);
+    }
+    sim7600_set_server_clock_sync(true);
+}
+#endif
+
 static bool post_backlog_record(const http_endpoint_t *endpoint, const char *payload, int route, portTickType budget_end)
 {
     if (post_to(endpoint, payload, route)) {
@@ -999,6 +1032,9 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
         }
 
         copy_to_server2(budget_end);
+#if OTA_REACH_TEST
+        reach_test(budget_end);
+#endif
 
         /* The record has gone out, so this can't delay it */
 #if GPS_AUTO_SEARCH
@@ -1009,6 +1045,13 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
 
         /* Check and process incoming operator SMS */
         sms_listen(telem, registered_at, budget_end, slot_of_day(s_archive_slot_id));
+
+#if ENABLE_OTA
+        /* Last of all, and only once this slot's record is with the server */
+        if (result == SLOT_SENT) {
+            ota_slot_step(slot_of_day(s_archive_slot_id));
+        }
+#endif
     } else {
         storage_log_debug("MODEM", "Modem has no network after all tries! Saving to backlog.");
         format_slot_payload(payload, sizeof(payload), telem, -113);
@@ -1798,6 +1841,9 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     save_last_slot(slot_id);
     LPC_RTC->GPREG4 = 0;    /* A slot finished: any run of fault restarts is over */
     do_requested_erase();   /* Before the power-off below */
+#if ENABLE_OTA
+    ota_install_step();     /* Restarts the unit if a downloaded firmware file is ready */
+#endif
 
     ui_set_slot_busy(false);
 

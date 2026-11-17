@@ -2,6 +2,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <ctype.h>
+#include <strings.h>
 
 static char up(char c)
 {
@@ -61,6 +63,8 @@ static const cmd_name_t s_names[] = {
     { "RESUME_SENDING",  SMS_CMD_RESUME },
     { "RESUME",          SMS_CMD_RESUME },
     { "ERASE_DATA",      SMS_CMD_ERASE_DATA },
+    { "SET_OTA_SERVER",  SMS_CMD_SET_OTA_SERVER },
+    { "OTA_SERVER",      SMS_CMD_SET_OTA_SERVER },
 };
 
 /* The command word at p (letters, digits, _), matched whole against the table */
@@ -150,6 +154,7 @@ bool sms_cmd_needs_office(sms_cmd_t cmd)
     case SMS_CMD_STOP:
     case SMS_CMD_RESUME:
     case SMS_CMD_ERASE_DATA:
+    case SMS_CMD_SET_OTA_SERVER:
         return true;
     default:
         return false;
@@ -505,4 +510,38 @@ bool sms_seen_repeat(sms_seen_t *s, const char *from, const char *ts, const char
     s->e[at].body_sum = sum;
     if (changed) *changed = true;
     return false;
+}
+
+/* ---- SET_OTA_SERVER ---- */
+bool sms_parse_ota_server(const char *arg, char *host, size_t host_size, uint16_t *port, bool *off)
+{
+    size_t n = 0;
+    unsigned long p = 80;
+    bool dot = false;
+    *off = false;
+    if (strcasecmp(arg, "OFF") == 0 || strcasecmp(arg, "DEFAULT") == 0) {
+        *off = true;
+        return true;
+    }
+    while (isalnum((unsigned char)arg[n]) || arg[n] == '.' || arg[n] == '-') {
+        dot = dot || arg[n] == '.';
+        n++;
+    }
+    if (n == 0 || n >= host_size || !dot) {
+        return false;
+    }
+    if (arg[n] != '\0') {
+        char *end = NULL;
+        if (arg[n] != ':' && arg[n] != ' ') {
+            return false;
+        }
+        p = strtoul(arg + n + 1, &end, 10);
+        if (end == arg + n + 1 || *end != '\0' || p == 0 || p > 65535UL) {
+            return false;
+        }
+    }
+    memcpy(host, arg, n);
+    host[n] = '\0';
+    *port = (uint16_t)p;
+    return true;
 }

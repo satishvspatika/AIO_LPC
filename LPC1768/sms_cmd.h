@@ -26,8 +26,13 @@ typedef enum {
     SMS_CMD_DEL_NUM,
     SMS_CMD_STOP,           /* Stop all HTTP sends (junk values): records kept on the card */
     SMS_CMD_RESUME,
-    SMS_CMD_ERASE_DATA      /* ERASE_DATA <station ID>: the ID guards against a message for another unit */
+    SMS_CMD_ERASE_DATA,     /* ERASE_DATA <station ID>: the ID guards against a message for another unit */
+    SMS_CMD_SET_OTA_SERVER  /* SET_OTA_SERVER <host> [port], or OFF for the built-in one */
 } sms_cmd_t;
+
+/* "host", "host port" or "host:port" (port 80 if not given) for SET_OTA_SERVER. *off for "OFF" or
+ * "DEFAULT": back to the address built in. The host is letters, digits, dots and hyphens with a dot. */
+bool sms_parse_ota_server(const char *arg, char *host, size_t host_size, uint16_t *port, bool *off);
 
 /* Finds the command in a message body. arg gets the value (trimmed, may be empty). */
 sms_cmd_t sms_cmd_parse(const char *body, char *arg, size_t arg_size);

@@ -104,6 +104,7 @@ been run on a unit.
 | `flash_nvram.c` | Settings in flash (sector 1): station ID, location, last logged, calibration result |
 | `errlog.c` | Error log in flash (sectors 9-11), copied to `ERRORS.TXT` |
 | `fw_update.c`, `fw_app.c`, `fw_ctrl.c` | Firmware update of both chips from the SD card; watchdog |
+| `ota.c` | Firmware over the air: daily check, download of the .hex to the card, hand-over to the SD update (section 7.6) |
 | `ui_display.c` | LCD, keypad, screens, menu, calibration, status SMS, idle power saving |
 | `boot/` | Bootloader, swap/journal core shared with the LPC845, layout header |
 
@@ -351,6 +352,7 @@ the log then shows `registered for SMS` with `No SMS waiting`. v6.9.47: the wind
 | `SET_STN_ID <1-6 or 1-8 digits>` | office | zero-padded to the type's length, saved to flash |
 | `SET_SERVER_2 host=..;port=..;path=/..;key=..` / `OFF` | office | server 2 (key optional: replaces the payload key for server 2) |
 | `SET_SERVER_MODE 0/1/2` | office | 0 server 1 only, 1 server 2 only (live + backlog), 2 both (server 2 gets one copy of the live record, no backlog, its clock not used) |
+| `SET_OTA_SERVER <host> [port]` / `OFF` (build 23) | office | where the unit asks for firmware (section 7.6); kept in `OTASRV.DAT` on the card; OFF goes back to the built-in address |
 | `ADD_NUM` / `DEL_NUM <number>`, `GET_NUM` | office | office number list (up to 5, last 10 digits; the last one can't be removed) |
 | `STOP` / `RESUME` (v6.9.48) | office | STOP: no HTTP sends at all, nothing queued (junk values are never sent, even after RESUME); the record is still written to the card; the modem still listens for SMS; while stopped the clock is corrected from network time (`AT+CCLK?`). Kept in flash (`sending_stopped`); SLOTS.CSV `STOPPED`, GET_CONFIG and the LCD backlog screen show it. RESUME: sending from the next slot |
 | `ERASE_DATA <station ID>` (v6.9.48) | office | The keypad's ERASE DATA (`data_erase_all()`). The ID must be this unit's (leading zeros ignored). Done by the main task only: after the slot is recorded, or at once with the LCD on (the UI holds its power save until the erase is over, v6.9.54). Not done with CTRL silent (its rain total would be left behind) |
@@ -450,6 +452,60 @@ file changed after the check; mutation-checked. Main stack at boot about 1.4 KB 
 unchanged; +2.2 KB main RAM, about 10 KB code. Spare CTRL boards should still get the bootloader by MCU-Link first.
 
 Outcomes are written to `UPDATE.TXT`.
+
+### 7.6 Firmware over the air (OTA; v6.9.55 build 23, on the bench from 2026-11-17)
+
+OTA only brings the firmware file to the SD card. The file is the same `.hex` that goes on a card by hand, and it
+is checked and installed by the code of section 7.5 (`fw_update_check`, `fw_update_stage`, the bootloader's swap,
+trial and rollback). No OTA code writes to flash. `ENABLE_OTA` (user_config.h) switches it off.
+
+**Server.** Ours, `187.127.175.183` port 80 (user, 2026-11-17: the address itself; no name yet). Changed without a
+new build by `OTASRV.DAT` on the card (`host port`), written by SMS `SET_OTA_SERVER <host> [port]` / `OFF`
+(office numbers only). Source and set-up: `ota_server/`.
+
+**When the unit asks** (`ota_slot_step`, after a slot whose record was delivered, after the SMS check, modem still
+held): on its daily slot (13:00 + 15 min x (station number mod 8)), on every slot while a download is unfinished,
+at the first slot after an install (to report), and on every slot if the card holds `OTA.NOW` (bench). Never with
+backlog pending, a card fault, firmware on trial, or the battery under 11.8 V (a reading under 2 V is a broken
+sense line and is allowed, as for the SD update).
+
+**Protocol** (plain HTTP GET, text, one socket kept open; `sim7600_http_get`):
+
+| Request | Answer |
+|---|---|
+| `/lpc/check?id=<station>&p=<type 0-2>&v=<version>&c=<running image CRC>&s=<0 idle, 1 downloading, 3 failed>&t=<image CRC that failed>` | `OTA NONE` or `OTA FW <file bytes> <file CRC> <image CRC>` |
+| `/lpc/fw?id=<station>&c=<file CRC>&o=<offset>&n=<bytes, up to 1024>` | `@<CRC-32 of the piece>` + newline + the piece. 404 `OTA GONE` if the file was withdrawn |
+
+An image is known by its CRC (builds share a version string), so the office can also send an older build.
+
+**Download.** Pieces of 1024 bytes, each checked against its CRC, appended to `OTA.TMP` and synced to the card
+before the next is asked for: the file's size is how far the download has got, so a power cut or a lost network
+goes on from there at the next slot. Three bad replies in a row stop it for this slot. No new piece is asked for
+within 330 s of the next slot. A reply is at most about 1.2 KB, inside the driver's 2 KB buffers, and the modem's
+receive mode is left as the data posts use it.
+
+**Install** (`ota_install_step`, at the end of `run_slot`, after SLOTS.CSV and LASTSLOT.DAT: a restart any earlier
+would have the slot taken for unfinished and sent again). Needs 300 s to the next slot, else it waits for the next
+one. The file is checked as a card file is, its image CRC must be the one offered, it is copied to staging, and the
+unit restarts into the bootloader.
+
+**State**, `OTA.DAT` on the card: `<file CRC> <image CRC> <file bytes> <phase>`: `D` downloading, `I` install started,
+`F` that image did not stay (rolled back) or its file was refused. An `F` image is never taken again; a different
+build is. The server learns the result from the next check: the running CRC is the target (updated), or `s=3`
+with the failed image.
+
+**Not there, by choice (user, 2026-11-17: as small as possible):** no signature (5.1 KB of flash is left; the
+unit takes firmware only from the one server address, so the server's security is the protection), no binary
+format (the .hex is about 353 KB against 126 KB), no OTA without a card, no CTRL update yet.
+
+**Airtel M2M SIMs** reach only approved addresses (bench 2026-11-17: the socket opens, the request goes, and it is
+closed in 1 s with no reply; BSNL reaches the server). On such a SIM the check costs a few seconds and logs
+`OTA: no answer`. Airtel has to approve `187.127.175.183` port 80.
+
+Memory: image 125.6-126.0 KB of 128 KB (was 121.2-121.5); +0.4 KB RAM; main task worst-case stack unchanged
+(3504 of 4352 B: the OTA path needs 1408 B under 1032 B of slot frames). Host tests: `tests/ota_test.c` (pretend
+server, card and clock: resume, bad replies, withdrawn or changed file, rollback, time limit; mutation-checked)
+and `tests/ota_get_test.c` (the reply parser as it stands in the driver, cut at every position).
 
 ---
 

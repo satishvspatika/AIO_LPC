@@ -102,6 +102,7 @@ ${CC} ${CFLAGS} "${LPC_DIR}/flash_log.c" -o "${OUT_DIR}/flash_log.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_app.c" -o "${OUT_DIR}/fw_app.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_update.c" -o "${OUT_DIR}/fw_update.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fw_ctrl.c" -o "${OUT_DIR}/fw_ctrl.o"
+${CC} ${CFLAGS} "${LPC_DIR}/ota.c" -o "${OUT_DIR}/ota.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/errlog.c" -o "${OUT_DIR}/errlog.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/net_policy.c" -o "${OUT_DIR}/net_policy.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/sms_cmd.c" -o "${OUT_DIR}/sms_cmd.o"
@@ -174,6 +175,7 @@ ${CC} \
   "${OUT_DIR}/fw_app.o" \
   "${OUT_DIR}/fw_update.o" \
   "${OUT_DIR}/fw_ctrl.o" \
+  "${OUT_DIR}/ota.o" \
   "${OUT_DIR}/errlog.o" \
   "${OUT_DIR}/net_policy.o" \
   "${OUT_DIR}/sms_cmd.o" \

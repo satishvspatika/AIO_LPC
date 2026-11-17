@@ -873,6 +873,58 @@ void fw_file_close(void)
     fs_unlock();
 }
 
+/* ---- The firmware file as it is downloaded (OTA) ----
+ * It grows a piece at a time and every piece is on the card before the next is asked for, so the
+ * file's size is how far the download has got: a power cut loses nothing and needs no other record.
+ * Uses the firmware FIL: a download and an update never run together. */
+long storage_file_size(const char *name)
+{
+    long size = -1;
+    fs_lock();
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    if (f_open(&s_fw_file, name, FA_OPEN_EXISTING | FA_READ) == FR_OK) {
+        size = (long)s_fw_file.fsize;
+        f_close(&s_fw_file);
+    }
+    fs_unlock();
+    return size;
+}
+
+bool storage_ota_open(const char *name, uint32_t expect_size)
+{
+    fs_lock();
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    bool ok = (f_open(&s_fw_file, name, (expect_size == 0) ? (FA_CREATE_ALWAYS | FA_WRITE) : (FA_OPEN_EXISTING | FA_WRITE)) == FR_OK);
+    if (ok && (s_fw_file.fsize != expect_size || f_lseek(&s_fw_file, expect_size) != FR_OK)) {
+        f_close(&s_fw_file);
+        ok = false;
+    }
+    fs_unlock();
+    return ok;
+}
+
+bool storage_ota_write(const void *data, uint32_t len)
+{
+    UINT wrote = 0;
+    fs_lock();
+    bool ok = (f_write(&s_fw_file, data, len, &wrote) == FR_OK && wrote == len && f_sync(&s_fw_file) == FR_OK);
+    fs_unlock();
+    return ok;
+}
+
+void storage_ota_close(void)
+{
+    fs_lock();
+    f_close(&s_fw_file);
+    fs_unlock();
+}
+
 void storage_state_delete(const char *name)
 {
     fs_lock();

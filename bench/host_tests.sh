@@ -22,3 +22,8 @@ python3 $R/bench/rtc_check_test.py $R | tail -1
 for t in 0 1 2; do cc $F -DUNIT_CFG=$t -I$R/LPC1768 -o $O/sid$t $R/LPC1768/tests/station_id_test.c $R/LPC1768/telemetry_formatter.c && $O/sid$t | tail -1; done
 cc $F -I$R/LPC1768 -o $O/npt $R/LPC1768/tests/net_policy_test.c $R/LPC1768/net_policy.c && $O/npt | tail -1
 cc $F -I$R/LPC1768 -o $O/smst $R/LPC1768/tests/sms_cmd_test.c $R/LPC1768/sms_cmd.c && $O/smst | tail -1
+# Firmware over the air: the download logic (pretend server, card and clock), and the modem reply
+# parser taken as it stands from the driver
+cc $F -DOTA_STOP_BEFORE_SLOT_S_FOR_TEST=330 -I$R/LPC1768/tests/host_stubs -I$R/LPC1768 -o $O/otat $R/LPC1768/tests/ota_test.c $R/LPC1768/ota.c && $O/otat | tail -1
+sed -n '/^static size_t __attribute__((noinline)) get_collect/,/^const char \*sim7600_http_get/p' $R/LPC1768/sim7600_driver.c | sed '$d' > $O/get_collect.inc
+cc $F -I$O -o $O/otag $R/LPC1768/tests/ota_get_test.c && $O/otag | tail -1

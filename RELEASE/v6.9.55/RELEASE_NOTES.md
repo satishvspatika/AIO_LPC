@@ -271,3 +271,11 @@
 ## 3. Known limits
 - Commands are answered only at 11:00, 12:00, 16:00 and 17:00 (or at once with the LCD on).
 - `=== BOOT` and `Free heap` lines are missing from the debug log on most scheduled boots (cosmetic, since v6.9.37).
+
+---
+
+## Build 23 (2026-11-17): firmware over the air, bench only
+
+Not for the test team yet. `build23_ota/SD_CARD/` is the card build (all three types, with `OTA.NOW` so
+the unit asks at every slot); `build23_ota/OTA_TARGET/` is the same KSNDMC TRG code named `v6.9.55-ota`,
+uploaded to the OTA server as the file the unit downloads. Design: docs/SYSTEM_DESIGN.md section 7.6.

@@ -36,6 +36,26 @@ int main(void)
     T(P("VARSHA STOPX", NULL) == SMS_CMD_UNKNOWN);
     T(P("VARSHA ERASE_DATA 1903", "1903") == SMS_CMD_ERASE_DATA);
     T(sms_cmd_needs_office(SMS_CMD_ERASE_DATA));
+    /* OTA server */
+    T(P("VARSHA SET_OTA_SERVER 187.127.175.183", "187.127.175.183") == SMS_CMD_SET_OTA_SERVER);
+    T(P("varsha ota_server=ota.example.net 8080", "ota.example.net 8080") == SMS_CMD_SET_OTA_SERVER);
+    T(sms_cmd_needs_office(SMS_CMD_SET_OTA_SERVER));
+    {
+        char h[44]; uint16_t port = 0; bool off = true;
+        T(sms_parse_ota_server("187.127.175.183", h, sizeof(h), &port, &off) && !off && port == 80 && !strcmp(h, "187.127.175.183"));
+        T(sms_parse_ota_server("ota.example.net 8080", h, sizeof(h), &port, &off) && port == 8080 && !strcmp(h, "ota.example.net"));
+        T(sms_parse_ota_server("ota-1.example.net:81", h, sizeof(h), &port, &off) && port == 81 && !strcmp(h, "ota-1.example.net"));
+        T(sms_parse_ota_server("off", h, sizeof(h), &port, &off) && off);
+        T(sms_parse_ota_server("DEFAULT", h, sizeof(h), &port, &off) && off);
+        T(!sms_parse_ota_server("", h, sizeof(h), &port, &off));
+        T(!sms_parse_ota_server("localhost", h, sizeof(h), &port, &off));           /* No dot */
+        T(!sms_parse_ota_server("a.b/path", h, sizeof(h), &port, &off));
+        T(!sms_parse_ota_server("a.b 0", h, sizeof(h), &port, &off));
+        T(!sms_parse_ota_server("a.b 70000", h, sizeof(h), &port, &off));
+        T(!sms_parse_ota_server("a.b 80x", h, sizeof(h), &port, &off));
+        T(!sms_parse_ota_server("a.b:", h, sizeof(h), &port, &off));
+        T(!sms_parse_ota_server("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com", h, sizeof(h), &port, &off));  /* 46 > 43 */
+    }
     T(sms_cmd_needs_office(SMS_CMD_STOP) && sms_cmd_needs_office(SMS_CMD_RESUME));
     T(P("VARSHA SEND_FTP_DAILY_DATA", NULL) == SMS_CMD_UNKNOWN);
     T(P("VARSHA", NULL) == SMS_CMD_UNKNOWN);
