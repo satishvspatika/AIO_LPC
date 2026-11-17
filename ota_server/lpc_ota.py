@@ -189,12 +189,12 @@ HEALTH_FIELDS = [   # (field, label, unit)
     ("net", "Network", ""),                         # 2 or 4 (G)
     ("op", "Operator", ""),
     ("ok", "Slots sent on time, 24 h", "of 96"),
-    ("late", "Sent later from the queue, 24 h", ""),
+    ("late", "Queued to send later, 24 h", ""),
     ("miss", "Slots missed or unit off, 24 h", ""),
     ("q", "Records waiting now", ""),
     ("dur", "Average time on per slot", "s"),
-    ("rst", "Restarts, 24 h", ""),
-    ("wdt", "Watchdog restarts, 24 h", ""),
+    ("rst", "Fault restarts since last report", ""),
+    ("wdt", "Watchdog restarts since last report", ""),
     ("sd", "SD card", ""),                          # 1 working, 0 fault
     ("ctrl", "CTRL firmware", ""),
     ("clk", "Clock corrected by", "s"),
@@ -202,7 +202,7 @@ HEALTH_FIELDS = [   # (field, label, unit)
     ("gps", "Location", ""),                        # lat,lon
 ]
 HEALTH_UNITS = {k: u for k, _, u in HEALTH_FIELDS}
-HEALTH_SHORT = {"bv": "Battery", "bmin": "Lowest", "sig": "Signal", "net": "Net", "ok": "On time", "late": "Later",
+HEALTH_SHORT = {"bv": "Battery", "bmin": "Lowest", "sig": "Signal", "net": "Net", "ok": "On time", "late": "Queued",
                 "miss": "Missed", "q": "Waiting", "rst": "Restarts", "wdt": "Watchdog", "hs": "Health"}
 HEALTH_HISTORY = ["bv", "bmin", "sig", "net", "ok", "late", "miss", "rst", "wdt", "hs"]
 HEALTH_VALUE = re.compile(r"[0-9A-Za-z._,:+-]{0,40}")

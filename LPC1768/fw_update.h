@@ -56,6 +56,7 @@ fw_result_t fw_ctrl_stream(const char *name, const fw_file_info_t *checked, fw_c
 /* File access, supplied by the application or the tests. Read returns bytes read, or -1. */
 bool fw_file_open(const char *name, uint32_t *out_size);
 int fw_file_read(void *buf, uint32_t len);
+bool fw_file_seek(uint32_t pos);     /* v6.9.60: for reading the end of SLOTS.CSV */
 void fw_file_close(void);
 
 #endif /* FW_UPDATE_H */

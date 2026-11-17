@@ -514,11 +514,17 @@ the failing step and the modem's reply go into the `OTA:` log line; a failed dai
 install the unit powers off once the new firmware is confirmed (it stayed on to the next slot), and a slot that
 `LASTSLOT.DAT` shows finished is not sent again after the install restart. Proven by OTA on 2G, 16:45.
 
-### 7.7 Health report (planned, v6.9.60; office side ready)
+### 7.7 Health report (v6.9.60, `health.c`; office side in `ota_server/lpc_ota.py`)
 
-The daily report rides on the OTA check: the same `GET /lpc/check`, with more short fields after the update
-ones. No second connection, no second server. A unit without them is unaffected. Planned twice a day (the
-13:00-14:45 check and one around 01:00, so the night battery is seen); decision pending.
+The report rides on the OTA check: the same `GET /lpc/check`, with more short fields after the update ones.
+No second connection, no second server. A unit without them is unaffected. **Twice a day** (user,
+2026-11-17): the check now also runs at 01:00 (`OTA_NIGHT_FIRST_SLOT`) besides 13:00, both plus the
+station's offset (station number mod 8 slots; 1922: 01:30 and 13:30), each with the report, so the night
+battery is seen. A failed one is tried at the next 3 delivered slots (`OTARETRY.DAT`). With `OTA.NOW` on
+the card (bench) the report goes with every check. The twice-daily check goes even with records waiting
+(that station is the one to see); only a download waits for them ("download put off"). `rst` and `wdt` count
+since the last report the server took (`HEALTH.DAT`, written at a fault boot and after a report); `late` is
+slots queued. Volts are handled as hundredths: `atof`/`%f` pulled in 12 KB of C library.
 
 | Field | Meaning | Source on the unit |
 |---|---|---|
@@ -536,8 +542,12 @@ ones. No second connection, no second server. A unit without them is unaffected.
 | `sens` | TWS sensors, e.g. `TH-OK,WS-OK,WD-FAIL` | sensor checks |
 | `gps` | `lat,lon` when known | GPS |
 
-Values: up to 40 characters of `0-9 A-Z a-z . , : + -` (others are dropped by the server). The path buffer
-grows from 96 B to about 320 B. Read back from `SLOTS.CSV` at report time, so nothing new is written each slot.
+Values: up to 40 characters of `0-9 A-Z a-z . , : + -` (the unit turns others into `-`, the server drops
+the rest). Path buffer 400 B. The last 9000 B of `SLOTS.CSV` are read in 256 B pieces at report time, so
+nothing new is written each slot. Not sent yet: `sv` and `sens` (no reading for them on the 1768 side).
+Image +1.9 KB (128.7-129.0 KB of 128 KB slot, 2.1 KB left on BIHAR); main task worst stack 3536 of 4352 B
+(the SMS path; unchanged order). Host tests: `tests/health_test.c` (pretend SLOTS.CSV over 9 KB, duplicate
+slot rows, unit off, queued, restart counts, location signs, damaged rows) and new cases in `ota_test.c`.
 
 Office (`ota_server/lpc_ota.py`): `HEALTH_FIELDS` names each field, `HEALTH_RULES` sets when it needs a look
 (battery under 11.8 V, lowest under 11.5 V, 4+ slots missed, 4+ records waiting, signal -105 dBm or weaker, any

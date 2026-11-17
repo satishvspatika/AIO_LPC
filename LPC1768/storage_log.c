@@ -866,6 +866,14 @@ int fw_file_read(void *buf, uint32_t len)
     return (r == FR_OK) ? (int)got : -1;
 }
 
+bool fw_file_seek(uint32_t pos)
+{
+    fs_lock();
+    bool ok = (f_lseek(&s_fw_file, pos) == FR_OK);
+    fs_unlock();
+    return ok;
+}
+
 void fw_file_close(void)
 {
     fs_lock();

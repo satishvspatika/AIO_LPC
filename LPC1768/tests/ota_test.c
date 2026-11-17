@@ -4,6 +4,7 @@
  * an install is started only for a whole, checked file with time to spare, and that an image which
  * did not stay is never taken again. */
 #include "ota.h"
+#include "health.h"
 #include "user_config.h"
 #include "sim7600_driver.h"
 #include "storage_log.h"
@@ -169,7 +170,7 @@ const char *fw_update_error_text(fw_result_t r) { (void)r; return "TEST ERROR"; 
 static enum { SRV_NONE, SRV_OFFER } s_server = SRV_NONE;
 static bool s_server_dead = false;
 static int s_get_calls = 0, s_check_calls = 0, s_piece_calls = 0, s_closes = 0;
-static char s_last_check[128];
+static char s_last_check[512];
 static uint32_t s_lowest_offset;
 static int s_fault_every = 0;       /* Every Nth piece request goes wrong, in turn: no reply, bad byte, short */
 static int s_fault_kind = 0;
@@ -181,7 +182,7 @@ const char *sim7600_http_get(const char *host, uint16_t port, const char *path, 
     CHECK(!strcmp(host, s_files[0].used && file_find("OTASRV.DAT") >= 0 ? "10.1.2.3" : OTA_SERVER_HOST));
     CHECK(port == (file_find("OTASRV.DAT") >= 0 ? 8080 : 80));
     CHECK(s_open < 0 || strncmp(path, "/lpc/check", 10));
-    CHECK(strlen(path) < 96);
+    CHECK(strlen(path) < 400);
     s_get_calls++;
     *len = 0; *status = 0;
     if (s_server_dead) { s_tick += 15000; return NULL; }
@@ -218,6 +219,15 @@ const char *sim7600_http_get(const char *host, uint16_t port, const char *path, 
     return s_reply;
 }
 void sim7600_http_get_close(void) { s_closes++; }
+/* ---- health report ---- */
+static int s_health_built = 0, s_health_sent = 0;
+static uint32_t s_health_pending = 99;
+const char *health_query(const telemetry_data_t *t, uint32_t pending)
+{
+    (void)t; s_health_built++; s_health_pending = pending;
+    return "&hs=OK&bv=12.60&ok=95";
+}
+void health_sent(void) { s_health_sent++; }
 const char *sim7600_http_get_fail_text(void) { return s_server_dead ? "CIPOPEN: +CIPOPEN: 0,4 ERROR" : ""; }
 
 /* ---- helpers ---- */
@@ -241,6 +251,7 @@ static void fresh(void)
     s_battery = 12.6f; s_running = 0x11111111UL; s_trial = false; s_sd_ok = true; s_backlog = 0; s_card_write_fails = false;
     s_server = SRV_NONE; s_server_dead = false; s_get_calls = s_check_calls = s_piece_calls = s_closes = 0;
     s_fault_every = 0; s_fault_kind = 0; s_all_pieces_bad = false; s_gone = false; s_piece_ms = 500;
+    s_health_built = s_health_sent = 0; s_health_pending = 99;
     s_checked = s_staged = s_resets = 0; s_check_result = FW_OK; s_lowest_offset = 0xFFFFFFFFUL; s_last_check[0] = 0;
 }
 static void new_firmware(uint32_t size, unsigned seed)
@@ -272,7 +283,7 @@ int main(void)
     fresh(); file_set(OTA_NOW_FILENAME, "", 0); CHECK(!step(3)); CHECK(s_check_calls == 1);
     fresh(); s_battery = 11.5f; CHECK(!step(DAILY)); CHECK(s_get_calls == 0);
     fresh(); s_battery = 0.2f; CHECK(!step(DAILY)); CHECK(s_check_calls == 1);     /* Broken sense line: allowed */
-    fresh(); s_backlog = 2; CHECK(!step(DAILY)); CHECK(s_get_calls == 0);
+    fresh(); s_backlog = 2; CHECK(!step(DAILY)); CHECK(s_check_calls == 1 && s_piece_calls == 0);   /* v6.9.60: report goes */
     fresh(); s_trial = true; CHECK(!step(DAILY)); CHECK(s_get_calls == 0);
     fresh(); s_sd_ok = false; CHECK(!step(DAILY)); CHECK(s_get_calls == 0);
     fresh(); s_server_dead = true; CHECK(!step(DAILY)); CHECK(s_check_calls == 0 && s_get_calls == 1 && phase() == '?');
@@ -410,15 +421,42 @@ int main(void)
     /* ... a check that is not due (OTA.NOW) leaves no tries behind */
     fresh(); s_server_dead = true; file_set(OTA_NOW_FILENAME, "", 0);
     CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 1 && file_find(OTA_RETRY_FILENAME) < 0);
-    /* Put off for records still to send: said in the log; the install report waits for it */
-    fresh(); s_backlog = 2;
-    CHECK(!step(DAILY)); CHECK(s_get_calls == 0 && strstr(s_log, "2 record(s) still to send"));
+    /* Records still to send: a check that isn't due (OTA.NOW) is put off and says so; the twice-daily
+     * check goes (health report), but a download waits for them (v6.9.60) */
+    fresh(); s_backlog = 2;     /* A download under way, on an ordinary slot */
+    {
+        char text[40]; snprintf(text, sizeof(text), "%08lX %08lX %07lu D\r\n", (unsigned long)s_fw_file_crc, (unsigned long)s_fw_image_crc, (unsigned long)s_fw_size);
+        file_set(OTA_STATE_FILENAME, text, (uint32_t)strlen(text));
+    }
+    CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 0 && strstr(s_log, "2 record(s) still to send"));
+    fresh(); s_backlog = 2; file_set(OTA_NOW_FILENAME, "", 0); s_server = SRV_OFFER;    /* Bench: checks, reports, no download */
+    CHECK(!step(DAILY + 1)); CHECK(s_check_calls == 1 && s_piece_calls == 0 && s_health_built == 1 && strstr(s_log, "download put off"));
     fresh(); s_backlog = 0; CHECK(!step(DAILY + 1)); CHECK(!strstr(s_log, "still to send"));   /* Not due: silent */
+    fresh(); s_backlog = 3; s_server = SRV_OFFER;
+    CHECK(!step(DAILY)); CHECK(s_check_calls == 1 && s_piece_calls == 0 && s_health_pending == 3 && s_health_sent == 1);
+    CHECK(strstr(s_log, "download put off: 3 record(s)") && phase() == '?');
+    s_backlog = 0; s_tick += 900000; set_clock(1, 10);
+    CHECK(step(OTA_NIGHT_FIRST_SLOT + 1922 % OTA_DAILY_SPREAD_SLOTS)); CHECK(s_staged == 1);   /* Queue empty: taken */
+    /* The install report goes with records waiting, too */
     fresh(); s_server = SRV_OFFER; CHECK(step(DAILY)); s_running = s_fw_image_crc; s_server = SRV_NONE;
     s_backlog = 1; s_tick += 900000; set_clock(16, 10);
-    CHECK(!step(DAILY + 1)); CHECK(phase() == 'I' && s_check_calls == 1);
-    s_backlog = 0; s_tick += 900000; set_clock(31, 10);
-    CHECK(!step(DAILY + 2)); CHECK(phase() == '-' && s_check_calls == 2 && strstr(s_last_check, "&c=22220001&s=0"));
+    CHECK(!step(DAILY + 1)); CHECK(phase() == '-' && s_check_calls == 2 && strstr(s_last_check, "&c=22220001&s=0"));
+
+    /* 13. v6.9.60 health report: at the night and day check slots (and their retries), not on others */
+    const int NIGHT = OTA_NIGHT_FIRST_SLOT + 1922 % OTA_DAILY_SPREAD_SLOTS;
+    fresh(); CHECK(!step(NIGHT)); CHECK(s_check_calls == 1 && s_health_built == 1 && s_health_sent == 1);
+    CHECK(strstr(s_last_check, "&t=00000000&hs=OK&bv=12.60&ok=95") && strstr(s_log, "health report sent"));
+    fresh(); CHECK(!step(DAILY)); CHECK(s_health_built == 1 && s_health_sent == 1);
+    fresh(); CHECK(!step(NIGHT + 1)); CHECK(s_get_calls == 0 && s_health_built == 0);
+    fresh(); file_set(OTA_NOW_FILENAME, "", 0); CHECK(!step(DAILY + 5)); CHECK(s_check_calls == 1 && s_health_built == 1);
+    /* Not answered: not counted as sent, and the retry carries the report again */
+    fresh(); s_server_dead = true; CHECK(!step(NIGHT)); CHECK(s_health_built == 1 && s_health_sent == 0);
+    s_server_dead = false; s_tick += 900000; set_clock(16, 10);
+    CHECK(!step(NIGHT + 1)); CHECK(s_health_built == 2 && s_health_sent == 1);
+    /* The install report alone carries no health report */
+    fresh(); s_server = SRV_OFFER; CHECK(step(DAILY)); s_running = s_fw_image_crc; s_server = SRV_NONE;
+    s_tick += 900000; set_clock(16, 10); s_health_built = 0;
+    CHECK(!step(DAILY + 1)); CHECK(s_check_calls == 2 && s_health_built == 0);
     /* No SD card on the daily slot: said */
     fresh(); s_sd_ok = false; CHECK(!step(DAILY)); CHECK(strstr(s_log, "SD card is not working"));
 

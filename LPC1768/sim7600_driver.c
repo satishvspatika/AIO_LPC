@@ -23,6 +23,17 @@
 
 static net_policy_t s_net;      /* Radio mode learning, kept in RATMODE.DAT between power-ons */
 static int s_net_mode = 0;      /* Mode this power-on registered on: NET_4G, NET_2G or 0 */
+static long s_clock_drift = 0;  /* v6.9.60: seconds from the server at its last time check (health report) */
+
+int sim7600_slot_network(void)
+{
+    return s_net_mode;  /* NET_4G is 4, NET_2G is 2 */
+}
+
+long sim7600_last_clock_drift(void)
+{
+    return s_clock_drift;
+}
 
 static void save_net_policy(void)
 {
@@ -551,6 +562,9 @@ static void sync_clock_from_server(const char *http_response, bool rejected)
 
     bool have_clock = intermcu_get_telemetry(&t);
     long drift = have_clock ? intermcu_clock_drift_sec(t.present_time, server_ts) : -1;
+    if (drift >= 0) {
+        s_clock_drift = drift;
+    }
     if (drift >= 0 && drift < clock_drift_limit(rejected)) {
         /* Every slot, so a card shows how fast this RTC really drifts */
         snprintf(msg, sizeof(msg), "Clock %lds from server, no change", drift);

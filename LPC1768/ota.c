@@ -15,6 +15,7 @@
  *   F  that image did not stay (rolled back), or its file was refused: not taken again
  */
 #include "ota.h"
+#include "health.h"
 #include "user_config.h"
 #include "sim7600_driver.h"
 #include "storage_log.h"
@@ -44,7 +45,7 @@ typedef struct {
 
 /* Static: this runs on the main task's stack, under the slot */
 static char s_text[176];   /* v6.9.57: room for the modem's reason */
-static char s_path[96];
+static char s_path[400];   /* v6.9.60: the check carries the health report */
 static char s_host[44];
 static uint16_t s_port;
 static ota_state_t s_st;
@@ -245,7 +246,9 @@ void ota_slot_step(int slot)
     const char *stn_id = flash_nvram_get_station_id();
     const char *t = telem->present_time;
     const uint32_t running = fw_app_running_crc();
-    bool due = (slot == OTA_DAILY_FIRST_SLOT + (int)(strtoul(stn_id, NULL, 10) % OTA_DAILY_SPREAD_SLOTS));
+    const int offset = (int)(strtoul(stn_id, NULL, 10) % OTA_DAILY_SPREAD_SLOTS);
+    /* v6.9.60: twice a day (night and day), each with the health report */
+    bool due = (slot == OTA_DAILY_FIRST_SLOT + offset || slot == OTA_NIGHT_FIRST_SLOT + offset);
 
     if (!storage_sd_is_ok() || strlen(t) < 14) {
         if (due) {
@@ -264,12 +267,18 @@ void ota_slot_step(int slot)
         retries = (unsigned)(s_text[9] - '0');
         due = true;
     }
-    if (!due && s_st.phase != 'D' && s_st.phase != 'I' && storage_file_size(OTA_NOW_FILENAME) < 0) {
+    const bool bench = (storage_file_size(OTA_NOW_FILENAME) >= 0);
+    if (!due && s_st.phase != 'D' && s_st.phase != 'I' && !bench) {
         return;
     }
-    /* v6.9.57: said, not silent (1922 on 17 Nov: a check put off for an hour with nothing in the log) */
+    /* The health report goes with the twice-daily check and its retries, and on a bench unit (OTA.NOW)
+     * with every check, so a test needn't wait for 01:00 or 13:00 */
+    const bool report = due || bench;
+    /* v6.9.57: said, not silent (1922 on 17 Nov: a check put off for an hour with nothing in the log).
+     * v6.9.60: the twice-daily check (health report, install report) goes anyway: a station with records
+     * waiting is the one to see. Only a download waits for them. */
     const uint32_t pending = storage_backlog_get_pending_count();
-    if (pending != 0) {
+    if (pending != 0 && !report && s_st.phase != 'I') {
         snprintf(s_text, sizeof(s_text), "OTA: check put off: %lu record(s) still to send first", (unsigned long)pending);
         ota_log("OTA", s_text);
         return;
@@ -298,11 +307,19 @@ void ota_slot_step(int slot)
     snprintf(s_path, sizeof(s_path), "/lpc/check?id=%.12s&p=%d&v=%s&c=%08lX&s=%c&t=%08lX", stn_id, (int)UNIT_CFG,
              FIRMWARE_VERSION, (unsigned long)running, (s_st.phase == 'D') ? '1' : (s_st.phase == 'F') ? '3' : '0',
              (unsigned long)((s_st.phase == 'F') ? s_st.image_crc : 0UL));
+    if (report) {
+        const size_t used = strlen(s_path);
+        snprintf(s_path + used, sizeof(s_path) - used, "%s", health_query(telem, pending));
+    }
     hal_power_heartbeat();
     const char *body = sim7600_http_get(s_host, s_port, s_path, &len, &status);
     const char *answer = (body && status == 200) ? strstr(body, "OTA ") : NULL;
     if (answer && retries != 0) {
         storage_state_delete(OTA_RETRY_FILENAME);   /* Answered: no more tries today */
+    }
+    if (answer && report) {
+        health_sent();
+        ota_log("OTA", "OTA: health report sent");
     }
     if (!answer) {
         snprintf(s_text, sizeof(s_text), "OTA: no answer from %.40s (HTTP %d) %.88s", s_host, status,
@@ -326,6 +343,9 @@ void ota_slot_step(int slot)
         ota_log("OTA", "OTA: offer ignored (size, or the image already running)");
     } else if (s_st.phase == 'F' && s_st.image_crc == image_crc) {
         ota_log("OTA", "OTA: the offered firmware failed here before: not taken");
+    } else if (pending != 0) {
+        snprintf(s_text, sizeof(s_text), "OTA: download put off: %lu record(s) still to send first", (unsigned long)pending);
+        ota_log("OTA", s_text);
     } else {
         if (s_st.phase != 'D' || s_st.file_crc != file_crc || s_st.size != size) {
             storage_state_delete(OTA_FILE_FILENAME);

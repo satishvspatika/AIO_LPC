@@ -27,3 +27,5 @@ cc $F -I$R/LPC1768 -o $O/smst $R/LPC1768/tests/sms_cmd_test.c $R/LPC1768/sms_cmd
 cc $F -DOTA_STOP_BEFORE_SLOT_S_FOR_TEST=330 -I$R/LPC1768/tests/host_stubs -I$R/LPC1768 -o $O/otat $R/LPC1768/tests/ota_test.c $R/LPC1768/ota.c && $O/otat | tail -1
 sed -n '/^static size_t __attribute__((noinline)) get_collect/,/^const char \*sim7600_http_get/p' $R/LPC1768/sim7600_driver.c | sed '$d' > $O/get_collect.inc
 cc $F -I$O -o $O/otag $R/LPC1768/tests/ota_get_test.c && $O/otag | tail -1
+# Health report (v6.9.60): built from a pretend SLOTS.CSV
+cc $F -I$R/LPC1768/tests/host_stubs -I$R/LPC1768 -o $O/hlt $R/LPC1768/tests/health_test.c $R/LPC1768/health.c && $O/hlt | tail -1

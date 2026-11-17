@@ -10,6 +10,7 @@
 #include "storage_log.h"
 #include "ota.h"
 #include "fw_app.h"
+#include "health.h"
 #include "errlog.h"
 #include "flash_nvram.h"
 #include "flash_log.h"
@@ -106,6 +107,13 @@ static void log_previous_crash(void)
     if ((s_reset_reason & 0x04) || LPC_RTC->GPREG0 == CRASH_MAGIC || LPC_RTC->GPREG0 == STUCK_MAGIC ||
         LPC_RTC->GPREG0 == STACK_CRASH_MAGIC) {
         wait_for_clock();
+    }
+    /* v6.9.60: counted for the health report (brownout alone: a power-on sets it too) */
+    if (s_reset_reason & 0x04) {
+        health_note_restart(true);
+    } else if (LPC_RTC->GPREG0 == CRASH_MAGIC || LPC_RTC->GPREG0 == STUCK_MAGIC || LPC_RTC->GPREG0 == STACK_CRASH_MAGIC ||
+               ((s_reset_reason & 0x08) && !(s_reset_reason & 0x01))) {
+        health_note_restart(false);
     }
     /* The hardware watchdog leaves no note of its own: the reset reason is all there is */
     if (s_reset_reason & 0x04) {
