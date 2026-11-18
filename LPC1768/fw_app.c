@@ -234,6 +234,12 @@ bool fw_ctrl_wait_reply(char kind, char *reply, size_t size, uint32_t timeout_ms
 static const char *s_ctrl_last_result = NULL;
 static bool s_ctrl_state_known = false;
 static char s_845_version[sizeof(((fw_ctrl_state_t *)0)->version)] = "";
+static uint32_t s_845_crc = 0;  /* v6.9.63: CTRL's running image CRC, 0 until it has answered (OTA) */
+
+uint32_t fw_app_ctrl_crc(void)
+{
+    return s_845_crc;
+}
 
 const char *fw_app_845_version(void)
 {
@@ -284,6 +290,9 @@ static void ctrl_step(uint32_t uptime_sec, uint32_t good_frames)
         return;
     }
     if (intermcu_take_u_reply(reply, sizeof(reply)) && fw_ctrl_parse_state(reply, &state)) {
+        if (state.state != FW_J_TRIAL_BOOT) {
+            s_845_crc = state.crc32;    /* On trial it is known once confirmed, at the next answer */
+        }
         if (!s_ctrl_state_known) {
             char line[48];
             s_ctrl_state_known = true;
@@ -352,8 +361,8 @@ void fw_app_step(uint32_t uptime_sec, uint32_t good_frames)
 
 #define WD_RUN_TICKS 60000000UL  /* 60 s: the watchdog runs from the 4 MHz IRC, divided by 4 */
 
-static const char *const s_wd_names[WD_COUNT] = { "Main", "Ui", "Modem" };
-static const uint16_t s_wd_limit_sec[WD_COUNT] = { 360, 60, 180 };
+static const char *const s_wd_names[WD_COUNT] = { "Main", "Ui", "Modem", "Kbd" };
+static const uint16_t s_wd_limit_sec[WD_COUNT] = { 360, 60, 180, 30 };
 static xTaskHandle s_wd_tasks[WD_COUNT];
 static volatile portTickType s_wd_seen[WD_COUNT];
 static bool s_wd_running = false;

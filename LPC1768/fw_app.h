@@ -26,6 +26,7 @@ typedef enum {
     WD_MAIN = 0,    /* 360: a slot's longest step, modem start-up, sits well inside this */
     WD_UI,          /* 60 */
     WD_MODEM,       /* 180 */
+    WD_KBD,         /* 30 (v6.9.63): scans every 50 ms, so silence means it has stopped */
     WD_COUNT
 } wd_task_t;
 void wd_register(wd_task_t id, void *task_handle);
@@ -44,6 +45,8 @@ const char *fw_app_845_version(void);
 
 /* The running image's CRC32, to spot a file that is the same firmware */
 uint32_t fw_app_running_crc(void);
+/* v6.9.63: the CTRL's running image CRC, 0 until it has answered a query since this boot */
+uint32_t fw_app_ctrl_crc(void);
 
 /* Status of the last flash command that failed (UM10360 IAP code), 0 if none */
 extern uint32_t fw_hal_last_status;

@@ -126,10 +126,10 @@ static void log_previous_crash(void)
         storage_log_debug("ERROR", msg);
         LPC_RTC->GPREG0 = 0;
     } else if (LPC_RTC->GPREG0 == STUCK_MAGIC) {
-        static const char *const names[] = { "Main", "Ui", "Modem" };
+        static const char *const names[] = { "Main", "Ui", "Modem", "Kbd" };
         char msg[56];
         uint32_t t = LPC_RTC->GPREG1;
-        snprintf(msg, sizeof(msg), "RESTARTED: task %s had stopped responding", (t < 3) ? names[t] : "?");
+        snprintf(msg, sizeof(msg), "RESTARTED: task %s had stopped responding", (t < 4) ? names[t] : "?");
         storage_log_debug("ERROR", msg);
         LPC_RTC->GPREG0 = 0;
     } else if (LPC_RTC->GPREG0 == STACK_CRASH_MAGIC) {
@@ -359,7 +359,7 @@ static void sync_flash_records_to_sd(void)
             char t[8];
             if (storage_state_load("TESTCUT.TXT", t, sizeof(t)) && strncmp(t, "CUT", 3) == 0) {
                 storage_state_save("TESTCUT.TXT", "DONE\r\n");
-                storage_log_debug("TEST", "Cutting power part way through the catch-up (2nd record on the card, not noted)");
+                storage_log_debug("TEST", "Power cut mid catch-up (test)");
                 vTaskDelay(1000 / portTICK_RATE_MS);
                 hal_power_sleep_system();
                 for (;;) {
@@ -435,9 +435,9 @@ static void archive_slot(const telemetry_data_t *telem, int csq_dbm, char *paylo
         if (newest->payload[0] != '\0' && newest->payload[0] != (char)0xFF &&
             strnlen(newest->payload, FLASH_LOG_PAYLOAD_SIZE) < FLASH_LOG_PAYLOAD_SIZE) {
             strcpy(payload, newest->payload);
-            storage_log_debug("SLOT", "This slot is already stored: sending the stored copy again, not today's readings");
+            storage_log_debug("SLOT", "Slot already stored: resending stored copy");
         } else {
-            storage_log_debug("SLOT", "This slot is already stored: sending it again without a second copy");
+            storage_log_debug("SLOT", "Slot already stored: resending, no 2nd copy");
         }
         sync_flash_records_to_sd();
         return;
@@ -464,7 +464,7 @@ static slot_result_t save_slot_for_retry(const telemetry_data_t *telem, const ch
     flash_log_note_delivery(s_last_record_seq, false);
 
     if (strlen(payload) >= 384) {
-        storage_log_debug("ERROR", "Slot payload exceeds 383 bytes: backlog copy will be truncated");
+        storage_log_debug("ERROR", "Payload over 383 B: backlog copy truncated");
     }
     if (!storage_backlog_save(telem->slot_time, payload)) {
         /* No usable SD card: the record is already in flash, so queue it there */
@@ -472,7 +472,7 @@ static slot_result_t save_slot_for_retry(const telemetry_data_t *telem, const ch
             ui_inc_backlog_count();
             storage_log_debug("BACKLOG", "SD backlog unavailable, record queued in flash");
         } else {
-            storage_log_debug("ERROR", "SLOT DATA NOT QUEUED: SD backlog and flash queue both failed");
+            storage_log_debug("ERROR", "SLOT DATA NOT QUEUED: SD and flash queue failed");
             result = SLOT_LOST;
         }
     }
@@ -676,7 +676,7 @@ static bool post_backlog_record(const http_endpoint_t *endpoint, const char *pay
         (long)(budget_end - xTaskGetTickCount()) <= 0) {
         return false;
     }
-    storage_log_debug("BACKLOG", "Backlog send failed before reaching the server: one more try in 3s");
+    storage_log_debug("BACKLOG", "Backlog send failed: retry in 3s");
     hal_power_heartbeat();
     vTaskDelay(3000 / portTICK_RATE_MS);
     return post_to(endpoint, payload, route);
@@ -716,7 +716,7 @@ static void do_requested_erase(void)
     /* The erase restarts CTRL's rain total too: with CTRL silent that would be lost, and its old
      * total would come back on the next record without the records behind it (review, v6.9.50) */
     if (!lpc845_link_alive()) {
-        storage_log_debug("ERROR", "VARSHA ERASE_DATA not done: CTRL not answering. Send it again");
+        storage_log_debug("ERROR", "ERASE_DATA not done: CTRL silent, send again");
         s_erasing = false;
         return;
     }
@@ -756,7 +756,7 @@ static void __attribute__((noinline)) keep_stopped_record(const telemetry_data_t
         }
     }
     sync_flash_records_to_sd();
-    storage_log_debug("SLOT", "Sending stopped by SMS: record kept, not sent or queued");
+    storage_log_debug("SLOT", "Sending stopped: record kept only");
 }
 
 static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out_attempts, int *out_csq, const char **out_reason)
@@ -840,7 +840,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
 #if (UNIT_CFG == KSNDMC_TWS)
         /* A slot run again sends its stored copy: one stored by older firmware may hold the zeros */
         if (tws_payload_th_missing(payload)) {
-            storage_log_debug("ERROR", "Stored copy of this slot has temperature or humidity 0: not sent");
+            storage_log_debug("ERROR", "Stored copy temp/hum 0: not sent");
             *out_reason = "NO_TEMP_HUMID";
             sim7600_release();
             return SLOT_LOST;
@@ -877,17 +877,17 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                 break;
             }
             if (sim7600_post_unanswered()) {
-                storage_log_debug("HTTP", "Sent with no answer: keeping it for the next slot, no repeat now");
+                storage_log_debug("HTTP", "Sent, no answer: kept for next slot");
                 break;
             }
             /* Signal gone since registering, or too long already: it's saved below either way */
             if (!SLOT_BUDGET_LEFT()) {
-                storage_log_debug("HTTP", "Slot sending time used up: keeping it for the next slot");
+                storage_log_debug("HTTP", "Send time used up: kept for next slot");
                 fail_reason = "TIME_LIMIT";
                 break;
             }
             if (!sim7600_post_rejected() && !sim7600_still_registered()) {
-                storage_log_debug("HTTP", "Network lost after registering: keeping it for the next slot");
+                storage_log_debug("HTTP", "Network lost: kept for next slot");
                 fail_reason = "NET_LOST";
                 break;
             }
@@ -940,11 +940,11 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                 if (tws_payload_th_missing(payload)) {
                     storage_append_stamped(REJECTED_FILENAME, payload);
                     if (!storage_backlog_mark_sent(bk_offset)) {
-                        storage_log_debug("ERROR", "Could not mark backlog record sent: stopping backlog cycle");
+                        storage_log_debug("ERROR", "Backlog mark-sent failed: backlog stopped");
                         bk_failed = true;
                         break;
                     }
-                    storage_log_debug("ERROR", "Backlog record has temperature or humidity 0: not sent, moved to " REJECTED_FILENAME);
+                    storage_log_debug("ERROR", "Backlog temp/hum 0: moved to " REJECTED_FILENAME);
                     continue;
                 }
 #endif
@@ -958,7 +958,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                     storage_log_debug("BACKLOG", "Backlog delivered OK, marking SENT");
                     /* Unmarked, it would be picked and sent again straight away */
                     if (!storage_backlog_mark_sent(bk_offset)) {
-                        storage_log_debug("ERROR", "Could not mark backlog record sent: stopping backlog cycle");
+                        storage_log_debug("ERROR", "Backlog mark-sent failed: backlog stopped");
                         bk_failed = true;
                         break;
                     }
@@ -1002,7 +1002,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                     }
                     ui_dec_backlog_count();
                     storage_append_stamped(REJECTED_FILENAME, payload);
-                    storage_log_debug("ERROR", "Flash backlog record has temperature or humidity 0: not sent, set aside");
+                    storage_log_debug("ERROR", "Flash backlog temp/hum 0: set aside");
                     continue;
                 }
 #endif
@@ -1015,11 +1015,11 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                     backlogs_sent++;
                 } else if (sim7600_post_rejected()) {
                     if (flash_log_note_rejected(flash_seq, REJECTIONS_ALLOWED)) {
-                        storage_log_debug("ERROR", "Flash backlog record refused 3 times: set aside, still in the flash log");
+                        storage_log_debug("ERROR", "Flash backlog refused 3x: set aside");
                         storage_append_stamped(REJECTED_FILENAME, payload);
                         ui_dec_backlog_count();
                     } else {
-                        storage_log_debug("BACKLOG", "Flash backlog record refused: trying it again next slot");
+                        storage_log_debug("BACKLOG", "Flash backlog refused: next slot");
                         bk_failed = true;
                     }
                 } else {
@@ -1061,7 +1061,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
         }
 #endif
     } else {
-        storage_log_debug("MODEM", "Modem has no network after all tries! Saving to backlog.");
+        storage_log_debug("MODEM", "No network after all tries: to backlog");
         format_slot_payload(payload, sizeof(payload), telem, -113);
         archive_slot(telem, -113, payload);
         *out_reason = "NO_NETWORK";
@@ -1282,7 +1282,7 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
         return; /* First run on this card, or nothing missed */
     }
     if (intermcu_get_845_system() < 0) {
-        storage_log_debug("ERROR", "Slots were missed, but this CTRL firmware can't supply stored samples");
+        storage_log_debug("ERROR", "Slots missed: this CTRL can't supply samples");
         return;
     }
 
@@ -1349,7 +1349,7 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
 #if (UNIT_CFG == KSNDMC_TWS)
         if (state == 1 && tws_th_missing(&s_gap_record)) {
             /* Measured, but temperature or humidity 0: never sent (user, 2026-11-13) */
-            snprintf(s_slot_line, sizeof(s_slot_line), "Stored sample for %.14s has temperature or humidity 0: not sent", request);
+            snprintf(s_slot_line, sizeof(s_slot_line), "Sample %.14s temp/hum 0: not sent", request);
             storage_log_debug("GAP", s_slot_line);
             not_held++;
             continue;
@@ -1404,7 +1404,7 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
             storage_log_slot(s_slot_line);
             off_filled++;
         } else {
-            storage_log_debug("ERROR", "CTRL did not answer a stored-sample request, stopping gap fill");
+            storage_log_debug("ERROR", "CTRL silent on sample request: gap fill stopped");
             break;
         }
     }
@@ -1588,7 +1588,7 @@ static bool __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data
             if (state == 1) {
                 memcpy(telem, &s_gap_record, sizeof(*telem));
                 snprintf(telem->slot_time, sizeof(telem->slot_time), "%.14s", own_name);
-                snprintf(s_slot_line, sizeof(s_slot_line), "CTRL's record is for later slot %.12s: this slot's own sample used for %.12s",
+                snprintf(s_slot_line, sizeof(s_slot_line), "CTRL record later (%.12s): own sample used for %.12s",
                          was, telem->slot_time);
                 storage_log_debug("ERROR", s_slot_line);
                 return false;
@@ -1596,12 +1596,12 @@ static bool __attribute__((noinline)) name_slot_if_845_clock_lost(telemetry_data
         }
         telem->rf_15m_mm = 0.0f;
         telem->rf_tips_15m = 0;
-        snprintf(s_slot_line, sizeof(s_slot_line), "CTRL's record is for slot %.12s, not %.12s: slot named from this clock, no 15-min rain of its own",
+        snprintf(s_slot_line, sizeof(s_slot_line), "CTRL record %.12s, not %.12s: named by own clock, no 15-min rain",
                  was, telem->slot_time);
         storage_log_debug("ERROR", s_slot_line);
         return true;
     }
-    snprintf(s_slot_line, sizeof(s_slot_line), "CTRL clock was lost or not yet set (its slot %.14s): slot named %.14s from this clock",
+    snprintf(s_slot_line, sizeof(s_slot_line), "CTRL clock lost (slot %.14s): named %.14s by own clock",
              was[0] ? was : "none", telem->slot_time);
     storage_log_debug("ERROR", s_slot_line);
     return true;
@@ -1619,18 +1619,18 @@ static void __attribute__((noinline)) note_values_out_of_range(const telemetry_d
      * new TWS cable, 0.23 V, 2026-11-09). Sent as read. */
     if (telem->bat1_volt < BATTERY_SENSE_FAULT_V) {
         fmt_fixed(v, sizeof(v), telem->bat1_volt, 4, 2);
-        snprintf(s_slot_line, sizeof(s_slot_line), "Battery reads %s V: battery sense line broken or unplugged", v);
+        snprintf(s_slot_line, sizeof(s_slot_line), "Battery %s V: sense line broken?", v);
         storage_log_debug("ERROR", s_slot_line);
     }
 #if (UNIT_CFG != KSNDMC_TWS)
     if (telem->rf_15m_mm > SANE_RAIN_15M_MAX_MM) {
         fmt_fixed(v, sizeof(v), telem->rf_15m_mm, 5, 2);
-        snprintf(s_slot_line, sizeof(s_slot_line), "15-min rain %s mm is beyond any real rain: check the gauge and CTRL", v);
+        snprintf(s_slot_line, sizeof(s_slot_line), "15-min rain %s mm impossible: check gauge", v);
         storage_log_debug("ERROR", s_slot_line);
     }
 #else
     if (tws_th_missing(telem)) {
-        storage_log_debug("ERROR", "No temperature/humidity reading: slot not sent. Check the sensor and its cable");
+        storage_log_debug("ERROR", "No temp/humidity: slot not sent, check sensor");
     }
 #endif
 }
@@ -1643,7 +1643,7 @@ static void __attribute__((noinline)) limit_wind_speed(telemetry_data_t *telem)
     if (telem->wind_speed_avg > WS_AVG_MAX_MPS) {
         char v[10];
         fmt_fixed(v, sizeof(v), telem->wind_speed_avg, 5, 1);
-        snprintf(s_slot_line, sizeof(s_slot_line), "Wind speed %s m/s for %.12s is beyond any real 15-min average: sent as 0.0. Check the supply and wind cable",
+        snprintf(s_slot_line, sizeof(s_slot_line), "Wind %s m/s for %.12s impossible: sent 0.0, check supply/cable",
                  v, telem->slot_time);
         storage_log_debug("ERROR", s_slot_line);
         telem->wind_speed_avg = 0.0f;
@@ -1692,8 +1692,8 @@ static void note_ctrl_clock(void)
         return;
     }
     s_noted = true;
-    storage_log_debug("ERROR", st == 1 ? "CTRL clock chip (RTC) not answering: CTRL keeps the time itself, about 1% accurate. Repair the RTC"
-                                       : "CTRL clock chip (RTC) not running: CTRL keeps the time itself, about 1% accurate. Repair the RTC");
+    storage_log_debug("ERROR", st == 1 ? "CTRL RTC not answering: soft clock (~1%), repair RTC"
+                                       : "CTRL RTC stopped: soft clock (~1%), repair RTC");
 }
 
 /* A slot that sends nothing (CTRL silent, or TWS with no temperature/humidity) still listens for SMS
@@ -1741,7 +1741,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
      * the slot's end, and the scheduler then found the slot due again): its record is not sent twice
      * (1922, 17 Nov: 13:30 and 15:15 records each sent twice) */
     if (slot_finished_on_card(slot_id)) {
-        snprintf(s_slot_line, sizeof(s_slot_line), "Slot %ld already finished before the restart: not sent again", (long)slot_id);
+        snprintf(s_slot_line, sizeof(s_slot_line), "Slot %ld finished before restart: not resent", (long)slot_id);
         storage_log_debug("SLOT", s_slot_line);
         ui_set_slot_busy(false);
         if (!ui_is_display_active() && !ui_is_operator_touched()) {
@@ -1782,7 +1782,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     if (elapsed_sec < SLOT_HOLD_GUARD_SEC) {
         int wait_sec = SLOT_HOLD_GUARD_SEC - elapsed_sec;
         /* Build 12: was "for sensors"; the record was closed at the boundary, the wait is the server's */
-        snprintf(s_slot_line, sizeof(s_slot_line), "Slot boundary reached, holding %ds (server takes records from +%ds)", wait_sec, SLOT_HOLD_GUARD_SEC);
+        snprintf(s_slot_line, sizeof(s_slot_line), "Holding %ds (server takes from +%ds)", wait_sec, SLOT_HOLD_GUARD_SEC);
         storage_log_debug("SLOT", s_slot_line);
         for (int w = 0; w < wait_sec; w++) {
             wd_checkin();
@@ -1803,7 +1803,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         telem->humidity_pct = telem->live_humidity_pct;
         telem->wind_speed_avg = telem->live_wind_speed;
         telem->wind_dir_deg = telem->live_wind_dir_deg;
-        storage_log_debug("SLOT", "CTRL has no record for this slot: its live readings are used");
+        storage_log_debug("SLOT", "No CTRL record: live readings used");
     }
     limit_wind_speed(telem);
 #else
@@ -1890,7 +1890,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
     /* If station was woken in unattended sentry mode AND display is not active:
      * enter sleep. If operator is browsing or display is active, stay awake! */
     if (!ui_is_display_active() && !ui_is_operator_touched()) {
-        storage_log_debug("PWR", "Unattended slot transmission complete -> entering sleep");
+        storage_log_debug("PWR", "Slot done -> sleep");
         if (fw_app_trial_unconfirmed()) {
             ui_sleep_when_confirmed();  /* Refused below: retried once the firmware is confirmed (v6.9.59) */
         }
@@ -1921,11 +1921,11 @@ static void __attribute__((noinline)) log_boot_header(void)
              (s_reset_reason == 0) ? " SOFTWARE" : "");
     storage_log_debug("BOOT", boot_info);
     if (flash_nvram_init_state() == NVRAM_ID_RECOVERED) {
-        snprintf(boot_info, sizeof(boot_info), "Settings sector was blank (power lost while saving?): station ID %s taken from the newest record",
+        snprintf(boot_info, sizeof(boot_info), "Settings blank: station ID %s from newest record",
                  flash_nvram_get_station_id());
         storage_log_debug("ERROR", boot_info);
     } else if (flash_nvram_init_state() == NVRAM_ID_LOST) {
-        snprintf(boot_info, sizeof(boot_info), "Settings sector was blank and no record holds a station ID: running as %s, set the ID",
+        snprintf(boot_info, sizeof(boot_info), "Settings blank, no ID in records: running as %s, set ID",
                  flash_nvram_get_station_id());
         storage_log_debug("ERROR", boot_info);
     }
@@ -2063,7 +2063,7 @@ static void vMain_Task(void *pvParameters)
                 /* No valid clock: let the modem supervisor try to get network time */
                 if (!s_waiting_for_clock) {
                     s_waiting_for_clock = true;
-                    storage_log_debug("ERROR", "Scheduled wake but clock is invalid: slot cannot run yet");
+                    storage_log_debug("ERROR", "Scheduled wake, clock invalid: slot waits");
                 }
                 if (clock_wait_is_over()) {
                     if (!s_gps_time_tried) {

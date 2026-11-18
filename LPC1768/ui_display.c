@@ -642,7 +642,9 @@ static void vGps_Task(void *pvParameters)
                 default:                gps_status_set("NO FIX"); break;
                 }
             }
-            if (s_gps_send_sms) {
+            if (sim7600_is_cancel_requested()) {
+                gps_status_set("GPS STOPPED");  /* v6.9.63: power save asked during the job */
+            } else if (s_gps_send_sms) {
                 /* F: asked from the field (keypad), saved or fresh. C is for office queries by SMS */
                 static telemetry_data_t t;      /* GPS task stack is short */
                 memset(&t, 0, sizeof(t));
@@ -833,7 +835,7 @@ static void vFwUpdate_Task(void *pvParameters)
         } else if (!fw_ctrl_query(&state)) {
             /* No CTRL bootloader (a replaced board, blank or old firmware): it goes on through the
              * LPC845's ROM loader with JP1 + JP2 fitted, at the next boot (ctrl_isp.c) */
-            storage_log_debug("FW", "CTRL chip doesn't answer: offering the ROM loader route (JP1+JP2)");
+            storage_log_debug("FW", "CTRL silent: offering ROM loader (JP1+JP2)");
             fw_show(FW_UI_CONFIRM_ISP, "NO CTRL BOOTLDR", "FIT JP1+JP2, EN");
         } else if (state.state == FW_J_TRIAL_BOOT) {
             fw_show(FW_UI_MESSAGE, "CTRL ON TRIAL", "TRY AGAIN SOON");
@@ -849,7 +851,7 @@ static void vFwUpdate_Task(void *pvParameters)
     case FW_OP_CTRL_ISP: {
         /* Done at the next boot, before the RTOS starts (ctrl_isp.c) */
         char msg[80];
-        snprintf(msg, sizeof(msg), "CTRL bootloader + %s by the ROM loader: restarting to do it", s_fw_info.version);
+        snprintf(msg, sizeof(msg), "CTRL boot + %s by ROM loader: restarting", s_fw_info.version);
         ctrl_isp_request(s_fw_info.crc32);
         fw_restart_for_install(msg);
         break;
@@ -859,7 +861,7 @@ static void vFwUpdate_Task(void *pvParameters)
         if (r == FW_OK) {
             fw_show(FW_UI_BUSY, "INSTALLING CTRL", "DO NOT POWER OFF");
             strncpy(s_status_sms_substep, "DO NOT POWER OFF", sizeof(s_status_sms_substep) - 1);
-            storage_log_debug("FW", "New CTRL firmware sent and checked, restarting it to install");
+            storage_log_debug("FW", "CTRL firmware sent and checked: restarting CTRL");
             storage_log_flush();
             fw_ctrl_restart_lpc845();
             /* The LPC845 cuts this chip's power as it restarts. If that hasn't happened, restart
@@ -1390,6 +1392,7 @@ static void vKbd_Task(void *pvParameters)
 
     for (;;) {
         vTaskDelay(50 / portTICK_RATE_MS); /* Scan interval from v6.1.9 */
+        wd_checkin();   /* v6.9.63: watched like the other tasks (30 s) */
 
         /* Keep scanning during a scheduled wake with the LCD off: any key turns the LCD on */
         if (s_system_asleep) {
@@ -1513,7 +1516,12 @@ void ui_display_init(void)
     /* Spawn dedicated Keypad Task (Priority 3, 160 words stack) */
     static xTaskHandle s_kbd_task_handle = NULL;
     if (s_kbd_task_handle == NULL) {
-        xTaskCreate(vKbd_Task, (const signed char *)"KbdTask", 160, NULL, 3, &s_kbd_task_handle);
+        if (xTaskCreate(vKbd_Task, (const signed char *)"KbdTask", 160, NULL, 3, &s_kbd_task_handle) == pdPASS) {
+            wd_register(WD_KBD, s_kbd_task_handle);
+        } else {
+            s_kbd_task_handle = NULL;
+            storage_log_debug("ERROR", "No memory for keypad task: keypad dead");
+        }
     }
 
     telemetry_data_t telem;
@@ -1544,28 +1552,45 @@ void ui_sleep_when_confirmed(void)
     s_sleep_after_confirm = true;
 }
 
+/* v6.9.63: what stops a power-off right now, as 16 LCD characters, or NULL if nothing does. One list
+ * for the keypad, the deferred power save and ui_enter_sleep: EN on POWER SAVE during SEND GPS used
+ * to be refused with nothing on the LCD and "slot is due" in the log (1922, 18 Nov). */
+static const char *sleep_blocker(bool with_modem)
+{
+    if (s_fw_running || s_fw_ui == FW_UI_BUSY) return "UPDATE RUNNING  ";
+    if (s_slot_busy || slot_scheduler_is_due()) return "SENDING DATA... ";
+    if (fw_app_trial_unconfirmed())            return "CHECKING NEW F/W";
+    if (s_gps_running)                         return "STOPPING GPS... ";
+    if (s_status_sms_state == STATUS_UI_SENDING) return "STOPPING SMS... ";
+    if (s_sms_task_handle != NULL)             return "FINISHING JOB...";
+    if (data_erase_pending())                  return "ERASING DATA... ";
+    if (with_modem && sim7600_is_busy())       return "MODEM BUSY...   ";
+    return NULL;
+}
+
 void ui_enter_sleep(void)
 {
     if (s_system_asleep) {
         return;
     }
 
-    /* Never power down over a 15-minute slot, with GPS searching, or before new firmware is confirmed */
-    if (s_slot_busy || s_gps_running || s_fw_running || slot_scheduler_is_due() || fw_app_trial_unconfirmed()) {
-        storage_log_debug("PWR", fw_app_trial_unconfirmed() ? "Sleep refused: new firmware not yet confirmed"
-                                                            : "Sleep refused: 15-minute slot is due or running");
+    /* Never power down over a 15-minute slot, a job (GPS, SMS, update), an erase, or before new firmware
+     * is confirmed. v6.9.63: the reason is logged as it is, and the power save waits for it (it was
+     * dropped when GPS or an update was running). */
+    const char *blocker = sleep_blocker(false);  /* A held modem is waited for at step 6, as before */
+    if (blocker) {
+        static char msg[48];
+        snprintf(msg, sizeof(msg), "Sleep waits: %.16s", blocker);
+        storage_log_debug("PWR", msg);
         s_inactivity_ticks = 0;
+        if (!s_fw_running && s_fw_ui != FW_UI_BUSY) {
+            s_sleep_deferred = true;
+        }
         return;
     }
-    /* An ERASE_DATA heard with the LCD on is done by the main task within a second (slots run only
-     * there, so it can't overlap one): power stays on until then (review, v6.9.52) */
-    if (data_erase_pending()) {
-        s_sleep_deferred = true;
-        return;
-    }
-
+    /* An ERASE_DATA heard with the LCD on (review, v6.9.52) is in sleep_blocker() since v6.9.63 */
     bool was_display_active = s_display_active;
-    storage_log_debug("PWR", "Entering sleep: shutting down UI, modem, and sending $f7;");
+    storage_log_debug("PWR", "Entering sleep: UI, modem off, $f7");
 
     /* 1. Mark system and display asleep */
     s_system_asleep = true;
@@ -1639,7 +1664,7 @@ void ui_enter_sleep(void)
         return;
     }
     if (slot_scheduler_is_due()) {
-        storage_log_debug("PWR", "Slot came due during shutdown: restarting instead of sleeping");
+        storage_log_debug("PWR", "Slot due during shutdown: restarting");
         storage_log_flush();
         NVIC_SystemReset();
     }
@@ -1678,7 +1703,7 @@ void ui_enter_sleep(void)
         since_f7_ms += 200;
         if (since_f7_ms >= 10000 && f7_resends < 3 && slot_scheduler_is_due()) {
             /* A slot came due while still powered: run it instead of cutting power under it */
-            storage_log_debug("PWR", "Still powered after $f7 and a slot is due: restarting to run it");
+            storage_log_debug("PWR", "On after $f7, slot due: restarting");
             storage_log_flush();
             NVIC_SystemReset();
         }
@@ -1984,23 +2009,31 @@ static bool ui_cursor_mode(void)
     return s_ui_mode == UI_MODE_EDIT_STN_ID || s_ui_mode == UI_MODE_EDIT_TIME;
 }
 
-/* Operator asked for power save: if a slot is running, power down once it has finished */
+/* Operator asked for power save. v6.9.63: whatever is busy is named on the LCD (EN used to do nothing
+ * during SEND GPS), a GPS search or status SMS is stopped, and power goes off once it is all done. */
 static void request_power_save(void)
 {
-    if (s_slot_busy || slot_scheduler_is_due() || fw_app_trial_unconfirmed()) {
-        bool trial = fw_app_trial_unconfirmed() && !s_slot_busy && !slot_scheduler_is_due();
-        storage_log_debug("PWR", trial ? "Power save deferred until the new firmware is confirmed"
-                                       : "Power save deferred until 15-minute slot finishes");
-        s_sleep_deferred = true;
-        lcd_command(0x80);
-        lcd_print(trial ? "CHECKING NEW F/W" : "SENDING DATA... ");
-        lcd_command(0xC0);
-        lcd_print("SLEEP WHEN DONE ");
-        vTaskDelay(1500 / portTICK_RATE_MS);
-        s_force_redraw = true;
-    } else {
+    const char *blocker = sleep_blocker(true);
+    if (blocker == NULL) {
         ui_enter_sleep();
+        return;
     }
+    if (s_gps_running || s_status_sms_state == STATUS_UI_SENDING) {
+        sim7600_request_cancel();
+    }
+    static char msg[48];
+    snprintf(msg, sizeof(msg), "Power save waits: %.16s", blocker);
+    storage_log_debug("PWR", msg);
+    const bool update = s_fw_running || s_fw_ui == FW_UI_BUSY;
+    if (!update) {
+        s_sleep_deferred = true;    /* An update ends in a restart: nothing to wait for */
+    }
+    lcd_command(0x80);
+    lcd_print(blocker);
+    lcd_command(0xC0);
+    lcd_print(update ? "PLEASE WAIT     " : "SLEEP WHEN DONE ");
+    vTaskDelay(1500 / portTICK_RATE_MS);
+    s_force_redraw = true;
 }
 
 static void calib_start(void)
@@ -2175,6 +2208,27 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
     }
     fw_start_waiting_job();
 
+    /* v6.9.63: an unattended wake still on at UNATTENDED_MAX_ON_SEC is stuck somewhere that keeps
+     * checking in (or the power-off is put off for ever): power goes off anyway, $f7 every 10 s. Not
+     * once someone has touched a key; the UI's own time-outs cover that. The modem loses power without
+     * AT+CPOF, which it survives; the record of the slot was saved before any send. */
+    if (s_scheduled_boot && !s_display_active && !s_operator_touched_key) {
+        static portTickType s_forced_off_tick = 0;
+        const portTickType now = xTaskGetTickCount();
+        if (now >= (portTickType)UNATTENDED_MAX_ON_SEC * configTICK_RATE_HZ &&
+            (s_forced_off_tick == 0 || (now - s_forced_off_tick) >= 10 * configTICK_RATE_HZ)) {
+            if (s_forced_off_tick == 0) {
+                storage_log_debug("ERROR", "Unattended wake on 13 min: forced off");
+                vTaskDelay(1500 / portTICK_RATE_MS);    /* For the error log's flash copy */
+                storage_log_flush();
+                storage_power_off_mark();
+                vTaskDelay(SD_SETTLE_BEFORE_POWER_OFF_MS / portTICK_RATE_MS);
+            }
+            s_forced_off_tick = now;
+            hal_power_sleep_system();
+        }
+    }
+
     /* Boot type comes from the LCD rail in the LPC845's first status frame. Its slot wake
      * leaves the LCD off; a DSP wake or first power-up has it on. */
     if (!s_boot_mode_known) {
@@ -2189,7 +2243,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
             lcd_init_hw();
             s_boot_mode_known = true;
         } else if (++s_boot_wait_ticks >= (3 * 20)) {
-            storage_log_debug("ERROR", "No status from CTRL after 3s: assuming OPERATOR boot, check UART3 link");
+            storage_log_debug("ERROR", "No CTRL status in 3s: OPERATOR boot assumed, check link");
             hal_power_lcd_on();
             lcd_init_hw();
             s_boot_mode_known = true;
@@ -2200,12 +2254,12 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
     /* Operator-requested power save, deferred while a slot was running. v6.9.55: and while the modem is
      * held (an SMS send waiting on the network): tried every 50 ms, it logged "Entering sleep" 340
      * times in 18 s and filled the log buffer (001903, 14 Nov 08:23) */
-    if (s_sleep_deferred && !s_slot_busy && !sim7600_is_busy() && !slot_scheduler_is_due() && !fw_app_trial_unconfirmed()) {
+    if (s_sleep_deferred && sleep_blocker(true) == NULL) {    /* v6.9.63: every blocker, GPS and jobs too */
         s_sleep_deferred = false;
         ui_enter_sleep();
         return;
     }
-    if (s_sleep_after_confirm && !s_slot_busy && !sim7600_is_busy() && !slot_scheduler_is_due() && !fw_app_trial_unconfirmed()) {
+    if (s_sleep_after_confirm && sleep_blocker(true) == NULL) {
         s_sleep_after_confirm = false;
         if (!s_display_active && !s_operator_touched_key) {
             storage_log_debug("PWR", "New firmware confirmed: entering sleep");
@@ -2367,7 +2421,7 @@ void ui_display_task_step(const telemetry_data_t *telemetry, const modem_status_
                 }
             } else if (key == KEY_LEFT) {
                 extern volatile int g_test_cut_after_erase;
-                storage_log_debug("TEST", "Cutting power between erasing and rewriting the settings sector");
+                storage_log_debug("TEST", "Power cut mid settings write (test)");
                 vTaskDelay(2000 / portTICK_RATE_MS);
                 g_test_cut_after_erase = 1;
                 flash_nvram_set_station_id(flash_nvram_get_station_id());

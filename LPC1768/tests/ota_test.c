@@ -10,6 +10,8 @@
 #include "storage_log.h"
 #include "flash_nvram.h"
 #include "fw_update.h"
+#include "fw_ctrl.h"
+#include "boot/fw_journal.h"
 #include "fw_app.h"
 #include "hal_power.h"
 #include "FreeRTOS.h"
@@ -32,6 +34,7 @@ static void set_clock(int minute, int second) { s_minute = minute; s_second = se
 
 /* ---- unit ---- */
 static float s_battery = 12.6f;
+static float s_rain_live = 0.0f;     /* v6.9.63: rain so far in this slot (CTRL install waits for none) */
 static uint32_t s_running = 0x11111111UL;
 static bool s_trial = false, s_sd_ok = true;
 static uint32_t s_backlog = 0;
@@ -42,10 +45,30 @@ bool intermcu_get_telemetry(telemetry_data_t *out)
     uint32_t sec = (uint32_t)s_minute * 60U + (uint32_t)s_second + (s_tick - s_tick_base) / 1000U;
     snprintf(out->present_time, sizeof(out->present_time), "2026111713%02u%02u", (unsigned)((sec / 60U) % 60U), (unsigned)(sec % 60U));
     out->bat1_volt = s_battery;
+    out->rf_live_15m_mm = s_rain_live;
     return true;
 }
 const char *flash_nvram_get_station_id(void) { return s_station; }
 uint32_t fw_app_running_crc(void) { return s_running; }
+/* ---- v6.9.63: the CTRL ---- */
+static uint32_t s_ctrl_crc = 0x33333333UL;
+static bool s_ctrl_answers = true, s_ctrl_trial = false;
+static fw_result_t s_ctrl_send_result = FW_OK;
+static int s_ctrl_sent = 0, s_ctrl_restarts = 0, s_ctrl_checked = 0;
+uint32_t fw_app_ctrl_crc(void) { return s_ctrl_crc; }
+bool fw_ctrl_query(fw_ctrl_state_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->state = s_ctrl_trial ? FW_J_TRIAL_BOOT : FW_J_CONFIRMED; out->crc32 = s_ctrl_crc;
+    return s_ctrl_answers;
+}
+fw_result_t fw_ctrl_send_image(const char *name, const fw_file_info_t *checked, fw_progress_fn progress)
+{
+    (void)name; (void)checked; progress("SEND", 10);
+    s_ctrl_sent++; s_tick += 70000;
+    return s_ctrl_send_result;
+}
+void fw_ctrl_restart_lpc845(void) { s_ctrl_restarts++; }
 bool fw_app_trial_unconfirmed(void) { return s_trial; }
 void wd_checkin(void) {}
 void hal_power_heartbeat(void) {}
@@ -165,9 +188,14 @@ fw_result_t fw_update_stage(const char *name, const fw_file_info_t *checked, fw_
     return FW_OK;
 }
 const char *fw_update_error_text(fw_result_t r) { (void)r; return "TEST ERROR"; }
+fw_result_t fw_ctrl_check(const char *name, fw_file_info_t *info, fw_progress_fn progress)
+{
+    s_ctrl_checked++;
+    return fw_update_check(name, 0, info, progress);    /* Same pretend file check */
+}
 
 /* ---- server and modem ---- */
-static enum { SRV_NONE, SRV_OFFER } s_server = SRV_NONE;
+static enum { SRV_NONE, SRV_OFFER, SRV_CTRL } s_server = SRV_NONE;
 static bool s_server_dead = false;
 static int s_get_calls = 0, s_check_calls = 0, s_piece_calls = 0, s_closes = 0;
 static char s_last_check[512];
@@ -182,7 +210,7 @@ const char *sim7600_http_get(const char *host, uint16_t port, const char *path, 
     CHECK(!strcmp(host, s_files[0].used && file_find("OTASRV.DAT") >= 0 ? "10.1.2.3" : OTA_SERVER_HOST));
     CHECK(port == (file_find("OTASRV.DAT") >= 0 ? 8080 : 80));
     CHECK(s_open < 0 || strncmp(path, "/lpc/check", 10));
-    CHECK(strlen(path) < 400);
+    CHECK(strlen(path) < 440);
     s_get_calls++;
     *len = 0; *status = 0;
     if (s_server_dead) { s_tick += 15000; return NULL; }
@@ -191,6 +219,7 @@ const char *sim7600_http_get(const char *host, uint16_t port, const char *path, 
         snprintf(s_last_check, sizeof(s_last_check), "%s", path);
         s_tick += 1500;
         if (s_server == SRV_OFFER) snprintf(s_reply, sizeof(s_reply), "OTA FW %lu %08lX %08lX\n", (unsigned long)s_fw_size, (unsigned long)s_fw_file_crc, (unsigned long)s_fw_image_crc);
+        else if (s_server == SRV_CTRL) snprintf(s_reply, sizeof(s_reply), "OTA CTRL %lu %08lX %08lX\n", (unsigned long)s_fw_size, (unsigned long)s_fw_file_crc, (unsigned long)s_fw_image_crc);
         else snprintf(s_reply, sizeof(s_reply), "OTA NONE\n");
         *status = 200; *len = (int)strlen(s_reply);
         return s_reply;
@@ -253,6 +282,8 @@ static void fresh(void)
     s_fault_every = 0; s_fault_kind = 0; s_all_pieces_bad = false; s_gone = false; s_piece_ms = 500;
     s_health_built = s_health_sent = 0; s_health_pending = 99;
     s_checked = s_staged = s_resets = 0; s_check_result = FW_OK; s_lowest_offset = 0xFFFFFFFFUL; s_last_check[0] = 0;
+    s_ctrl_crc = 0x33333333UL; s_ctrl_answers = true; s_ctrl_trial = false; s_ctrl_send_result = FW_OK;
+    s_ctrl_sent = s_ctrl_restarts = s_ctrl_checked = 0; s_rain_live = 0.0f;
 }
 static void new_firmware(uint32_t size, unsigned seed)
 {
@@ -493,6 +524,58 @@ int main(void)
     CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 1 && file_find(OTA_RETRY_FILENAME) >= 0);
     s_tick += 900000; set_clock(16, 10); CHECK(!step(DAILY + 2));
     s_tick += 900000; set_clock(31, 10); CHECK(!step(DAILY + 3)); CHECK(s_get_calls == 3 && file_find(OTA_RETRY_FILENAME) < 0);
+
+    /* 16. v6.9.63: CTRL by OTA. The check says what the CTRL runs (cc), between p and v */
+    fresh(); CHECK(!step(DAILY)); CHECK(strstr(s_last_check, "&cc=33333333&v=") && strstr(s_last_check, "id=001922&p="));
+    /* A clean CTRL download and install: file to the card, sent to the CTRL, CTRL restarted, phase i */
+    fresh(); s_server = SRV_CTRL;
+    CHECK(step(DAILY));
+    CHECK(card_has_whole_file() && s_ctrl_checked == 1 && s_ctrl_sent == 1 && s_ctrl_restarts == 1 && s_staged == 0 && phase() == 'i');
+    CHECK(strstr(s_last_check, "&s=0&t=00000000"));
+    /* Next slot: the CTRL runs it, said once, then quiet */
+    s_ctrl_crc = s_fw_image_crc; s_server = SRV_NONE; s_tick += 900000; set_clock(16, 10);
+    CHECK(!step(DAILY + 1)); CHECK(s_check_calls == 2 && strstr(s_last_check, "&cc=22220001&") && phase() == '-');
+    CHECK(strstr(s_log, "new CTRL firmware is running") && file_find(OTA_FILE_FILENAME) < 0);
+    CHECK(!step(DAILY + 2)); CHECK(s_check_calls == 2);
+    /* The CTRL went back to its old firmware: said with s=3, never taken again */
+    fresh(); s_server = SRV_CTRL; CHECK(step(DAILY));
+    s_tick += 900000; set_clock(16, 10);
+    CHECK(!step(DAILY + 1)); CHECK(phase() == 'f' && strstr(s_last_check, "&s=3&t=22220001") && strstr(s_log, "failed here before"));
+    CHECK(s_ctrl_sent == 1);
+    /* CTRL's running image not known yet after the restart: the report waits for it */
+    fresh(); s_server = SRV_CTRL; CHECK(step(DAILY)); s_ctrl_crc = 0; s_server = SRV_NONE;
+    s_tick += 900000; set_clock(16, 10);
+    CHECK(!step(DAILY + 1)); CHECK(phase() == 'i');
+    s_ctrl_crc = s_fw_image_crc; s_tick += 900000; set_clock(31, 10);
+    CHECK(!step(DAILY + 2)); CHECK(phase() == '-');
+    /* Raining: the whole file waits on the card, installed at the next dry slot without fetching again */
+    fresh(); s_server = SRV_CTRL; s_rain_live = 0.5f;
+    CHECK(!step(DAILY)); CHECK(card_has_whole_file() && s_ctrl_sent == 0 && phase() == 'd' && strstr(s_log, "raining"));
+    pieces = s_piece_calls; s_rain_live = 0.0f; s_tick += 900000; set_clock(16, 10);
+    CHECK(step(DAILY + 1)); CHECK(s_ctrl_sent == 1 && s_piece_calls == pieces && phase() == 'i');
+    /* CTRL on trial: put off. CTRL without a bootloader: not taken */
+    fresh(); s_server = SRV_CTRL; s_ctrl_trial = true;
+    CHECK(!step(DAILY)); CHECK(s_ctrl_sent == 0 && phase() == 'd');
+    fresh(); s_server = SRV_CTRL; s_ctrl_answers = false;
+    CHECK(!step(DAILY)); CHECK(s_ctrl_sent == 0 && phase() == 'f' && file_find(OTA_FILE_FILENAME) < 0);
+    /* The link failed while sending: fetched again at a later check, not marked failed */
+    fresh(); s_server = SRV_CTRL; s_ctrl_send_result = FW_E_LINK;
+    CHECK(!step(DAILY)); CHECK(s_ctrl_restarts == 0 && phase() == '-' && file_find(OTA_FILE_FILENAME) < 0);
+    /* The CTRL refused the file: not taken again */
+    fresh(); s_server = SRV_CTRL; s_ctrl_send_result = FW_E_BAD_CRC;
+    CHECK(!step(DAILY)); CHECK(s_ctrl_restarts == 0 && phase() == 'f');
+    /* Offer of what the CTRL already runs, or with the CTRL's image not known: ignored */
+    fresh(); s_server = SRV_CTRL; s_ctrl_crc = s_fw_image_crc;
+    CHECK(!step(DAILY)); CHECK(s_piece_calls == 0 && phase() == '?');
+    fresh(); s_server = SRV_CTRL; s_ctrl_crc = 0;
+    CHECK(!step(DAILY)); CHECK(s_piece_calls == 0 && strstr(s_last_check, "&cc=00000000&"));
+    /* A main-board download under way, then a CTRL offer: the main file is dropped, the CTRL one fetched */
+    fresh(); s_server = SRV_OFFER; s_piece_ms = 4000;
+    CHECK(!step(DAILY)); CHECK(phase() == 'D');
+    s_server = SRV_CTRL; s_piece_ms = 300; s_tick += 400000; set_clock(16, 10); s_lowest_offset = 0xFFFFFFFFUL;
+    new_firmware(60000, 4);
+    CHECK(step(DAILY + 1)); CHECK(s_lowest_offset == 0 && card_has_whole_file() && phase() == 'i' && s_staged == 0);
+    new_firmware(340936, 1);
 
     /* No SD card on the daily slot: said */
     fresh(); s_sd_ok = false; CHECK(!step(DAILY)); CHECK(strstr(s_log, "SD card is not working"));

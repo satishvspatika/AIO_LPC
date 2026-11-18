@@ -306,8 +306,8 @@ versions, named as the two updates: `MAIN  v6.9.13` / `CTRL  845-v1.5`. The LPC8
 
 ### 7.4 Time
 
-The server's `Date:` header is checked on every delivered record and the RTC corrected if it is 90 s or more off
-(45 s after a refused record). Tower time (`CCLK`) is used only if the RTC has no valid time; GPS also corrects it on
+The server's `Date:` header is checked on every delivered record and the RTC corrected if it is 20 s or more off
+(15 s after a refused record; v6.9.63, was 90 s and 45 s: a clock 60-89 s fast sent before the server's +62 s). Tower time (`CCLK`) is used only if the RTC has no valid time; GPS also corrects it on
 a good fix. With no valid clock a scheduled wake gives up after 3 minutes, or 2 with no network (v6.9.4). The bench
 unit's clock reads 6-8 s behind the server and the Mac.
 
@@ -515,6 +515,23 @@ the failing step and the modem's reply go into the `OTA:` log line; a failed dai
 install the unit powers off once the new firmware is confirmed (it stayed on to the next slot), and a slot that
 `LASTSLOT.DAT` shows finished is not sent again after the install restart. Proven by OTA on 2G, 16:45.
 
+**v6.9.63: CTRL firmware by OTA.** The check also says what the CTRL runs (`&cc=<image CRC>`, between `p` and `v`;
+`00000000` until the CTRL has answered this boot). The server may answer `OTA CTRL <file bytes> <file CRC> <image
+CRC>`, the same form as `OTA FW`, but only when no main-board update is waiting for that station. The file is
+`ctrl.hex`, fetched exactly as a main file (same pieces, `OTA.TMP`, resume). OTA.DAT uses lower-case phases for it
+(`d`, `i`, `f`); `s` and `t` cover it, and the server tells the two apart by the CRC. Install (`ota_install_ctrl`,
+at the end of the slot, 300 s to the next): no rain in this slot or the one before (the CTRL counts nothing for the
+~10 s it installs), the file checked as CTRL F/W checks `ctrl.hex` and its image CRC the one offered, the CTRL
+asked (`$UQ`) and not on trial, then sent with the code of MENU > FIRMWARE UPDATE > CTRL (about 70 s), phase `i`,
+`$UR`. The CTRL restarts into it and powers this board up (`woke=B`), which confirms it (`$UC`, fw_app.c) as after a
+keypad update; its bootloader puts the old one back after 3 failed trial starts. The next check: CTRL running the
+image, `-` and reported; else `f` (never taken again; another build is). A CTRL with no bootloader: `f`. A link
+failure while sending: the file is dropped and fetched again at a later check (at most twice a day), not `f`.
+Office page: `ctrl.hex` uploads as "CTRL, every type"; it can be chosen in Send an update (ticked stations, or
+every station of the type as they are now) or per station (CTRL firmware: Gets); stations list and page show its
+state. Host test `tests/ota_test.c` section 16 (mutation-checked); local server run: download identical, success,
+failure, main first.
+
 ### 7.7 Health report (v6.9.60, `health.c`; office side in `ota_server/lpc_ota.py`)
 
 The report rides on the OTA check: the same `GET /lpc/check`, with more short fields after the update ones.
@@ -641,9 +658,11 @@ With no card and no network, the oldest records are overwritten after about 6.5 
 |---|---|---|
 | Crash (hard fault) | Location saved in RTC registers (task stacks in AHB SRAM accepted since v6.9.11), restart, logged at boot | Restart at once (845-v1.2) |
 | Stack overflow | FreeRTOS check on every task switch; task name saved, restart, logged (v6.9.8) | Pattern at the stack's edge checked every 100 ms (845-v1.2) |
-| Task stops responding | Main, UI and Modem check in; a task silent for 360 / 60 / 180 s is logged, then restart (v6.9.9) | Main loop must feed the watchdog |
-| Everything stops | 60 s hardware watchdog, fed only by the disk task | 60 s watchdog once running normally; 5.3 min on a firmware trial |
+| Task stops responding | Main, UI, Modem and (v6.9.63) Keypad check in; a task silent for 360 / 60 / 180 / 30 s is logged, then restart (v6.9.9) | Main loop must feed the watchdog |
+| Everything stops | 60 s hardware watchdog, fed only by the disk task | 60 s watchdog once running normally; 5.3 min on a firmware trial. CTRL v1.17: fed only while the 1 ms tick still counts, so a stopped tick (rain debounce, clock read and heartbeat cut all stop with it) restarts the chip |
 | LPC1768 hangs with power on | LPC845 cuts all power after 11 min with no heartbeat | |
+| Unattended wake never ends (v6.9.63) | The main loop sends the heartbeat whatever it is doing, so the 11-minute cut can't catch it. A slot wake with the LCD off and no key pressed that is still on at `UNATTENDED_MAX_ON_SEC` (780 s, +13:40 after the boundary) logs ERROR and sends `$f7` every 10 s (UI task) | |
+| Operator asks for power save while busy (v6.9.63) | `sleep_blocker()` names what is busy on the LCD (`STOPPING GPS...`, `SENDING DATA...`, `UPDATE RUNNING` etc.); a GPS search or status SMS is cancelled, and power goes off when it is done. EN during SEND GPS used to do nothing (1922, 18 Nov) | |
 | Repeated fault restarts | After 3 in a row, powers off until the next slot (v6.9.9) | |
 | Restart loses rain | | Slot tips, day total and its rain day kept in `.noinit` across crash, watchdog and update restarts (845-v1.3). Power loss falls back to `$T` |
 | LPC845 silent | No record made (no zeros); slot filled later | |
@@ -822,6 +841,9 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | LPC845 clock set back across a boundary | A server correction of 90 s or more across xx:00/15/30/45 runs that boundary twice: the stored 15-min sample keeps only the second part (CUM_RF stays right). Rare; not fixed |
 | LPC845 I2C0 jams while the modem is on | Recovered by 845-v1.5. Hardware cause (noise or supply dip on the RTC bus) worth a look on the next board |
 | RTC coin cell | Can't be measured on this board; firmware can only detect a stop. ADC link proposed for the next board |
+| Old 4G registration taken in 2G-only mode | Fixed in v6.9.63 (1922, 18 Nov 11:31): "straight to 2G" set CNMP=13, then the LTE `+CEREG: 0,1` the modem booted with was taken as LTE at once; data took 17 s while the radio changed and the plan learned 4G works. In 2G-only mode CEREG is now ignored and CGREG counts only once COPS shows the modem off LTE |
+| First `AT+CGACT` wait | v6.9.63: 12 s (was 25 s). 1922, 18 Nov 09:16 on 2G: no answer in 25 s, the retry OK in under 1 s. The second try keeps 25 s. Check on the next card: how often a first try took over 12 s and still succeeded |
+| Flash | v6.9.63 (with CTRL by OTA, after shortening 77 long log lines, about 2.1 KB): BIHAR 130,148 of 131,072 bytes (924 spare), KSNDMC_TRG 129,844, KSNDMC_TWS 129,600. About 25 KB of the image is text strings: the next room comes from there |
 
 ---
 

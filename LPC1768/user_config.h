@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.62"
+#define FIRMWARE_VERSION "v6.9.63"
 
 /* THE production switch. 1 = field build:
  *   - MENU > KEY TEST hidden (and TEST SEND can't be switched on)
@@ -213,6 +213,12 @@
  * it. The modem needs 16-18 s to answer and 20-27 s to register, and the server takes records from
  * +62 s: 40 s cuts the idle hold from 26 s to about 16 s. The CTRL accepts 10-55 s. */
 #define SLOT_WAKE_DELAY_SEC     40
+
+/* v6.9.63: longest an unattended wake (slot wake, LCD off, no key pressed) may stay on. The main loop
+ * sends the CTRL heartbeat whatever it is doing, so the CTRL's 11-minute cut can't catch a wake that
+ * never ends. Everything a slot does ends well before this: sends stop at 300 s, OTA pieces 330 s
+ * before the next slot. From the wake at +40 s, 780 s is +13:40, before the next boundary. */
+#define UNATTENDED_MAX_ON_SEC   780
 
 /* GPS position (SIM7600 AT+CGPS). It only runs while the modem is already on for a slot, after
  * the record has gone out. */

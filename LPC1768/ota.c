@@ -13,6 +13,10 @@
  * OTA.DAT on the card: "<file crc> <image crc> <file bytes> <phase>", phase being
  *   D  downloading that file            I  install started for that image
  *   F  that image did not stay (rolled back), or its file was refused: not taken again
+ * and the same in lower case (d, i, f) for a CTRL file (v6.9.63, "OTA CTRL" answer): it is sent to the
+ * CTRL by the code of MENU > FIRMWARE UPDATE > CTRL (fw_ctrl.c), whose bootloader tries it and goes
+ * back to the old one if it doesn't run. One download at a time; the server offers the main board's
+ * first.
  */
 #include "ota.h"
 #include "health.h"
@@ -21,6 +25,8 @@
 #include "storage_log.h"
 #include "flash_nvram.h"
 #include "fw_update.h"
+#include "fw_ctrl.h"
+#include "boot/fw_journal.h"
 #include "fw_app.h"
 #include "hal_power.h"
 #include "intermcu_protocol.h"
@@ -45,7 +51,7 @@ typedef struct {
 
 /* Static: this runs on the main task's stack, under the slot */
 static char s_text[176];   /* v6.9.57: room for the modem's reason */
-static char s_path[400];   /* v6.9.60: the check carries the health report */
+static char s_path[440];   /* v6.9.60: the check carries the health report; v6.9.63: +cc (worst case ~430) */
 static char s_host[44];
 static uint16_t s_port;
 static ota_state_t s_st;
@@ -89,7 +95,7 @@ static void ota_load(void)
     s_st.phase = '-';
     if (storage_state_load(OTA_STATE_FILENAME, s_text, sizeof(s_text)) &&
         sscanf(s_text, "%8lx %8lx %lu %c", &file_crc, &image_crc, &size, &phase) == 4 &&
-        (phase == 'D' || phase == 'I' || phase == 'F')) {
+        strchr("DIFdif", phase) && phase != '\0') {
         s_st.file_crc = file_crc;
         s_st.image_crc = image_crc;
         s_st.size = size;
@@ -133,11 +139,64 @@ static void ota_server(void)
     s_port = (uint16_t)port;
 }
 
+/* v6.9.63: a CTRL file. Only with no rain in this slot so far: the CTRL counts nothing while it
+ * installs (about 10 s). Sent as MENU > FIRMWARE UPDATE > CTRL sends ctrl.hex (about 70 s); the
+ * CTRL then restarts into it and powers this board up again, which confirms it (fw_app.c). */
+static void ota_install_ctrl(void)
+{
+    static telemetry_data_t s_t;
+    fw_ctrl_state_t state;
+    if (!intermcu_get_telemetry(&s_t) || s_t.rf_live_15m_mm > 0.0f || s_t.rf_15m_mm > 0.0f) {
+        ota_log("OTA", "OTA: CTRL install put off: raining");
+        return;
+    }
+    fw_result_t r = fw_ctrl_check(OTA_FILE_FILENAME, &s_info, ota_progress);
+    if (r == FW_OK && s_info.crc32 != s_st.image_crc) {
+        r = FW_E_BAD_CRC;
+    }
+    if (r == FW_OK && !fw_ctrl_query(&state)) {
+        ota_log("ERROR", "OTA: CTRL has no bootloader: CTRL file not taken");
+        ota_forget_file('f');
+        return;
+    }
+    if (r == FW_OK && state.state == FW_J_TRIAL_BOOT) {
+        ota_log("OTA", "OTA: CTRL on trial: install put off");
+        return;
+    }
+    if (r == FW_OK) {
+        r = fw_ctrl_send_image(OTA_FILE_FILENAME, &s_info, ota_progress);
+        if (r == FW_OK) {
+            s_st.phase = 'i';
+            ota_save();
+            snprintf(s_text, sizeof(s_text), "OTA: CTRL %.16s (%08lX) sent and checked: restarting CTRL",
+                     s_info.version, (unsigned long)s_info.crc32);
+            ota_log("FW", s_text);
+            storage_log_flush();
+            fw_ctrl_restart_lpc845();
+            vTaskDelay(3000 / portTICK_RATE_MS);    /* The CTRL cuts this board's power as it restarts */
+            NVIC_SystemReset();
+        }
+        if (r == FW_E_LINK) {
+            /* The link, not the file: fetched again at the next check (at most twice a day) */
+            ota_log("ERROR", "OTA: CTRL did not take the file (link): tried again later");
+            ota_forget_file('-');
+            return;
+        }
+    }
+    snprintf(s_text, sizeof(s_text), "OTA: CTRL file not installed: %s. Not taken again", fw_update_error_text(r));
+    ota_log("ERROR", s_text);
+    ota_forget_file('f');
+}
+
 /* The file is whole: check it as a card file is checked, then hand it to the bootloader */
 static void ota_install(void)
 {
     if (seconds_to_slot() < OTA_INSTALL_NEEDS_S) {
         ota_log("OTA", "File complete: installing after the next slot (too close to it now)");
+        return;
+    }
+    if (s_st.phase == 'd') {
+        ota_install_ctrl();
         return;
     }
     fw_result_t r = fw_update_check(OTA_FILE_FILENAME, UNIT_CFG, &s_info, ota_progress);
@@ -294,7 +353,7 @@ void ota_slot_step(int slot)
         due = true;
     }
     const bool bench = (storage_file_size(OTA_NOW_FILENAME) >= 0);
-    if (!due && s_st.phase != 'D' && s_st.phase != 'I' && !bench) {
+    if (!due && !strchr("DIdi", s_st.phase) && !bench) {
         return;
     }
     /* v6.9.62: the health report goes once a day, with the day check (12:30 + offset) and its retries
@@ -305,7 +364,7 @@ void ota_slot_step(int slot)
      * v6.9.60: the twice-daily check (health report, install report) goes anyway: a station with records
      * waiting is the one to see. Only a download waits for them. */
     const uint32_t pending = storage_backlog_get_pending_count();
-    if (pending != 0 && !report && s_st.phase != 'I') {
+    if (pending != 0 && !report && s_st.phase != 'I' && s_st.phase != 'i') {
         snprintf(s_text, sizeof(s_text), "OTA: check put off: %lu record(s) still to send first", (unsigned long)pending);
         ota_log("OTA", s_text);
         return;
@@ -320,6 +379,18 @@ void ota_slot_step(int slot)
             ota_forget_file('F');
         }
         due = true;     /* Tell the server now */
+    }
+    const uint32_t ctrl_crc = fw_app_ctrl_crc();
+    if (s_st.phase == 'i' && ctrl_crc != 0) {
+        /* v6.9.63: a CTRL install was started: is the CTRL running it? (Not known yet: asked next slot) */
+        if (s_st.image_crc == ctrl_crc) {
+            ota_log("FW", "OTA: the new CTRL firmware is running");
+            ota_forget_file('-');
+        } else {
+            ota_log("ERROR", "OTA: the new CTRL firmware did not stay. Not taken again");
+            ota_forget_file('f');
+        }
+        due = true;
     }
     /* v6.9.61: a low battery holds back only a download. The check is one short request on the network
      * the slot already has, and a weak battery is what the office most needs to see (1922 on 17 Nov:
@@ -336,9 +407,12 @@ void ota_slot_step(int slot)
     ota_server();
     int len = 0, status = 0;
     unsigned long size = 0, file_crc = 0, image_crc = 0;
-    snprintf(s_path, sizeof(s_path), "/lpc/check?id=%.12s&p=%d&v=%s&c=%08lX&s=%c&t=%08lX", stn_id, (int)UNIT_CFG,
-             FIRMWARE_VERSION, (unsigned long)running, (s_st.phase == 'D') ? '1' : (s_st.phase == 'F') ? '3' : '0',
-             (unsigned long)((s_st.phase == 'F') ? s_st.image_crc : 0UL));
+    /* v6.9.63: cc = the CTRL's running image (0 not known), so the server can offer a CTRL file. s and t
+     * cover a CTRL file too: the server tells them apart by the CRC. */
+    const bool failed = (s_st.phase == 'F' || s_st.phase == 'f');
+    snprintf(s_path, sizeof(s_path), "/lpc/check?id=%.12s&p=%d&cc=%08lX&v=%s&c=%08lX&s=%c&t=%08lX", stn_id, (int)UNIT_CFG,
+             (unsigned long)ctrl_crc, FIRMWARE_VERSION, (unsigned long)running,
+             (s_st.phase == 'D' || s_st.phase == 'd') ? '1' : failed ? '3' : '0', (unsigned long)(failed ? s_st.image_crc : 0UL));
     if (report) {
         const size_t used = strlen(s_path);
         snprintf(s_path + used, sizeof(s_path) - used, "%s", health_query(telem, pending));
@@ -366,14 +440,20 @@ void ota_slot_step(int slot)
                 storage_state_delete(OTA_RETRY_FILENAME);
             }
         }
-    } else if (sscanf(answer, "OTA FW %lu %8lx %8lx", &size, &file_crc, &image_crc) != 3) {
+        goto done;
+    }
+    /* v6.9.63: "OTA CTRL" offers a CTRL file, in the same form as "OTA FW" */
+    const bool ctrl = (strncmp(answer, "OTA CTRL ", 9) == 0);
+    const char want = ctrl ? 'd' : 'D';
+    if (sscanf(answer + (ctrl ? 9 : 7), "%lu %8lx %8lx", &size, &file_crc, &image_crc) != 3 ||
+        (!ctrl && strncmp(answer, "OTA FW ", 7) != 0)) {
         ota_log("OTA", "OTA: nothing new");
-        if (s_st.phase == 'D') {
+        if (s_st.phase == 'D' || s_st.phase == 'd') {
             ota_forget_file('-');
         }
-    } else if (size < 1000UL || size > OTA_MAX_FILE || image_crc == running) {
+    } else if (size < 1000UL || size > OTA_MAX_FILE || image_crc == (ctrl ? ctrl_crc : running) || (ctrl && ctrl_crc == 0)) {
         ota_log("OTA", "OTA: offer ignored (size, or the image already running)");
-    } else if (s_st.phase == 'F' && s_st.image_crc == image_crc) {
+    } else if ((s_st.phase == 'F' || s_st.phase == 'f') && s_st.image_crc == image_crc) {
         ota_log("OTA", "OTA: the offered firmware failed here before: not taken");
     } else if (battery_low) {
         ota_log("OTA", "OTA: download put off: battery low");
@@ -381,15 +461,16 @@ void ota_slot_step(int slot)
         snprintf(s_text, sizeof(s_text), "OTA: download put off: %lu record(s) still to send first", (unsigned long)pending);
         ota_log("OTA", s_text);
     } else {
-        if (s_st.phase != 'D' || s_st.file_crc != file_crc || s_st.size != size) {
+        if (s_st.phase != want || s_st.file_crc != file_crc || s_st.size != size) {
             storage_state_delete(OTA_FILE_FILENAME);
             s_st.file_crc = file_crc;
             s_st.image_crc = image_crc;
             s_st.size = size;
-            s_st.phase = 'D';
+            s_st.phase = want;
             ota_save();
         }
         ota_download(stn_id);
     }
+done:
     sim7600_http_get_close();
 }

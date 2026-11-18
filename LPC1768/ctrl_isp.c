@@ -35,14 +35,14 @@
 
 
 static const char *const s_result_text[ISP_RESULT_COUNT] = {
-    "CTRL bootloader and firmware put on, whole chip read back",
+    "CTRL boot+firmware written, read back OK",
     "JP1/JP2 not fitted: nothing done",
     "ctrl.hex missing or damaged: nothing done",
     "ctrl.hex changed since the menu check: nothing done",
-    "CTRL chip ROM loader did not answer (JP1/JP2?): nothing written",
+    "CTRL ROM loader silent (JP1/JP2?): nothing written",
     "CTRL chip ROM loader refused unlock: nothing written",
-    "CTRL chip sector 0 did not write (rescue left if possible): run CTRL F/W again",
-    "CTRL chip write failed (rescue sector 0 in place): run CTRL F/W again",
+    "CTRL sector 0 write failed: run CTRL F/W again",
+    "CTRL write failed (rescue in place): run CTRL F/W again",
     "CTRL chip read-back differs: run CTRL F/W again",
 };
 static const char *const s_result_lcd[ISP_RESULT_COUNT] = {

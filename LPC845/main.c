@@ -77,8 +77,15 @@ static inline void wind_sample_1ms(void)
 	}
 }
 
+/* CTRL v1.17: counts the 1 ms ticks, so the main loop feeds the watchdog only while they come. With
+ * the tick stopped, rain debounce, the clock read and the LPC1768 heartbeat cut all stop too, and a
+ * loop that kept feeding would hide it for ever; now the watchdog restarts the chip in about 60 s. */
+static volatile uint32_t s_systick_ms;
+
 void SysTick_Handler(void)
 {
+	s_systick_ms++;
+
 	/* if TICKRATE_HZ is (1000)	i.e., 1000 ticks per second
 	 *   this handler will be activated every 1 ms
 	 *   in other words, the time base is 1 ms	 */
@@ -2622,7 +2629,14 @@ int main(void)
 	while (1)
 	{
 
-		fw845_app_feed_watchdog();
+		{	//CTRL v1.17: only with the 1 ms tick still running (see s_systick_ms)
+			static uint32_t s_fed_at_ms;
+			const uint32_t now_ms = s_systick_ms;
+			if(now_ms != s_fed_at_ms){
+				s_fed_at_ms = now_ms;
+				fw845_app_feed_watchdog();
+			}
+		}
 
 		//Only a wake-up key while the LPC1768 is powered down. While it is running, COL2 also
 		//goes low on its normal keypad scan, which must not switch the rails.

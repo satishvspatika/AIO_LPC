@@ -2,14 +2,16 @@
 """LPC-AIO firmware-over-the-air server. One file, Python standard library only.
 
 Units (port 80, through nginx, paths under /lpc/):
-  GET /lpc/check?id=&p=&v=&c=&s=&t=   -> "OTA NONE" or "OTA FW <file bytes> <file crc> <image crc>"
+  GET /lpc/check?id=&p=&cc=&v=&c=&s=&t= -> "OTA NONE", "OTA FW <file bytes> <file crc> <image crc>" or
+                                         (v6.9.63, cc = the CTRL's running image) "OTA CTRL <same three>"
   GET /lpc/fw?id=&c=<file crc>&o=<offset>&n=<bytes>
                                       -> "@<crc32 of the piece>\n" + the piece of the .hex file
 Office (port 5002, login): tabs Stations (send an update, see each station's state), Firmware files
 (upload), History, Password (change the admin password; kept hashed in the database, ota.env is the fallback).
 
-A file is accepted only if it is a complete main-firmware .hex whose image header and CRC are right:
-the same checks the unit makes before it installs anything.
+A file is accepted only if it is a complete main-firmware .hex, or (v6.9.63) a CTRL ctrl.hex, whose image
+header and CRC are right: the same checks the unit makes before it installs anything. A CTRL file is the
+same for every station type; a station gets it only when it has no main-board update waiting.
 """
 import contextlib
 import hashlib
@@ -39,6 +41,10 @@ SLOT_A_BASE = 0x18000
 SLOT_SIZE = 0x20000
 IMAGE_MAGIC = 0x31474D49
 BOARD_ID = 0x1768
+CTRL_SLOT_A_BASE = 0x2400       # v6.9.63: CTRL (LPC845) firmware, ctrl.hex
+CTRL_SLOT_SIZE = 0x6000
+CTRL_BOARD_ID = 0x845
+CTRL_PROFILE = 9                # builds.profile of a CTRL file: for every station type
 TYPES = {0: "KSNDMC TRG", 1: "BIHAR TRG", 2: "KSNDMC TWS"}
 MAX_UPLOAD = 2 * 1024 * 1024
 MAX_PIECE = 2048
@@ -86,23 +92,28 @@ def parse_firmware_hex(data):
     if not mem:
         raise ValueError("no data in the file")
     lo, hi = min(mem), max(mem)
-    if lo != SLOT_A_BASE or hi >= SLOT_A_BASE + SLOT_SIZE:
-        raise ValueError("not a main firmware file (fw_ksn_trg.hex, fw_bihar.hex or fw_ksn_tws.hex): "
+    ctrl = lo == CTRL_SLOT_A_BASE and hi < CTRL_SLOT_A_BASE + CTRL_SLOT_SIZE
+    if not ctrl and (lo != SLOT_A_BASE or hi >= SLOT_A_BASE + SLOT_SIZE):
+        raise ValueError("not a firmware file (fw_ksn_trg.hex, fw_bihar.hex, fw_ksn_tws.hex or ctrl.hex): "
                          f"its data is at 0x{lo:05X}-0x{hi:05X}")
+    base = CTRL_SLOT_A_BASE if ctrl else SLOT_A_BASE
     if len(mem) != hi - lo + 1:
         raise ValueError("lines missing in the file")
     img = bytearray(mem[a] for a in range(lo, hi + 1))
-    off = struct.unpack_from("<I", img, 8 * 4)[0] - SLOT_A_BASE
+    off = struct.unpack_from("<I", img, 8 * 4)[0] - base
     if off < 0 or off + 36 > len(img):
         raise ValueError("no image header")
     magic, board, length, crc, profile = struct.unpack_from("<IIIII", img, off)
-    if magic != IMAGE_MAGIC or board != BOARD_ID:
-        raise ValueError("no image header for the main board")
+    if magic != IMAGE_MAGIC or board != (CTRL_BOARD_ID if ctrl else BOARD_ID):
+        raise ValueError("no image header for the " + ("CTRL" if ctrl else "main board"))
     if length != len(img):
         raise ValueError(f"image length {length} in the header, {len(img)} in the file")
     struct.pack_into("<I", img, off + 12, 0)
     if zlib.crc32(bytes(img)) & 0xFFFFFFFF != crc:
         raise ValueError("image CRC is wrong: a damaged file")
+    if ctrl:
+        version = bytes(img[off + 20:off + 36]).split(b"\0")[0].decode("ascii", "replace")
+        return CTRL_PROFILE, version, crc, len(img)
     if profile not in TYPES:
         raise ValueError(f"unknown station type {profile}")
     version = bytes(img[off + 20:off + 36]).split(b"\0")[0].decode("ascii", "replace")
@@ -164,6 +175,11 @@ def init_db():
             con.execute("ALTER TABLE stations ADD COLUMN health TEXT DEFAULT ''")
         if "health_at" not in cols:
             con.execute("ALTER TABLE stations ADD COLUMN health_at INTEGER DEFAULT 0")
+        # v6.9.63: CTRL by OTA. ctrl_target is a CTRL build id or '' (none); ctrl_crc what the unit says its
+        # CTRL runs ('' from firmware before v6.9.63, which can't take a CTRL file)
+        for col in ("ctrl_target", "ctrl_crc", "ctrl_offered", "ctrl_result"):
+            if col not in cols:
+                con.execute(f"ALTER TABLE stations ADD COLUMN {col} TEXT DEFAULT ''")
 
 
 def add_event(con, station, text, profile=None):
@@ -276,6 +292,7 @@ def unit_check(q, ip):
     crc = q.get("c", "").upper()[:8]
     status = q.get("s", "0")[:1]
     tried = q.get("t", "").upper()[:8]
+    cc = q.get("cc", "").upper()[:8]
     key = station_key(stn)
     now = int(time.time())
     with _db_lock, db() as con:
@@ -322,6 +339,39 @@ def unit_check(q, ip):
             con.execute("UPDATE stations SET offered_crc=?, result=? WHERE key=?", (offered, result, key))
         else:
             con.execute("UPDATE stations SET result=? WHERE key=?", (result, key))
+        if offered is None:
+            reply = ctrl_check(con, st, stn, cc, status, tried) or reply
+    return reply
+
+
+def ctrl_check(con, st, stn, cc, status, tried):
+    """v6.9.63: the CTRL file this station should get, as the reply, or None. Only once no main-board
+    update is waiting, and only to a unit that says what its CTRL runs (v6.9.63 on)."""
+    con.execute("UPDATE stations SET ctrl_crc=? WHERE key=?", (cc, st["key"]))
+    if not (st["ctrl_target"] or "").isdigit():
+        return None
+    b = con.execute("SELECT * FROM builds WHERE id=? AND profile=?", (int(st["ctrl_target"]), CTRL_PROFILE)).fetchone()
+    if b is None:
+        return None
+    result, offered, reply = st["ctrl_result"] or "", None, None
+    if cc == b["image_crc"]:
+        if st["ctrl_offered"] == cc and not result.startswith("updated"):
+            add_event(con, stn, f"UPDATED CTRL to {b['version']} ({cc})")
+        result = "updated: running the target" if st["ctrl_offered"] == cc else "running the target"
+    elif status == "3" and tried == b["image_crc"]:
+        if not result.startswith("FAILED"):
+            add_event(con, stn, f"FAILED: CTRL {b['version']} did not run and the CTRL went back")
+        result = "FAILED: the CTRL went back to its old firmware. Upload a new CTRL file to try again"
+    elif not re.fullmatch(r"[0-9A-F]{8}", cc) or cc == "00000000":
+        result = "waiting: the unit needs main firmware v6.9.63 or later first"
+    else:
+        reply = f"OTA CTRL {b['size']} {b['file_crc']} {b['image_crc']}\n"
+        offered = b["image_crc"]
+        if st["ctrl_offered"] != offered:
+            add_event(con, stn, f"offered CTRL {b['version']} ({offered})")
+        result = "offered, waiting for the unit"
+    con.execute("UPDATE stations SET ctrl_result=?" + (", ctrl_offered=?" if offered else "") + " WHERE key=?",
+                (result, offered, st["key"]) if offered else (result, st["key"]))
     return reply
 
 
@@ -348,7 +398,8 @@ def unit_piece(q):
     if not piece:
         return 416, b"OTA END\n"
     with _db_lock, db() as con:
-        con.execute("UPDATE stations SET progress=?, result=? WHERE key=?",
+        col = "ctrl_result" if build["profile"] == CTRL_PROFILE else "result"
+        con.execute(f"UPDATE stations SET progress=?, {col}=? WHERE key=?",
                     (off + len(piece), f"downloading: {100 * (off + len(piece)) // build['size']}%", station_key(stn)))
     return 200, b"@%08X\n" % (zlib.crc32(piece) & 0xFFFFFFFF) + piece
 
@@ -514,7 +565,32 @@ def page(title, body, tab=None, message="", script="", ptype=None):
 
 
 def build_name(b):
-    return f"{b['version']} · {TYPES.get(b['profile'], '?')} (#{b['id']})"
+    return f"{b['version']} · {TYPES.get(b['profile'], 'CTRL, every type')} (#{b['id']})"
+
+
+def ctrl_state(s, b):
+    """v6.9.63: (pill class, text) for the station's CTRL update, or None when none is set."""
+    if b is None:
+        return None
+    res = s["ctrl_result"] or ""
+    if res.startswith("FAILED"):
+        return "bad", "CTRL update failed"
+    if res.startswith("updated"):
+        return "ok", f"CTRL updated to {b['version']}"
+    if res == "running the target":
+        return "ok", "CTRL up to date"
+    if res.startswith("downloading"):
+        return "busy", f"CTRL {res}"
+    if res.startswith("waiting: the unit needs"):
+        return "wait", "CTRL: needs v6.9.63 first"
+    if res.startswith("offered"):
+        return "busy", "CTRL: starting download"
+    return "wait", f"CTRL {b['version']} at next check"
+
+
+def ctrl_build(con, s):
+    t = s["ctrl_target"] or ""
+    return con.execute("SELECT * FROM builds WHERE id=? AND profile=?", (int(t), CTRL_PROFILE)).fetchone() if t.isdigit() else None
 
 
 def station_state(s, build):
@@ -572,6 +648,8 @@ def attention(s, h):
     res = s["result"] or ""
     if res.startswith("FAILED"):
         out.append(("bad", "Update failed"))
+    if (s["ctrl_result"] or "").startswith("FAILED"):
+        out.append(("bad", "CTRL update failed"))
     elif res.startswith("target is for another"):
         out.append(("bad", "Wrong firmware type set"))
     if s["unit_status"] in ("4", "5"):
@@ -743,6 +821,7 @@ def stations_tab(ptype, search):
         targets = {r["profile"]: r["build_id"] for r in con.execute("SELECT * FROM type_targets")}
         stations = con.execute("SELECT * FROM stations ORDER BY CAST(key AS INTEGER), key").fetchall()
         st_builds = {s["key"]: target_build(con, s) for s in stations}
+        st_ctrl = {s["key"]: ctrl_state(s, ctrl_build(con, s)) for s in stations}
     by_id = {b["id"]: b for b in builds}
     h = []
 
@@ -794,7 +873,9 @@ def stations_tab(ptype, search):
                  f"<td class='nw'>{fw_text(s, hl)}</td><td class='nw'>{sent_text(hl)}</td>"
                  f"<td class='nw'>{bat}</td><td class='nw'>{carrier or '<span class=mute>—</span>'}</td>"
                  f"<td class='nw'>{esc(when(s['last_seen']))}</td>"
-                 f"<td class='nw'><span class='pill {cls}'>{esc(label)}</span>{bar}</td></tr>")
+                 f"<td class='nw'><span class='pill {cls}'>{esc(label)}</span>{bar}"
+                 + (f"<div style='margin-top:4px'><span class='pill {st_ctrl[s['key']][0]}'>{esc(st_ctrl[s['key']][1])}</span></div>"
+                    if st_ctrl[s["key"]] else "") + "</td></tr>")
     if not rows:
         h.append(f"<tr><td colspan='7' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
     h.append("</table></div>")
@@ -804,7 +885,7 @@ def stations_tab(ptype, search):
     h.append("</div>")
 
     # Send an update, for this type only
-    tb = [b for b in builds if b["profile"] == ptype]
+    tb = [b for b in builds if b["profile"] in (ptype, CTRL_PROFILE)]
     h.append(f"<div class='card'><h2>Send an update to {esc(TYPES[ptype])} stations</h2>")
     if not tb:
         h.append(f"<p class='hint' style='margin:0'>No {esc(TYPES[ptype])} firmware uploaded yet: see "
@@ -815,7 +896,9 @@ def stations_tab(ptype, search):
         ticks = "".join(f"<label class='tick'><input type='checkbox' name='stn' value='{esc(s['key'])}'>"
                         f"<span><b>{esc(s['shown_id'])}</b> <span class='mute'>{esc(s['version'] or 'not seen yet')}</span></span></label>"
                         for s in stations if s["profile"] == ptype)
-        h.append("<p class='hint'>Choose the firmware, tick the stations, press Send. Try one station first.</p>"
+        h.append("<p class='hint'>Choose the firmware, tick the stations, press Send. Try one station first. "
+                 "A CTRL file goes to the CTRL board of the ticked stations, after any main-board update; "
+                 "they need main firmware v6.9.63 or later.</p>"
                  f"<form method='post' action='/send' class='stack'><input type='hidden' name='back' value='/?tab=stations&type={ptype}'>"
                  f"<div><label class='f' for='bsel'>1. Firmware</label><select id='bsel' name='build' required>{opts}</select></div>"
                  f"<div><label class='f'>2. Stations</label><div class='ticks'>{ticks or '<span class=mute>None yet.</span>'}</div></div>"
@@ -854,6 +937,8 @@ def station_page(key, message=""):
             return None
         build = target_build(con, s)
         builds = con.execute("SELECT * FROM builds WHERE profile=? ORDER BY id DESC", (s["profile"],)).fetchall()
+        cbuild = ctrl_build(con, s)
+        cbuilds = con.execute("SELECT * FROM builds WHERE profile=? ORDER BY id DESC", (CTRL_PROFILE,)).fetchall()
         reports = con.execute("SELECT * FROM health WHERE key=? ORDER BY id DESC LIMIT 60", (key,)).fetchall()
         events = con.execute("SELECT * FROM events WHERE station=? ORDER BY id DESC LIMIT 100", (s["shown_id"],)).fetchall()
     hl = health_of(s)
@@ -892,7 +977,17 @@ def station_page(key, message=""):
              f"{'<p class=hint>' + esc(detail) + '</p>' if detail else ''}"
              f"<form method='post' action='/station' class='row' style='margin-top:10px'><input type='hidden' name='key' value='{esc(s['key'])}'>"
              f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='tsel'>Gets</label>"
-             f"<select id='tsel' name='target'>{sel}</select><button>Set</button></form></div>")
+             f"<select id='tsel' name='target'>{sel}</select><button>Set</button></form>")
+    # v6.9.63: CTRL
+    cst = ctrl_state(s, cbuild)
+    copts = [("", "Nothing")] + [(str(b["id"]), build_name(b)) for b in cbuilds]
+    csel = "".join(f"<option value='{esc(v)}'{' selected' if v == (s['ctrl_target'] or '') else ''}>{esc(t)}</option>" for v, t in copts)
+    h.append(f"<h2 style='margin-top:18px'>CTRL firmware</h2><p class='hint'>Running CRC "
+             f"<span class='crc'>{esc(s['ctrl_crc']) or '— (main firmware before v6.9.63 does not say)'}</span></p>"
+             + (f"<p style='margin:0 0 6px'><span class='pill {cst[0]}'>{esc(cst[1])}</span></p>" if cst else "") +
+             f"<form method='post' action='/station/ctrl' class='row'><input type='hidden' name='key' value='{esc(s['key'])}'>"
+             f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='csel'>Gets</label>"
+             f"<select id='csel' name='target'>{csel}</select><button>Set</button></form></div>")
 
     # Health history
     h.append("<div class='card'><h2>Health history</h2><div class='scroll'><table><tr><th>Received</th>" +
@@ -922,14 +1017,18 @@ def station_page(key, message=""):
 
 def firmware_tab(ptype):
     with db() as con:
-        builds = con.execute("SELECT * FROM builds WHERE profile=? ORDER BY id DESC", (ptype,)).fetchall()
+        builds = con.execute("SELECT * FROM builds WHERE profile IN (?,?) ORDER BY profile, id DESC", (ptype, CTRL_PROFILE)).fetchall()
         targets = {r["build_id"] for r in con.execute("SELECT build_id FROM type_targets WHERE build_id IS NOT NULL")}
         used_by = {}
         for s in con.execute("SELECT shown_id, target FROM stations WHERE target NOT IN ('type','hold')"):
             used_by.setdefault(int(s["target"]), []).append(s["shown_id"])
+        for s in con.execute("SELECT shown_id, ctrl_target FROM stations WHERE ctrl_target != ''"):
+            if s["ctrl_target"].isdigit():
+                used_by.setdefault(int(s["ctrl_target"]), []).append(s["shown_id"] + " (CTRL)")
     h = ["<div class='card'><h2>Upload firmware</h2>"
          "<ol class='steps'><li>Use the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
-         "<code>fw_bihar.hex</code> or <code>fw_ksn_tws.hex</code>.</li>"
+         "<code>fw_bihar.hex</code>, <code>fw_ksn_tws.hex</code>, or <code>ctrl.hex</code> for the CTRL board "
+         "(one file for every type).</li>"
          "<li>The station type and version are read from the file. A damaged or wrong file is refused.</li>"
          "<li>It is filed under its own type, whichever type is chosen above.</li>"
          f"<li>Uploading sends it to nobody. Choose stations on the <a href='/?tab=stations&type={ptype}'>Stations</a> tab.</li></ol>"
@@ -938,7 +1037,7 @@ def firmware_tab(ptype):
          "<div><label class='f'>File</label><input type='file' name='file' accept='.hex' required></div>"
          "<div><label class='f'>Note (optional)</label><input name='note' placeholder='e.g. SMS fix, for test team' size='34' maxlength='60'></div>"
          "<div><button>Upload</button></div></form></div>"]
-    h.append(f"<div class='card'><h2>{esc(TYPES[ptype])} firmware</h2><div class='scroll'><table>"
+    h.append(f"<div class='card'><h2>{esc(TYPES[ptype])} and CTRL firmware</h2><div class='scroll'><table>"
              "<tr><th>Version</th><th>Type</th><th>Uploaded</th><th>Note</th><th>Set for</th><th></th></tr>")
     for b in builds:
         users = []
@@ -947,7 +1046,7 @@ def firmware_tab(ptype):
         users += used_by.get(b["id"], [])
         h.append(f"<tr><td class='nw'><b>{esc(b['version'])}</b> <span class='mute'>#{b['id']}</span><br>"
                  f"<span class='crc'>CRC {esc(b['image_crc'])} · {b['size'] // 1024} KB</span></td>"
-                 f"<td class='nw'>{esc(TYPES.get(b['profile'], '?'))}</td><td>{esc(when(b['uploaded_at']))}</td>"
+                 f"<td class='nw'>{esc(TYPES.get(b['profile'], 'CTRL, every type'))}</td><td>{esc(when(b['uploaded_at']))}</td>"
                  f"<td>{esc(b['note'])}</td><td>{esc(', '.join(users)) or '<span class=mute>nobody</span>'}</td>"
                  f"<td><form method='post' action='/build/delete' onsubmit=\"return confirm('Delete {esc(b['version'])} (#{b['id']})?')\">"
                  f"<input type='hidden' name='back' value='/?tab=firmware&type={ptype}'>"
@@ -1053,9 +1152,11 @@ def do_upload(parts):
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, os.path.join(BUILDS_DIR, f"{build_id}.hex"))
-        add_event(con, "", f"build #{build_id} uploaded: {TYPES[profile]} {version} ({image_crc}) {note}", profile)
-    return (f"Uploaded {version} for {TYPES[profile]} as #{build_id}. "
-            "Nobody gets it yet: send it from the Stations tab."), profile
+        kind = TYPES.get(profile, "CTRL")
+        add_event(con, "", f"build #{build_id} uploaded: {kind} {version} ({image_crc}) {note}",
+                  None if profile == CTRL_PROFILE else profile)
+    return (f"Uploaded {version} for {kind} as #{build_id}. "
+            "Nobody gets it yet: send it from the Stations tab."), (None if profile == CTRL_PROFILE else profile)
 
 
 def do_send(f, stn_keys):
@@ -1068,6 +1169,23 @@ def do_send(f, stn_keys):
         if b is None:
             return "No such firmware."
         sent, skipped = [], []
+        if b["profile"] == CTRL_PROFILE:
+            # v6.9.63: a CTRL file, to the ticked stations (or every station of the type shown, as they are now)
+            keys = list(stn_keys)
+            if all_type and f.get("back", "").startswith("/?tab=stations&type="):
+                t = f["back"][-1]
+                keys += [r["key"] for r in con.execute("SELECT key FROM stations WHERE profile=?", (int(t),)) if t.isdigit()]
+            for key in dict.fromkeys(keys):
+                st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
+                if st is None:
+                    continue
+                con.execute("UPDATE stations SET ctrl_target=?, ctrl_result='', ctrl_offered='' WHERE key=?", (str(build_id), key))
+                add_event(con, st["shown_id"], f"office set: CTRL gets build #{build_id} {b['version']}")
+                sent.append(st["shown_id"])
+            if not sent:
+                return "Not sent: tick at least one station."
+            return (f"CTRL {b['version']} set for {', '.join(sent)}. Each takes it at its next check, after any "
+                    "main-board update (main firmware v6.9.63 or later needed).")
         for key in stn_keys:
             st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
             if st is None:
@@ -1217,6 +1335,16 @@ class Handler(BaseHTTPRequestHandler):
                         message = (f"Updates stopped for {st['shown_id']}." if target == "hold" else
                                    f"Updates resumed for {st['shown_id']}." if target == "type" else
                                    f"Station {st['shown_id']} set. It acts on this at its next check.")
+        elif url.path == "/station/ctrl":
+            target = f.get("target", "")
+            if target == "" or target.isdigit():
+                with _db_lock, db() as con:
+                    st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
+                    if st:
+                        con.execute("UPDATE stations SET ctrl_target=?, ctrl_result='', ctrl_offered='' WHERE key=?", (target, st["key"]))
+                        add_event(con, st["shown_id"], "office set: " + (f"CTRL gets build #{target}" if target else "no CTRL update"))
+                        message = (f"Station {st['shown_id']}: CTRL set. It acts on this at its next check." if target else
+                                   f"Station {st['shown_id']}: no CTRL update.")
         elif url.path == "/station/add":
             stn = f.get("id", "")
             if re.fullmatch(r"[0-9A-Za-z]{1,12}", stn) and f.get("profile", "") in ("0", "1", "2"):
@@ -1241,8 +1369,9 @@ class Handler(BaseHTTPRequestHandler):
                 build_id = int(f["id"])
                 with _db_lock, db() as con:
                     b = con.execute("SELECT profile FROM builds WHERE id=?", (build_id,)).fetchone()
-                    used = con.execute("SELECT 1 FROM type_targets WHERE build_id=? UNION SELECT 1 FROM stations WHERE target=?",
-                                       (build_id, str(build_id))).fetchone()
+                    used = con.execute("SELECT 1 FROM type_targets WHERE build_id=? UNION SELECT 1 FROM stations WHERE target=?"
+                                       " UNION SELECT 1 FROM stations WHERE ctrl_target=?",
+                                       (build_id, str(build_id), str(build_id))).fetchone()
                     if used:
                         message = f"Build #{build_id} is still set for a station or a type: stop that first on the Stations tab."
                     else:

@@ -27,6 +27,9 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
   latest health report, firmware update control, health history, events.
 - **Send an update** (on each type's tab): choose the firmware, tick the stations, Send. "Every station of this
   type" also covers stations that check in later. Try one station first.
+- **CTRL firmware** (v6.9.63): upload `ctrl.hex` on Firmware files (listed as "CTRL, every type"), then choose
+  it in Send an update, or on a station's page under CTRL firmware. A station takes it only after any main-board
+  update, and only with main firmware v6.9.63 or later; its row shows a second, CTRL pill.
 - **Firmware files**: upload the file that goes on the SD card (`fw_ksn_trg.hex`, `fw_bihar.hex`,
   `fw_ksn_tws.hex`). It is refused unless it is a whole main-firmware file with the right header and CRC.
   Uploading sends it to nobody. It is filed under its own type (read from the file) and the page then shows

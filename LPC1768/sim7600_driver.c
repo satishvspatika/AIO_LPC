@@ -69,7 +69,7 @@ static bool set_rat_mode(const char *rat_cmd)
         }
     }
     s_rat_unsure = true;
-    storage_log_debug("MODEM", "Radio mode command (AT+CNMP) refused 3 times: this slot doesn't change the learned radio mode");
+    storage_log_debug("MODEM", "CNMP refused 3 times: radio mode not learned this slot");
     return false;
 }
 
@@ -520,10 +520,13 @@ static void parse_cops_operator(const char *cops_resp, char *out_carrier, size_t
     out_carrier[max_len - 1] = '\0';
 }
 
-/* ESP32 flow: the server's clock is the reference. Correct the RTC only past the drift limit:
- * 90s after a delivered record, 45s after a rejected one (often caused by the clock itself). */
-#define CLOCK_DRIFT_LIMIT_SEC           90
-#define CLOCK_DRIFT_LIMIT_REJECTED_SEC  45
+/* ESP32 flow: the server's clock is the reference. Correct the RTC only past the drift limit.
+ * v6.9.63: 20 s after a delivered record (was 90), 15 s after a rejected one (was 45). A clock 60-89 s
+ * fast sent before the server's +62 s and was refused once before it was put right; 1922 had drifted
+ * to 38 s slow by 18 Nov. Corrections come at +62 s or later and are this small, so the step never
+ * crosses a slot boundary. */
+#define CLOCK_DRIFT_LIMIT_SEC           20
+#define CLOCK_DRIFT_LIMIT_REJECTED_SEC  15
 /* CTRL v1.11 keeping the time itself (its RTC chip failed) runs about 0.6% fast, 6 s a slot (001903,
  * 2026-11-13): at 90 s its slots were up to 1.5 minutes early. 15 s stays clear of the server time's
  * 1 s steps and the send delay, and is corrected about every third slot. Corrections come about a
@@ -661,7 +664,7 @@ void sim7600_correct_clock_from_network(void)
         storage_log_debug("RTC", msg);
         return;
     }
-    snprintf(msg, sizeof(msg), "Clock corrected from network time: %.14s -> %s (drift %lds)",
+    snprintf(msg, sizeof(msg), "Clock from network: %.14s -> %s (%lds)",
              have_clock ? t.present_time : "none", ts14, drift);
     storage_log_debug("RTC", msg);
     hal_power_sync_rtc(ts14);
@@ -779,7 +782,7 @@ static const char *apn_for_sim(const char *iccid, const char *imsi)
     if (s_saved_apn && iccid[0] && strcmp(iccid, s_saved_apn_iccid) == 0 && !saved_apn_refused(s_saved_apn)
         && strcmp(s_saved_apn, apn) != 0) {
         char msg[96];
-        snprintf(msg, sizeof(msg), "APN %s delivered last on this SIM: tried first (by the SIM's numbers: %s)", s_saved_apn, apn);
+        snprintf(msg, sizeof(msg), "APN %s last delivered on SIM %s: tried first", s_saved_apn, apn);
         storage_log_debug("APN", msg);
         apn = s_saved_apn;
     }
@@ -1016,7 +1019,7 @@ bool sim7600_power_on(void)
     char old_op[6];
     memcpy(old_op, s_net.op, sizeof(old_op));
     if (net_policy_set_operator(&s_net, imsi)) {
-        snprintf(capture, sizeof(capture), "SIM operator changed (%s to %.5s): radio mode learning starts again", old_op, imsi);
+        snprintf(capture, sizeof(capture), "SIM operator %s -> %.5s: radio learning restarts", old_op, imsi);
         storage_log_debug("MODEM", capture);
     }
     const net_plan_t plan = net_policy_plan(&s_net);
@@ -1077,7 +1080,15 @@ bool sim7600_power_on(void)
             set_rat_mode(rat_cmd);
             continue;
         }
-        if (cereg_answered && (strstr(capture, ",1") || strstr(capture, ",5"))) {
+        if (cereg_answered && rat_mode == 13 && (strstr(capture, ",1") || strstr(capture, ",5"))) {
+            /* v6.9.63: in 2G-only mode this is the LTE registration the modem booted on, not yet dropped
+             * (1922, 18 Nov 11:31: "straight to 2G", then CEREG 0,1 taken as LTE at once; data took 17 s
+             * while the radio changed, and the plan learned 4G works). Waits for the 2G answer below. */
+            if (!cgreg_not_lte_logged) {
+                cgreg_not_lte_logged = true;
+                storage_log_debug("MODEM", "CEREG is old 4G: waiting for 2G");
+            }
+        } else if (cereg_answered && (strstr(capture, ",1") || strstr(capture, ",5"))) {
             registered = true;
             reg_mode = NET_4G;
             sec_to_4g = (uint8_t)(((xTaskGetTickCount() - (mode_switch_tick ? mode_switch_tick : search_begin)) / configTICK_RATE_HZ) + 1);
@@ -1092,15 +1103,20 @@ bool sim7600_power_on(void)
              * powered up on (001903, 15 Nov 11:31: the 11:16 SMS listening ended on 3G; CNMP=38, then
              * CEREG 0,4 + CGREG 0,1 taken as LTE, COPS showed act 2, CGACT "no network service", 80 s
              * lost). Accept it only if COPS shows the modem really is on LTE (act 7). */
+            /* v6.9.63: and in 2G-only mode, only if COPS shows it has left LTE (act not 7) */
+            char cops[96];
+            clear_rx();
+            send_raw("AT+COPS?\r\n");
+            const char *act = wait_response("+COPS:", 1500, cops, sizeof(cops)) ? strrchr(cops, ',') : NULL;
+            if (rat_mode == 13 && act != NULL && act[1] == '7') {
+                delay_ms(1000);
+                continue;
+            }
             if (rat_mode == 38) {
-                char cops[96];
-                clear_rx();
-                send_raw("AT+COPS?\r\n");
-                const char *act = wait_response("+COPS:", 1500, cops, sizeof(cops)) ? strrchr(cops, ',') : NULL;
                 if (act == NULL || act[1] != '7') {
                     if (!cgreg_not_lte_logged) {
                         cgreg_not_lte_logged = true;
-                        storage_log_debug("MODEM", "+CGREG registered but not on LTE yet (old 3G/2G registration): waiting for 4G");
+                        storage_log_debug("MODEM", "CGREG on old 3G/2G: waiting for 4G");
                     }
                     delay_ms(1000);
                     continue;
@@ -1117,7 +1133,7 @@ bool sim7600_power_on(void)
         if (wait_response("+CREG: ", 800, capture, sizeof(capture)) && (strstr(capture, ",1") || strstr(capture, ",5"))) {
             if (voice_only_since == 0) {
                 voice_only_since = xTaskGetTickCount();
-                storage_log_debug("MODEM", "Registered for voice/SMS only (+CREG): waiting for data registration");
+                storage_log_debug("MODEM", "CREG only: waiting for data registration");
             } else if ((xTaskGetTickCount() - voice_only_since) / configTICK_RATE_HZ >= NET_VOICE_ONLY_WAIT_SEC) {
                 registered = true;
                 reg_mode = MODE_NOW();
@@ -1213,7 +1229,7 @@ void sim7600_power_off(void)
 {
     /* v6.9.55: an SMS that just arrived still needs its acknowledgement to reach the network */
     if (sms_arrived_within(SMS_QUIET_MS)) {
-        storage_log_debug("SMS", "An SMS just arrived: power-off waits a few seconds for its acknowledgement");
+        storage_log_debug("SMS", "SMS arrived: power-off waits for its ack");
         wait_sms_quiet(SMS_QUIET_MS, SMS_QUIET_MS);
     }
     storage_log_debug("MODEM", "Powering down SIM7600 cellular engine...");
@@ -1252,7 +1268,7 @@ void sim7600_power_off(void)
 
     /* Hardware fallback: pulse PWRKEY (P0.1) LOW for 2.5s if AT+CPOF failed */
     if (!cpof_ok) {
-        storage_log_debug("MODEM", "AT+CPOF unconfirmed, pulsing PWRKEY (P0.1) LOW for 2.5s...");
+        storage_log_debug("MODEM", "CPOF unconfirmed: PWRKEY 2.5s");
         LPC_GPIO0->FIOCLR = (1UL << PIN_PWR_KEY);
         delay_ms(2500);
         LPC_GPIO0->FIOSET = (1UL << PIN_PWR_KEY);
@@ -1515,6 +1531,10 @@ static void log_bearer_details(void)
  * AT+CSOCKSETPN are sent once per power-on and APN (they can't be read back in the same list).
  * Returns true if CID 1 was written. */
 #define CGACT_RETRY_GAP_MS 5000
+/* v6.9.63: first try's wait, was 25 s. 1922, 18 Nov 09:16 (2G): no answer in 25 s, then the retry was
+ * OK in under 1 s; a late first answer is no loss, as the retry finds the context up. The second try
+ * keeps the full 25 s. */
+#define CGACT_FIRST_WAIT_MS 12000
 
 static bool __attribute__((noinline)) set_pdp_contexts(const char *apn)
 {
@@ -1594,7 +1614,7 @@ static bool __attribute__((noinline)) activate_apn(const char *apn)
         clear_rx();
         const portTickType asked = xTaskGetTickCount();
         send_raw("AT+CGACT=1,1\r\n");
-        active = wait_response("OK", 25000, NULL, 0);
+        active = wait_response("OK", attempt == 0 ? CGACT_FIRST_WAIT_MS : 25000, NULL, 0);
         if (!active && attempt == 0) {
             const portTickType refused = xTaskGetTickCount();
             const bool quick_refusal = (refused - asked) < (5000 / portTICK_RATE_MS);
@@ -1630,7 +1650,7 @@ static bool __attribute__((noinline)) activate_apn(const char *apn)
             return true;
         }
     }
-    storage_log_debug("APN", "Activated, but no address (0.0.0.0) after 20s: treating as failed");
+    storage_log_debug("APN", "No IP address after 20s: failed");
     return false;
 }
 
@@ -1709,7 +1729,7 @@ static void __attribute__((noinline)) ensure_bearer(void)
          * new one: after a SIM swap the data connection can be up on the old operator's APN. BSNL
          * then gave an address on airteliot.com but NETOPEN failed twice (BIHAR 23:45, 2026-11-08,
          * 72 s). Attach again on the right APN before sending. */
-        storage_log_debug("APN", "Data connection is on another APN: fresh attach on the SIM's APN");
+        storage_log_debug("APN", "Data on another APN: re-attach on SIM's APN");
         s_bearer_ready = reattach_on_apn(primary) && activate_apn(primary);
     }
     if (!s_bearer_ready && primary[0]) {
@@ -2547,7 +2567,7 @@ bool sim7600_net_diagnostics(const http_endpoint_t *endpoint, const char *payloa
 
     /* 5. TWS6 never sends AT&D0, and this close code can mean DTR went off */
     bool got_reply = false;
-    storage_log_debug("DIAG", "Repeating the POST with AT&D1 (TWS6 does not set AT&D0)");
+    storage_log_debug("DIAG", "POST again with AT&D1");
     diag_query("AT&D1\r\n");
     bool sent = http_post_tcp(endpoint, endpoint->ip, payload, NULL, 0, &got_reply);
     diag_query("AT&D0\r\n");
@@ -2764,7 +2784,8 @@ gps_result_t sim7600_gps_update(const char *today)
     int32_t first_lat = 0, first_lon = 0;
     uint32_t waited = 0;
     report_progress("GPS SEARCHING...");
-    while (waited < GPS_FIX_TIMEOUT_SEC && !have_fix) {
+    /* v6.9.63: power save during a search (keypad EN) cancels it at the next 5 s step */
+    while (waited < GPS_FIX_TIMEOUT_SEC && !have_fix && !sim7600_is_cancel_requested()) {
         delay_ms(5000);
         waited += 5;
         cap[0] = '\0';
@@ -2994,7 +3015,7 @@ static bool __attribute__((noinline)) send_sms_to_number(const char *number, con
         } else if (strstr(cap, "ERROR")) {
             report_progress("CMD ERROR       ");
         } else {
-            report_progress("NET TIMEOUT 60S ");
+            report_progress("NO NETWORK REPLY");   /* v6.9.63: was "NET TIMEOUT 60S" after a 3-min wait */
         }
         return false;
     }
@@ -3051,8 +3072,8 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
      * repeated one can't be taken back. ESC in case the modem is still in text input. */
     if (s_sms_handed_over) {
         bool alive = sms_modem_answers();
-        storage_log_debug("SMS", alive ? "No confirmation for the reply: not sent again (a repeat would arrive twice)"
-                                       : "No confirmation for the reply and the modem is silent: not sent again");
+        storage_log_debug("SMS", alive ? "Reply not confirmed: not resent"
+                                       : "Reply not confirmed, modem silent: not resent");
         return false;
     }
 
@@ -3307,14 +3328,14 @@ bool sim7600_prepare_sms_listen(bool rejoin)
      * whenever a BSNL one came first). The re-join waits until none has arrived for SMS_QUIET_MS, so
      * each acknowledgement is out; only if they keep coming for SMS_QUIET_MAX_MS does it stay on. */
     if (!wait_sms_quiet(SMS_QUIET_MS, SMS_QUIET_MAX_MS)) {
-        storage_log_debug("SMS", "Listening: automatic mode, SMS still arriving: staying on the network");
+        storage_log_debug("SMS", "Listening: SMS arriving, staying on");
         return true;
     }
     /* Build 19: with every slot listening, only one slot in SMS_REJOIN_EVERY_SLOTS leaves and joins
      * again (13-20 s of modem time each on BSNL, 1922, 16 Nov evening). The others listen as they
      * are: SMS from the SIM's own operator come anyway, another operator's at the next re-join. */
     if (!rejoin) {
-        storage_log_debug("SMS", "Listening: automatic mode, staying on the network (joins again once an hour)");
+        storage_log_debug("SMS", "Listening: auto mode, staying on (rejoin hourly)");
         return true;
     }
 #if !SMS_REJOIN_AIRTEL_IOT
@@ -3323,11 +3344,11 @@ bool sim7600_prepare_sms_listen(bool rejoin)
      * then power-off) the next three switch-ons took 65-90 s to register and two ended on 2G with
      * data refused; before it, about 15 s on LTE. No SMS has reached that SIM either way. */
     if (s_sim_airtel_iot) {
-        storage_log_debug("SMS", "Listening: Airtel IoT SIM, staying on the network (no leave and join)");
+        storage_log_debug("SMS", "Listening: Airtel IoT, no rejoin");
         return true;
     }
 #endif
-    storage_log_debug("SMS", "Listening: leaving the network and joining again (tells other operators' SMS centres)");
+    storage_log_debug("SMS", "Listening: leave and rejoin network");
     clear_rx();
     send_raw("AT+COPS=2\r\n");
     wait_response("OK", 10000, NULL, 0);
@@ -3344,7 +3365,7 @@ bool sim7600_prepare_sms_listen(bool rejoin)
         auto_ok = wait_response("OK", 20000, NULL, 0);
     }
     if (!auto_ok) {
-        storage_log_debug("ERROR", "Modem did not take automatic network selection (COPS=0) after 2 tries");
+        storage_log_debug("ERROR", "COPS=0 refused twice");
     }
     /* Build 16: 60 checks, was 20. On an Airtel IoT SIM the modem was still searching (+CREG: 0,2)
      * 20 s after COPS=0 and the window ran with no SMS registration, so a command sent to the unit
@@ -3355,7 +3376,7 @@ bool sim7600_prepare_sms_listen(bool rejoin)
         send_raw("AT+CREG?\r\n");
         if (wait_response("+CREG: ", 1000, cap, sizeof(cap)) && (strstr(cap, ",1") || strstr(cap, ",5"))) {
             static char msg[72];   /* Static: keeps this path's stack as it was */
-            snprintf(msg, sizeof(msg), "Listening: automatic mode, registered for SMS %lus after joining again",
+            snprintf(msg, sizeof(msg), "Listening: SMS registered %lus after rejoin",
                      (unsigned long)((xTaskGetTickCount() - joined_from) / configTICK_RATE_HZ));
             storage_log_debug("SMS", msg);
             return true;
@@ -3411,7 +3432,7 @@ static bool sms_get_answered_lately(const sms_in_t *m)
         sms_answered_t *a = &s_answered[i];
         if (a->num[0] && a->cmd == (uint8_t)cmd && strcmp(a->num, num) == 0 && (now - a->at) < window) {
             char msg[96];
-            snprintf(msg, sizeof(msg), "Same request from %s answered %lu s ago: not answered again",
+            snprintf(msg, sizeof(msg), "Same request from %s %lus ago: not answered",
                      num, (unsigned long)((now - a->at) / configTICK_RATE_HZ));
             storage_log_debug("SMS", msg);
             return true;
@@ -3538,7 +3559,7 @@ static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
     }
     char from10[11];
     if (!sms_number_last10(m->from, from10)) {
-        storage_log_debug("SMS", "Command from a sender that is not a phone number: ignored");
+        storage_log_debug("SMS", "Command from non-phone sender: ignored");
         return;
     }
     const char *stn = flash_nvram_get_station_id();
@@ -3741,7 +3762,7 @@ static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
         if (!flash_nvram_set_remote(&r)) {
             snprintf(out, osz, "STN %s NOT CHANGED: flash write failed", stn);
         } else if (stop) {
-            storage_log_debug("ERROR", "Sending stopped by SMS (VARSHA STOP): records kept on the card only");
+            storage_log_debug("ERROR", "Sending stopped by SMS: card only");
             snprintf(out, osz, "STN %s SENDING STOPPED. Records kept on card, SMS still answered. VARSHA RESUME to restart", stn);
         } else {
             storage_log_debug("ERROR", "Sending resumed by SMS (VARSHA RESUME)");
@@ -3903,7 +3924,7 @@ int sim7600_check_incoming_sms(const telemetry_data_t *telemetry, bool in_slot)
         s_last_check_command = s_last_check_command || sms_is_command(&s_inbox[i]);
         if (sms_seen_repeat(&s_seen, s_inbox[i].from, s_inbox[i].ts, s_inbox[i].body, &seen_changed)) {
             char msg[96];
-            snprintf(msg, sizeof(msg), "Sent again by the network (%s, %.17s): already answered, not again",
+            snprintf(msg, sizeof(msg), "Network repeat (%s, %.17s): not answered again",
                      s_inbox[i].from, s_inbox[i].ts);
             storage_log_debug("SMS", msg);
             continue;
