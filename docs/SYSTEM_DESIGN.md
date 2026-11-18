@@ -662,6 +662,7 @@ With no card and no network, the oldest records are overwritten after about 6.5 
 | Everything stops | 60 s hardware watchdog, fed only by the disk task | 60 s watchdog once running normally; 5.3 min on a firmware trial. CTRL v1.17: fed only while the 1 ms tick still counts, so a stopped tick (rain debounce, clock read and heartbeat cut all stop with it) restarts the chip |
 | LPC1768 hangs with power on | LPC845 cuts all power after 11 min with no heartbeat | |
 | Unattended wake never ends (v6.9.63) | The main loop sends the heartbeat whatever it is doing, so the 11-minute cut can't catch it. A slot wake with the LCD off and no key pressed that is still on at `UNATTENDED_MAX_ON_SEC` (780 s, +13:40 after the boundary) logs ERROR and sends `$f7` every 10 s (UI task) | |
+| SMS handed to the network, never confirmed (v6.9.63) | Not sent again (v6.9.55 rule). The LCD now says `NOT CONFIRMED` / `MAY HAVE SENT` (GPS SMS: `MAY HAVE SENT`), not a failure: 1922, 18 Nov 12:08, no `+CMGS` in 226 s on 2G, yet the phone had it at 12:09; "failed" invited a second send | |
 | Operator asks for power save while busy (v6.9.63) | `sleep_blocker()` names what is busy on the LCD (`STOPPING GPS...`, `SENDING DATA...`, `UPDATE RUNNING` etc.); a GPS search or status SMS is cancelled, and power goes off when it is done. EN during SEND GPS used to do nothing (1922, 18 Nov) | |
 | Repeated fault restarts | After 3 in a row, powers off until the next slot (v6.9.9) | |
 | Restart loses rain | | Slot tips, day total and its rain day kept in `.noinit` across crash, watchdog and update restarts (845-v1.3). Power loss falls back to `$T` |
@@ -843,7 +844,7 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | RTC coin cell | Can't be measured on this board; firmware can only detect a stop. ADC link proposed for the next board |
 | Old 4G registration taken in 2G-only mode | Fixed in v6.9.63 (1922, 18 Nov 11:31): "straight to 2G" set CNMP=13, then the LTE `+CEREG: 0,1` the modem booted with was taken as LTE at once; data took 17 s while the radio changed and the plan learned 4G works. In 2G-only mode CEREG is now ignored and CGREG counts only once COPS shows the modem off LTE |
 | First `AT+CGACT` wait | v6.9.63: 12 s (was 25 s). 1922, 18 Nov 09:16 on 2G: no answer in 25 s, the retry OK in under 1 s. The second try keeps 25 s. Check on the next card: how often a first try took over 12 s and still succeeded |
-| Flash | v6.9.63 (with CTRL by OTA, after shortening 77 long log lines, about 2.1 KB): BIHAR 130,148 of 131,072 bytes (924 spare), KSNDMC_TRG 129,844, KSNDMC_TWS 129,600. About 25 KB of the image is text strings: the next room comes from there |
+| Flash | v6.9.63 (with CTRL by OTA, after shortening 77 long log lines, about 2.1 KB): BIHAR 130,292 of 131,072 bytes (780 spare), KSNDMC_TRG 129,984, KSNDMC_TWS 129,740. About 25 KB of the image is text strings: the next room comes from there |
 
 ---
 

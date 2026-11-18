@@ -92,6 +92,8 @@ bool sim7600_is_cancel_requested(void);
 /* SMS Engine */
 void sanitize_phone_number(char *dest, const char *src, size_t dest_size);
 bool sim7600_send_sms(const char *dest_phone, const char *message);
+/* v6.9.63: after a false from sim7600_send_sms: true if the text reached the network unconfirmed */
+bool sim7600_sms_maybe_sent(void);
 /* GPS SMS text in the ESP32 format (STAT_AD-F from the keypad, STAT_AD-C by SMS), saved position.
  * The modem must be on; send it with sim7600_send_sms(). Static buffer: one caller at a time. */
 const char *sim7600_build_gps_sms(char kind, const char *present_time);

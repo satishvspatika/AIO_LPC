@@ -656,7 +656,7 @@ static void vGps_Task(void *pvParameters)
                     gps_status_set("NO POSITION");
                 } else {
                     bool sent = sim7600_send_sms(STATUS_SMS_DEST_NUMBER, sim7600_build_gps_sms('F', t.present_time));
-                    gps_status_set(sent ? "GPS SMS SENT" : "GPS SMS FAILED");
+                    gps_status_set(sent ? "GPS SMS SENT" : sim7600_sms_maybe_sent() ? "MAY HAVE SENT" : "GPS SMS FAILED");
                 }
             }
         }
@@ -1944,7 +1944,8 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                     snprintf(line1, sizeof(line1), "SEND STATUS SMS ");
                     snprintf(line2, sizeof(line2), "STATUS SENT OK  ");
                 } else if (s_status_sms_state == STATUS_UI_FAILED) {
-                    snprintf(line1, sizeof(line1), "SEND STATUS SMS ");
+                    /* v6.9.63: no confirmation is not a failure: don't send it again */
+                    snprintf(line1, sizeof(line1), "%s", strncmp(s_status_sms_substep, "MAY HAVE", 8) ? "SEND STATUS SMS " : "NOT CONFIRMED   ");
                     snprintf(line2, sizeof(line2), "%-16.16s", (s_status_sms_substep[0]) ? s_status_sms_substep : "STATUS FAILED   ");
                 } else {
                     snprintf(line1, sizeof(line1), "SEND STATUS SMS ");

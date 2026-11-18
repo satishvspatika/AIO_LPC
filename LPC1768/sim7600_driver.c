@@ -3041,6 +3041,12 @@ static void sms_log_query(const char *cmd)
     wait_response("OK", 2000, NULL, 0);
 }
 
+/* v6.9.63: the last send was handed to the network but never confirmed (it may well have arrived) */
+bool sim7600_sms_maybe_sent(void)
+{
+    return s_sms_handed_over;
+}
+
 bool sim7600_send_sms(const char *dest_phone, const char *message)
 {
     if (!dest_phone || !message) return false;
@@ -3074,6 +3080,9 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
         bool alive = sms_modem_answers();
         storage_log_debug("SMS", alive ? "Reply not confirmed: not resent"
                                        : "Reply not confirmed, modem silent: not resent");
+        /* v6.9.63: said as it is. 1922, 18 Nov 12:08: no +CMGS in 226 s, yet the phone had it at 12:09;
+         * "failed" on the LCD invites a second send, and the office gets two */
+        report_progress("MAY HAVE SENT   ");
         return false;
     }
 
@@ -3108,7 +3117,13 @@ bool sim7600_send_sms(const char *dest_phone, const char *message)
 
     snprintf(line, sizeof(line), "Retrying as %s on automatic network mode", sanitized);
     storage_log_debug("SMS", line);
-    return send_sms_to_number(sanitized, message);
+    if (send_sms_to_number(sanitized, message)) {
+        return true;
+    }
+    if (s_sms_handed_over) {
+        report_progress("MAY HAVE SENT   ");     /* v6.9.63: as for the first try */
+    }
+    return false;
 }
 
 /* kind 'F': SEND STATUS SMS from the keypad, to the status number. 'C': an office query by SMS,
