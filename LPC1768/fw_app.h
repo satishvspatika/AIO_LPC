@@ -11,6 +11,10 @@ void fw_app_init(void);
 
 /* Once a second. Confirms an image on trial after it has run a while and hears the LPC845. */
 void fw_app_step(uint32_t uptime_sec, uint32_t good_frames);
+/* v6.9.62: the CTRL version query alone, from the slot's wait for the server's +62 s. A scheduled slot
+ * runs before the main loop gets to fw_app_step, so the CTRL version was never known in a timed slot
+ * and the health report sent it empty. */
+void fw_app_ctrl_poll(void);
 
 /* Once a second, from the disk task. Firmware on trial is left to the bootloader's watchdog. Otherwise
  * the watchdog runs with a 60 s timeout, fed only while every registered task keeps checking in; a

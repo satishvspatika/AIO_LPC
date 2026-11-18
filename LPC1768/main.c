@@ -1786,6 +1786,7 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         storage_log_debug("SLOT", s_slot_line);
         for (int w = 0; w < wait_sec; w++) {
             wd_checkin();
+            fw_app_ctrl_poll();     /* v6.9.62: so a timed slot knows the CTRL version (health report) */
             vTaskDelay(1000 / portTICK_RATE_MS);
         }
     }

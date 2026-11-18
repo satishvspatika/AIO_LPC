@@ -318,6 +318,13 @@ bool fw_app_trial_unconfirmed(void)
     return s_on_trial && !s_confirmed && (xTaskGetTickCount() / configTICK_RATE_HZ) < TRIAL_HOLD_MAX_SEC;
 }
 
+void fw_app_ctrl_poll(void)
+{
+    uint32_t bytes, frames, good;
+    intermcu_get_link_stats(&bytes, &frames, &good, NULL, 0);
+    ctrl_step(xTaskGetTickCount() / configTICK_RATE_HZ, good);
+}
+
 void fw_app_step(uint32_t uptime_sec, uint32_t good_frames)
 {
     ctrl_step(uptime_sec, good_frames);

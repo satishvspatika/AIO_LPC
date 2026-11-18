@@ -598,6 +598,16 @@ type. Events carry their type (`events.profile`, filled in for old events from t
 named in the text; a password change belongs to every type). Rules added: 4+ of 96 not sent, any error logged,
 night battery average under 11.5 V.
 
+Same day, after the user saw it live: (1) `ctrl` was always empty. A timed slot runs inside the main task
+before its loop reaches `fw_app_step`, so the CTRL version query never ran (only keypad and restart boots
+knew the version). `fw_app_ctrl_poll()` now runs the query each second of the slot's wait for the server's
++62 s (about 16 s, from +7 s). CRC TRG 2198E7EA / BIHAR 4660D911 / TWS F6354295, BIHAR 584 B left.
+(2) Office page made shorter: stations list = firmware with CTRL next to it, sent of 96 (by backlog),
+battery day / night average, carrier; Needs attention shows under the problems a line "Sent 92/96 (3 by
+backlog) · Battery day / night · carrier"; the Health card is one status line (watchdog/fault restarts and
+SD fault folded in), the day, sent, not sent, the three battery figures, battery now, errors with the newest,
+network, waiting, time on, clock. The 24-hour counts of v6.9.60-61 reports are no longer shown.
+
 ---
 
 ## 8. Data storage

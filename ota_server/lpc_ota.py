@@ -226,12 +226,7 @@ HEALTH_FIELDS = [   # (field, label, unit)
     ("late", "Queued to send later, 24 h", ""),     # v6.9.60-61 only
     ("miss", "Slots missed or unit off, 24 h", ""), # v6.9.60-61 only
 ]
-HEALTH_LEGACY = {"ok", "late", "miss"}              # Shown only in a report that has them
 HEALTH_UNITS = {k: u for k, _, u in HEALTH_FIELDS}
-HEALTH_SHORT = {"day": "Day", "sent": "Sent", "bk": "Backlog", "bd": "Day avg", "bn": "Night avg", "bmin": "Lowest",
-                "bv": "Battery", "ne": "Errors", "sig": "Signal", "net": "Net", "q": "Waiting", "rst": "Restarts",
-                "wdt": "Watchdog", "hs": "Health"}
-HEALTH_HISTORY = ["day", "sent", "bk", "bd", "bn", "bmin", "ne", "sig", "q", "rst", "wdt", "hs"]
 HEALTH_VALUE = re.compile(r"[0-9A-Za-z._,:+ -]{0,60}")
 
 
@@ -240,13 +235,16 @@ def _f(v):
 
 
 HEALTH_RULES = [    # (field, needs a look if, class, text)
-    ("hs", lambda v: v not in ("OK", ""), "bad", lambda v: v.replace(".", ", ")),
+    # Watchdog and fault restarts have rules of their own: hs only for any other code
+    ("hs", lambda v: bool(set(v.split(".")) - {"OK", "", "WDOG", "CRASH"}), "bad",
+     lambda v: ", ".join(c for c in v.split(".") if c not in ("WDOG", "CRASH"))),
     ("sd", lambda v: v == "0", "bad", lambda v: "SD card fault"),
     ("wdt", lambda v: _f(v) > 0, "bad", lambda v: f"{v} watchdog restart(s)"),
+    ("rst", lambda v: _f(v) > 0, "bad", lambda v: f"{v} fault restart(s)"),
     ("bv", lambda v: _f(v) < 11.0, "bad", lambda v: f"Battery {v} V"),
     ("bmin", lambda v: _f(v) < 11.0, "wait", lambda v: f"Battery fell to {v} V"),
     ("bn", lambda v: _f(v) < 11.5, "wait", lambda v: f"Night battery average {v} V"),
-    ("sent", lambda v: _f(v) <= 92, "wait", lambda v: f"Only {v} of 96 sent"),
+    ("sent", lambda v: _f(v) <= 92, "wait", lambda v: f"{96 - int(_f(v))} of 96 not sent"),
     ("ne", lambda v: _f(v) > 0, "wait", lambda v: f"{v} error(s) logged"),
     ("miss", lambda v: _f(v) >= 4, "wait", lambda v: f"{v} slots missed"),
     ("q", lambda v: _f(v) >= 4, "wait", lambda v: f"{v} records waiting"),
@@ -617,6 +615,111 @@ def fmt_health(key, v):
     return esc(v) + (f" <span class='mute'>{esc(unit)}</span>" if unit else "")
 
 
+def _v(h, k, unit=""):
+    v = h.get(k)
+    if v in (None, ""):
+        return "<span class='mute'>—</span>"
+    return esc(v) + (f" <span class='mute'>{unit}</span>" if unit else "")
+
+
+def fw_text(s, h):
+    """Main firmware with the CTRL firmware next to it."""
+    ctrl = h.get("ctrl") or ""
+    return (f"<b>{esc(s['version']) or '—'}</b> <span class='mute'>· CTRL</span> "
+            + (f"<b>{esc(ctrl)}</b>" if ctrl else "<span class='mute'>—</span>"))
+
+
+def sent_text(h):
+    """'92/96 (3 backlog)' from a v6.9.62 report; '—' from an older one."""
+    if h.get("sent") in (None, ""):
+        return "<span class='mute'>—</span>"
+    bk = h.get("bk") or "0"
+    return f"<b>{esc(h['sent'])}</b><span class='mute'>/96</span> <span class='mute'>({esc(bk)} backlog)</span>"
+
+
+def summary_line(h):
+    """The short line under a station in Needs attention: not sent, day/night battery, carrier."""
+    bits = []
+    if h.get("sent") not in (None, ""):
+        try:
+            int(h["sent"])
+            bits.append(f"Sent {esc(h['sent'])}/96 ({esc(h.get('bk') or '0')} by backlog)")
+        except ValueError:
+            pass
+    if h.get("bd") or h.get("bn"):
+        bits.append(f"Battery day {esc(h.get('bd') or '—')} V / night {esc(h.get('bn') or '—')} V")
+    if h.get("op"):
+        bits.append(esc(h["op"]) + (f" {esc(h['net'])}G" if h.get("net") in ("2", "4") else ""))
+    return " · ".join(bits)
+
+
+def status_text(h):
+    """One line: OK, or what went wrong (restarts and SD card folded in)."""
+    bad = []
+    try:
+        if int(h.get("wdt") or 0):
+            bad.append(f"{h['wdt']} watchdog restart(s)")
+        if int(h.get("rst") or 0):
+            bad.append(f"{h['rst']} fault restart(s)")
+    except ValueError:
+        pass
+    if h.get("sd") == "0":
+        bad.append("SD card fault")
+    if not bad and h.get("hs") not in (None, "", "OK"):
+        bad.append(h["hs"].replace(".", ", "))
+    if not h:
+        return "<span class='mute'>—</span>"
+    return f"<span class='badt'>{esc(', '.join(bad))}</span>" if bad else "<span class='okt'>OK</span>"
+
+
+def health_rows(s, h):
+    """The Health card: (label, html), short and in the order asked for (user, 18 Nov)."""
+    try:
+        not_sent = str(96 - int(h["sent"])) if h.get("sent") not in (None, "") else ""
+    except ValueError:
+        not_sent = ""
+    errs = _v(h, "ne")
+    if h.get("err"):
+        errs += f" <span class='mute'>· newest:</span> <span class='badt'>{esc(h['err'])}</span>"
+    net = " · ".join(x for x in (_v(h, "sig", "dBm") if h.get("sig") else "",
+                                 esc(h["net"] + "G") if h.get("net") in ("2", "4") else "",
+                                 esc(h.get("op") or "")) if x) or "<span class='mute'>—</span>"
+    rows = [
+        ("Status", status_text(h)),
+        ("Day reported", fmt_health("day", h.get("day"))),
+        ("Slots sent", sent_text(h)),
+        ("Slots not sent", esc(not_sent) if not_sent else "<span class='mute'>—</span>"),
+        ("Battery, day average (10:00-16:00)", _v(h, "bd", "V")),
+        ("Battery, night average (22:00-04:00)", _v(h, "bn", "V")),
+        ("Battery, lowest that day", _v(h, "bmin", "V") if h.get("sent") not in (None, "") else "<span class='mute'>—</span>"),
+        ("Battery now", _v(h, "bv", "V")),
+        ("Errors that day", errs),
+        ("Network", net),
+        ("Records waiting now", _v(h, "q")),
+        ("Time on per slot", _v(h, "dur", "s")),
+        ("Clock corrected by", _v(h, "clk", "s")),
+    ]
+    if h.get("sv"):
+        rows.append(("Solar", _v(h, "sv", "V")))
+    if h.get("sens"):
+        rows.append(("Sensors", _v(h, "sens")))
+    if h.get("gps"):
+        rows.append(("Location", fmt_health("gps", h["gps"])))
+    return rows
+
+
+HISTORY_COLS = [
+    ("Day", lambda d: fmt_health("day", d.get("day"))),
+    ("Sent", sent_text),
+    ("Day avg", lambda d: _v(d, "bd", "V")),
+    ("Night avg", lambda d: _v(d, "bn", "V")),
+    ("Lowest", lambda d: _v(d, "bmin", "V") if d.get("sent") not in (None, "") else "<span class='mute'>—</span>"),
+    ("Errors", lambda d: _v(d, "ne")),
+    ("Carrier", lambda d: _v(d, "op")),
+    ("Status", status_text),
+]
+
+
 def type_counts(stations):
     counts = {p: 0 for p in TYPES}
     for s in stations:
@@ -656,8 +759,9 @@ def stations_tab(ptype, search):
         h.append("<div class='scroll'><table><tr><th>Station</th><th>What</th></tr>")
         for s, a in flagged:
             pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a)
+            line = summary_line(health_of(s))
             h.append(f"<tr><td class='nw'><a href='/s?k={esc(s['key'])}'><b>{esc(s['shown_id'])}</b></a></td>"
-                     f"<td>{pills}</td></tr>")
+                     f"<td>{pills}{'<div class=mute style=margin-top:4px>' + line + '</div>' if line else ''}</td></tr>")
         h.append("</table></div>")
     else:
         h.append(f"<p class='hint' style='margin:0'><span class='okt'>Nothing.</span> Every {esc(TYPES[ptype])} station "
@@ -673,25 +777,23 @@ def stations_tab(ptype, search):
              f"<form method='get' action='/' class='row'><input type='hidden' name='tab' value='stations'>"
              f"<input type='hidden' name='type' value='{ptype}'><input name='q' value='{esc(search)}' "
              f"placeholder='Find a station ID' size='16'><button class='plain'>Find</button></form></div>"
-             "<div class='scroll'><table class='list'><tr><th>Station</th><th>Firmware</th><th>Battery</th>"
-             "<th>Signal</th><th>Sent (last day)</th><th>Last check</th><th>Update</th></tr>")
+             "<div class='scroll'><table class='list'><tr><th>Station</th><th>Firmware</th><th>Sent (last day)</th>"
+             "<th>Battery day / night</th><th>Carrier</th><th>Last check</th><th>Update</th></tr>")
     for s in rows:
         hl = health_of(s)
         cls, label, _, pct = station_state(s, st_builds[s["key"]])
         a = attention(s, hl)
         dot = f"<span class='dot {a[0][0]}' title='{esc(', '.join(t for _, t in a))}'></span>" if a else "<span class='dot'></span>"
         bar = f"<div class='bar'><i style='width:{pct}%'></i></div>" if pct is not None else ""
-        if hl.get("sent"):
-            bk = f" <span class='mute'>({esc(hl['bk'])} backlog)</span>" if hl.get("bk") not in (None, "", "0") else ""
-            ontime = f"{esc(hl['sent'])}<span class='mute'>/96</span>{bk}"
-        elif hl.get("ok"):
-            ontime = f"{esc(hl['ok'])}<span class='mute'>/96 (24 h)</span>"
+        if hl.get("bd") or hl.get("bn"):
+            bat = f"{esc(hl.get('bd') or '—')} / {esc(hl.get('bn') or '—')} <span class='mute'>V</span>"
         else:
-            ontime = "<span class='mute'>—</span>"
+            bat = "<span class='mute'>—</span>"
+        carrier = esc(hl.get("op") or "") + (f" <span class='mute'>{esc(hl['net'])}G</span>" if hl.get("net") in ("2", "4") else "")
         h.append(f"<tr><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(s['shown_id'])}</b></a></td>"
-                 f"<td class='nw'>{esc(s['version']) or '<span class=mute>—</span>'}</td>"
-                 f"<td class='nw'>{fmt_health('bv', hl.get('bv'))}</td><td class='nw'>{fmt_health('sig', hl.get('sig'))}</td>"
-                 f"<td class='nw'>{ontime}</td><td class='nw'>{esc(when(s['last_seen']))}</td>"
+                 f"<td class='nw'>{fw_text(s, hl)}</td><td class='nw'>{sent_text(hl)}</td>"
+                 f"<td class='nw'>{bat}</td><td class='nw'>{carrier or '<span class=mute>—</span>'}</td>"
+                 f"<td class='nw'>{esc(when(s['last_seen']))}</td>"
                  f"<td class='nw'><span class='pill {cls}'>{esc(label)}</span>{bar}</td></tr>")
     if not rows:
         h.append(f"<tr><td colspan='7' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
@@ -766,22 +868,19 @@ def station_page(key, message=""):
              f"{esc(s['shown_id'])} <span class='mute' style='font-size:15px;font-weight:400'>{esc(TYPES.get(s['profile'], '?'))}</span></h2>"
              f"<div>{pills}</div></div>"
              f"<div class='kv' style='margin-top:14px'>"
-             f"<div><span>Firmware</span><b>{esc(s['version']) or '—'}</b> <span class='crc'>{esc(s['running_crc'])}</span></div>"
+             f"<div><span>Firmware</span><span>{fw_text(s, hl)} <span class='crc'>{esc(s['running_crc'])}</span></span></div>"
              f"<div><span>Last check</span>{esc(when(s['last_seen']))}</div>"
              f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware v6.9.60 on)</span>'}</div>"
              f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
 
     # Health
-    h.append("<div class='card'><h2>Health</h2><p class='hint'>From the unit's last daily report (13:00 to 14:15, "
-             "about the day 08:45 to 08:30 before it).</p><div class='kv'>")
-    for key_, label_, _unit in HEALTH_FIELDS:
-        if key_ in ("sens", "sv") and s["profile"] != 2 and not hl.get(key_):
-            continue        # Sensors and solar: TWS only, unless a TRG sends them
-        if key_ in HEALTH_LEGACY and key_ not in hl:
-            continue
-        if key_ in ("day", "sent", "bk", "bd", "bn", "ne", "err") and "ok" in hl and key_ not in hl:
-            continue        # A v6.9.60-61 report: it has the 24-hour counts instead
-        h.append(f"<div><span>{esc(label_)}</span><span>{fmt_health(key_, hl.get(key_))}</span></div>")
+    old_report = bool(hl) and hl.get("sent") in (None, "")
+    h.append("<div class='card'><h2>Health</h2><p class='hint'>From the daily report at 12:30-14:15, about the day "
+             "08:45 to 08:30 before it." + (" <b>This report is from firmware before v6.9.62</b>, which doesn't send "
+                                            "the day's counts or battery averages." if old_report else "") +
+             "</p><div class='kv'>")
+    for label_, value in health_rows(s, hl):
+        h.append(f"<div><span>{esc(label_)}</span><span>{value}</span></div>")
     h.append("</div></div>")
 
     # Update
@@ -796,17 +895,17 @@ def station_page(key, message=""):
              f"<select id='tsel' name='target'>{sel}</select><button>Set</button></form></div>")
 
     # Health history
-    h.append("<div class='card'><h2>Health history</h2><div class='scroll'><table><tr><th>When</th>" +
-             "".join(f"<th>{esc(HEALTH_SHORT[k])}</th>" for k in HEALTH_HISTORY) + "</tr>")
+    h.append("<div class='card'><h2>Health history</h2><div class='scroll'><table><tr><th>Received</th>" +
+             "".join(f"<th>{esc(t)}</th>" for t, _ in HISTORY_COLS) + "</tr>")
     for r in reports:
         try:
             d = json.loads(r["data"])
         except ValueError:
             d = {}
         h.append(f"<tr><td class='nw'>{esc(when(r['at']))}</td>" +
-                 "".join(f"<td class='nw'>{fmt_health(k, d.get(k))}</td>" for k in HEALTH_HISTORY) + "</tr>")
+                 "".join(f"<td class='nw'>{fn(d)}</td>" for _, fn in HISTORY_COLS) + "</tr>")
     if not reports:
-        h.append(f"<tr><td colspan='{len(HEALTH_HISTORY) + 1}' class='mute'>No health report yet.</td></tr>")
+        h.append(f"<tr><td colspan='{len(HISTORY_COLS) + 1}' class='mute'>No health report yet.</td></tr>")
     h.append("</table></div></div>")
 
     # Events
