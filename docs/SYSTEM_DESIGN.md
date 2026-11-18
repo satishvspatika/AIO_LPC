@@ -529,7 +529,7 @@ image, `-` and reported; else `f` (never taken again; another build is). A CTRL 
 failure while sending: the file is dropped and fetched again at a later check (at most twice a day), not `f`.
 Office page: `ctrl.hex` uploads as "CTRL, every type"; it can be chosen in Send an update (ticked stations, or
 every station of the type as they are now) or per station (CTRL firmware: Gets); stations list and page show its
-state. Host test `tests/ota_test.c` section 16 (mutation-checked); local server run: download identical, success,
+state. CTRL's CRC not learned during the slot's hold (a late wake): the check asks the CTRL itself, only on check slots, a CTRL download or right after a CTRL install; a CTRL silent after its install is asked at check slots only. Host test `tests/ota_test.c` section 16 (mutation-checked); local server run: download identical, success,
 failure, main first.
 
 ### 7.7 Health report (v6.9.60, `health.c`; office side in `ota_server/lpc_ota.py`)
@@ -844,7 +844,7 @@ Unit 1922 (KSNDMC_TRG, Airtel IoT SIM) unless noted.
 | RTC coin cell | Can't be measured on this board; firmware can only detect a stop. ADC link proposed for the next board |
 | Old 4G registration taken in 2G-only mode | Fixed in v6.9.63 (1922, 18 Nov 11:31): "straight to 2G" set CNMP=13, then the LTE `+CEREG: 0,1` the modem booted with was taken as LTE at once; data took 17 s while the radio changed and the plan learned 4G works. In 2G-only mode CEREG is now ignored and CGREG counts only once COPS shows the modem off LTE |
 | First `AT+CGACT` wait | v6.9.63: 12 s (was 25 s). 1922, 18 Nov 09:16 on 2G: no answer in 25 s, the retry OK in under 1 s. The second try keeps 25 s. Check on the next card: how often a first try took over 12 s and still succeeded |
-| Flash | v6.9.63 (with CTRL by OTA, after shortening 77 long log lines, about 2.1 KB): BIHAR 130,292 of 131,072 bytes (780 spare), KSNDMC_TRG 129,984, KSNDMC_TWS 129,740. About 25 KB of the image is text strings: the next room comes from there |
+| Flash | v6.9.63 (with CTRL by OTA, after shortening 77 long log lines, about 2.1 KB): BIHAR 130,296 of 131,072 bytes (776 spare), KSNDMC_TRG 129,988, KSNDMC_TWS 129,744. About 25 KB of the image is text strings: the next room comes from there |
 
 ---
 

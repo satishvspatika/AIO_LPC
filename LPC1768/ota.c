@@ -380,7 +380,18 @@ void ota_slot_step(int slot)
         }
         due = true;     /* Tell the server now */
     }
-    const uint32_t ctrl_crc = fw_app_ctrl_crc();
+    uint32_t ctrl_crc = fw_app_ctrl_crc();
+    if (ctrl_crc == 0 && (due || bench || s_st.phase == 'd' || s_st.phase == 'i')) {
+        /* Not asked yet this boot (a late wake has no hold before +62 s to ask in): asked now, at most
+         * 7.5 s if the CTRL is silent. Firmware on trial is confirmed by fw_app.c, not here. */
+        static fw_ctrl_state_t s_cs;
+        if (fw_ctrl_query(&s_cs) && s_cs.state != FW_J_TRIAL_BOOT) {
+            ctrl_crc = s_cs.crc32;
+        }
+    }
+    if (s_st.phase == 'i' && ctrl_crc == 0 && !due && !bench) {
+        return;     /* CTRL not answering yet: asked again at the next check slot, not every slot */
+    }
     if (s_st.phase == 'i' && ctrl_crc != 0) {
         /* v6.9.63: a CTRL install was started: is the CTRL running it? (Not known yet: asked next slot) */
         if (s_st.image_crc == ctrl_crc) {

@@ -1557,7 +1557,8 @@ void ui_sleep_when_confirmed(void)
  * to be refused with nothing on the LCD and "slot is due" in the log (1922, 18 Nov). */
 static const char *sleep_blocker(bool with_modem)
 {
-    if (s_fw_running || s_fw_ui == FW_UI_BUSY) return "UPDATE RUNNING  ";
+    /* s_fw_running, not s_fw_ui: a job that ended with its screen still BUSY must not hold the unit on */
+    if (s_fw_running) return "UPDATE RUNNING  ";
     if (s_slot_busy || slot_scheduler_is_due()) return "SENDING DATA... ";
     if (fw_app_trial_unconfirmed())            return "CHECKING NEW F/W";
     if (s_gps_running)                         return "STOPPING GPS... ";
@@ -1583,7 +1584,7 @@ void ui_enter_sleep(void)
         snprintf(msg, sizeof(msg), "Sleep waits: %.16s", blocker);
         storage_log_debug("PWR", msg);
         s_inactivity_ticks = 0;
-        if (!s_fw_running && s_fw_ui != FW_UI_BUSY) {
+        if (!s_fw_running) {
             s_sleep_deferred = true;
         }
         return;
@@ -2025,7 +2026,7 @@ static void request_power_save(void)
     static char msg[48];
     snprintf(msg, sizeof(msg), "Power save waits: %.16s", blocker);
     storage_log_debug("PWR", msg);
-    const bool update = s_fw_running || s_fw_ui == FW_UI_BUSY;
+    const bool update = s_fw_running;
     if (!update) {
         s_sleep_deferred = true;    /* An update ends in a restart: nothing to wait for */
     }

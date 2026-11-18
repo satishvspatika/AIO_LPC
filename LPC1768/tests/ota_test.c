@@ -55,7 +55,8 @@ static uint32_t s_ctrl_crc = 0x33333333UL;
 static bool s_ctrl_answers = true, s_ctrl_trial = false;
 static fw_result_t s_ctrl_send_result = FW_OK;
 static int s_ctrl_sent = 0, s_ctrl_restarts = 0, s_ctrl_checked = 0;
-uint32_t fw_app_ctrl_crc(void) { return s_ctrl_crc; }
+static bool s_app_knows_ctrl = true;   /* False: not asked during the hold (a late wake) */
+uint32_t fw_app_ctrl_crc(void) { return s_app_knows_ctrl ? s_ctrl_crc : 0; }
 bool fw_ctrl_query(fw_ctrl_state_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -283,7 +284,7 @@ static void fresh(void)
     s_health_built = s_health_sent = 0; s_health_pending = 99;
     s_checked = s_staged = s_resets = 0; s_check_result = FW_OK; s_lowest_offset = 0xFFFFFFFFUL; s_last_check[0] = 0;
     s_ctrl_crc = 0x33333333UL; s_ctrl_answers = true; s_ctrl_trial = false; s_ctrl_send_result = FW_OK;
-    s_ctrl_sent = s_ctrl_restarts = s_ctrl_checked = 0; s_rain_live = 0.0f;
+    s_ctrl_sent = s_ctrl_restarts = s_ctrl_checked = 0; s_rain_live = 0.0f; s_app_knows_ctrl = true;
 }
 static void new_firmware(uint32_t size, unsigned seed)
 {
@@ -548,7 +549,18 @@ int main(void)
     CHECK(!step(DAILY + 1)); CHECK(phase() == 'i');
     s_ctrl_crc = s_fw_image_crc; s_tick += 900000; set_clock(31, 10);
     CHECK(!step(DAILY + 2)); CHECK(phase() == '-');
-    /* Raining: the whole file waits on the card, installed at the next dry slot without fetching again */
+    /* Not known from the hold (late wake): the check asks the CTRL itself, and the offer is taken */
+    fresh(); s_app_knows_ctrl = false; s_server = SRV_CTRL;
+    CHECK(step(DAILY)); CHECK(strstr(s_last_check, "&cc=33333333&") && s_ctrl_sent == 1 && phase() == 'i');
+    /* ... but not on an ordinary slot with nothing under way */
+    fresh(); s_app_knows_ctrl = false; s_ctrl_answers = false; CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 0);
+    /* ... and a CTRL that stays silent after the install is asked at check slots only, not every slot */
+    fresh(); s_server = SRV_CTRL; CHECK(step(DAILY)); s_ctrl_crc = 0; s_ctrl_answers = false; s_server = SRV_NONE;
+    s_tick += 900000; set_clock(16, 10);
+    { int before = s_get_calls; CHECK(!step(DAILY + 1)); CHECK(s_get_calls == before && phase() == 'i'); }
+    s_tick += 900000; set_clock(1, 10);
+    CHECK(!step(DAILY)); CHECK(phase() == 'i' && strstr(s_last_check, "&cc=00000000&"));
+        /* Raining: the whole file waits on the card, installed at the next dry slot without fetching again */
     fresh(); s_server = SRV_CTRL; s_rain_live = 0.5f;
     CHECK(!step(DAILY)); CHECK(card_has_whole_file() && s_ctrl_sent == 0 && phase() == 'd' && strstr(s_log, "raining"));
     pieces = s_piece_calls; s_rain_live = 0.0f; s_tick += 900000; set_clock(16, 10);
