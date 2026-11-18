@@ -235,7 +235,12 @@ void ota_install_step(void)
     }
 }
 
-/* v6.9.60: twice a day (night and day), each with the health report */
+static int two_digits(const char *p)
+{
+    return (p[0] - '0') * 10 + (p[1] - '0');
+}
+
+/* v6.9.60: twice a day (night and day). v6.9.62: the health report only with the day one */
 static bool check_slot(int slot)
 {
     const int offset = (int)(strtoul(flash_nvram_get_station_id(), NULL, 10) % OTA_DAILY_SPREAD_SLOTS);
@@ -292,9 +297,10 @@ void ota_slot_step(int slot)
     if (!due && s_st.phase != 'D' && s_st.phase != 'I' && !bench) {
         return;
     }
-    /* The health report goes with the twice-daily check and its retries, and on a bench unit (OTA.NOW)
-     * with every check, so a test needn't wait for 00:30 or 12:30 */
-    const bool report = due || bench;
+    /* v6.9.62: the health report goes once a day, with the day check (12:30 + offset) and its retries
+     * (user, 18 Nov: one a day is enough; the night check only asks for firmware). On a bench unit
+     * (OTA.NOW) with every check, so a test needn't wait. */
+    const bool report = (due && two_digits(t + 8) >= 12) || bench;
     /* v6.9.57: said, not silent (1922 on 17 Nov: a check put off for an hour with nothing in the log).
      * v6.9.60: the twice-daily check (health report, install report) goes anyway: a station with records
      * waiting is the one to see. Only a download waits for them. */

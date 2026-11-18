@@ -565,6 +565,39 @@ v6.9.61 (first night of v6.9.60 on 1922, 17 Nov): two ways a half-day's report w
 - Check times moved half an hour earlier (user, 17 Nov): 00:30 and 12:30 plus the station's offset (station
   number mod 8 slots), so 00:30-02:15 and 12:30-14:15. 1922: 01:00 and 13:00.
 
+**v6.9.62 (user, 18 Nov): one report a day, about the last whole MET day.** Only the day check (12:30 +
+offset, 1922 13:00) and its retries carry the report; the night check (00:30 + offset) only asks for
+firmware (a partial day at night would read worse than it is and can't be compared day to day). The report
+covers the MET day 08:45 the day before to 08:30 today, named by its close date (`day`, as the DATA file).
+It is counted from the unit's **flash** record and error logs, not the card (1922, 17 Nov 21:00: the card
+lost every write of one slot; counted from SLOTS.CSV it would have looked like a missed slot).
+
+| Field | Meaning | Source on the unit |
+|---|---|---|
+| `day` | close date YYYYMMDD of the day reported | now, or a record of that day before 08:45 |
+| `sent` | records of that day delivered (in their own slot or later), of 96 | flash records with a payload, minus those still waiting |
+| `bk` | ... of them delivered later than their own slot (backlog, gap/off-filled) | outage/resumed markers in the flash log |
+| `bd`, `bn` | average battery 10:00-15:45 and 22:00-03:45 (V); left out with no reading | flash records' battery |
+| `bmin` | lowest battery that day (was: last 24 h) | flash records' battery |
+| `ne`, `err` | error log entries that day (each error at most once a day), newest one's text (48 chars) | flash error log |
+| `ok`, `late`, `miss` | no longer sent (v6.9.60-61 only) | |
+
+Still waiting: the queue sends oldest first, so the waiting records are the newest late ones; the day now
+running's late records count first, any more waiting are the reported day's. Off-filled records (signal -110/-112)
+carry a copied battery value and are left out of the battery figures. A space is sent as `+` (and a `+` of
+its own as `-`). `dur`, `q`, `rst`, `wdt`, `bv`, `sig`, `net`, `op`, `ctrl`, `clk`, `gps` as before.
+Image 130.1-130.4 KB of 128 KB slot, **628 B left on BIHAR**: the next feature needs space found first.
+Main task worst stack unchanged (824 B spare; the report path is not the deepest). Host test
+`tests/health_test.c` rewritten (missing, stopped, off-filled, late and still-waiting records, averages, error
+window, night bench report, no clock).
+
+Office page v4 (same change): everything is kept apart by unit type. A type switch at the top of Stations,
+Firmware files and History (each type with its station count and how many need a look); Needs attention,
+firmware list, uploads (filed under the file's own type, the page then shows that type) and history show one
+type. Events carry their type (`events.profile`, filled in for old events from the station or the type/build
+named in the text; a password change belongs to every type). Rules added: 4+ of 96 not sent, any error logged,
+night battery average under 11.5 V.
+
 ---
 
 ## 8. Data storage

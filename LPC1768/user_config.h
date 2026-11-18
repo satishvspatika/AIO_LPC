@@ -20,7 +20,7 @@
 #endif
 
 /* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.61"
+#define FIRMWARE_VERSION "v6.9.62"
 
 /* THE production switch. 1 = field build:
  *   - MENU > KEY TEST hidden (and TEST SEND can't be switched on)
@@ -193,7 +193,7 @@
 #define OTA_NOW_FILENAME        "OTA.NOW"     /* On the card (any content, or empty): check at every slot (bench) */
 #define OTA_RETRY_FILENAME      "OTARETRY.DAT" /* v6.9.57: "YYYYMMDD n": the daily check failed, n tries since */
 #define OTA_RETRIES             3             /* Further tries that day after a failed daily check */
-#define OTA_NIGHT_FIRST_SLOT    2             /* 00:30 (v6.9.61; was 01:00): a second check (with the health report) at night */
+#define OTA_NIGHT_FIRST_SLOT    2             /* 00:30 (v6.9.61; was 01:00): a second check at night (firmware only from v6.9.62) */
 #define OTA_MIN_BATTERY_V       11.0f         /* v6.9.61 (was GPS_MIN_BATTERY_V, 11.8 V): no OTA download or keypad SD update below this */
 #define HEALTH_FILENAME         "HEALTH.DAT"  /* v6.9.60: restart counts since the last health report */
 /* The daily check: 12:30 + 15 min x (station number mod 8), so 12:30 to 14:15 (v6.9.61; was 13:00). By

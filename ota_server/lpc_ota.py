@@ -145,6 +145,20 @@ def init_db():
         CREATE TABLE IF NOT EXISTS health (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, at INTEGER, data TEXT);
         CREATE INDEX IF NOT EXISTS health_key ON health (key, id);
         """)
+        ecols = {r["name"] for r in con.execute("PRAGMA table_info(events)")}
+        if "profile" not in ecols:
+            # Office page v4: everything is kept apart by unit type. Old events get their type from the
+            # station, or from the build or type name in the text; the rest (password) show for every type.
+            con.execute("ALTER TABLE events ADD COLUMN profile INTEGER")
+            con.execute("UPDATE events SET profile=(SELECT profile FROM stations WHERE stations.shown_id=events.station)"
+                        " WHERE station != ''")
+            for e in con.execute("SELECT id, text FROM events WHERE station='' OR station IS NULL").fetchall():
+                p = next((k for k, t in TYPES.items() if t in e["text"]), None)
+                m = re.match(r"build #(\d+)", e["text"])
+                if p is None and m:
+                    b = con.execute("SELECT profile FROM builds WHERE id=?", (int(m.group(1)),)).fetchone()
+                    p = b["profile"] if b else None
+                con.execute("UPDATE events SET profile=? WHERE id=?", (p, e["id"]))
         cols = {r["name"] for r in con.execute("PRAGMA table_info(stations)")}
         if "health" not in cols:
             con.execute("ALTER TABLE stations ADD COLUMN health TEXT DEFAULT ''")
@@ -152,8 +166,12 @@ def init_db():
             con.execute("ALTER TABLE stations ADD COLUMN health_at INTEGER DEFAULT 0")
 
 
-def add_event(con, station, text):
-    con.execute("INSERT INTO events (at, station, text) VALUES (?,?,?)", (int(time.time()), station, text))
+def add_event(con, station, text, profile=None):
+    """profile: the unit type it belongs to; for a station, its own when not given. None: every type."""
+    if profile is None and station:
+        row = con.execute("SELECT profile FROM stations WHERE shown_id=?", (station,)).fetchone()
+        profile = row["profile"] if row else None
+    con.execute("INSERT INTO events (at, station, text, profile) VALUES (?,?,?,?)", (int(time.time()), station, text, profile))
     con.execute("DELETE FROM events WHERE id < (SELECT MAX(id) FROM events) - 2000")
 
 
@@ -181,16 +199,20 @@ def target_build(con, st):
 # a look. A unit without them (before v6.9.60) is unaffected. Planned unit side: docs/SYSTEM_DESIGN.md 7.7.
 
 HEALTH_FIELDS = [   # (field, label, unit)
-    ("hs", "Health status", ""),                    # "OK" or fault codes joined by ".", e.g. RTC_FAIL.WDOG (ESP32 health_sts)
+    ("hs", "Health status", ""),                    # "OK" or fault codes joined by ".", e.g. WDOG.CRASH
+    ("day", "Day reported", ""),                    # v6.9.62: MET day 08:45 to 08:30, named by its close date YYYYMMDD
+    ("sent", "Records sent that day", "of 96"),     # v6.9.62: delivered, in their own slot or later
+    ("bk", "... of them by backlog", ""),           # v6.9.62: delivered later than their own slot
+    ("bd", "Battery average, day (10:00-16:00)", "V"),
+    ("bn", "Battery average, night (22:00-04:00)", "V"),
+    ("bmin", "Battery lowest that day", "V"),       # up to v6.9.61: lowest in the last 24 h
     ("bv", "Battery now", "V"),
-    ("bmin", "Battery lowest, 24 h", "V"),
+    ("ne", "Errors logged that day", ""),           # v6.9.62
+    ("err", "Newest error that day", ""),           # v6.9.62
     ("sv", "Solar", "V"),
     ("sig", "Signal", "dBm"),
     ("net", "Network", ""),                         # 2 or 4 (G)
     ("op", "Operator", ""),
-    ("ok", "Slots sent on time, 24 h", "of 96"),
-    ("late", "Queued to send later, 24 h", ""),
-    ("miss", "Slots missed or unit off, 24 h", ""),
     ("q", "Records waiting now", ""),
     ("dur", "Average time on per slot", "s"),
     ("rst", "Fault restarts since last report", ""),
@@ -200,12 +222,17 @@ HEALTH_FIELDS = [   # (field, label, unit)
     ("clk", "Clock corrected by", "s"),
     ("sens", "Sensors", ""),                        # TWS: e.g. TH-OK,WS-OK,WD-OK
     ("gps", "Location", ""),                        # lat,lon
+    ("ok", "Slots sent on time, 24 h", "of 96"),    # v6.9.60-61 only (shown when sent)
+    ("late", "Queued to send later, 24 h", ""),     # v6.9.60-61 only
+    ("miss", "Slots missed or unit off, 24 h", ""), # v6.9.60-61 only
 ]
+HEALTH_LEGACY = {"ok", "late", "miss"}              # Shown only in a report that has them
 HEALTH_UNITS = {k: u for k, _, u in HEALTH_FIELDS}
-HEALTH_SHORT = {"bv": "Battery", "bmin": "Lowest", "sig": "Signal", "net": "Net", "ok": "On time", "late": "Queued",
-                "miss": "Missed", "q": "Waiting", "rst": "Restarts", "wdt": "Watchdog", "hs": "Health"}
-HEALTH_HISTORY = ["bv", "bmin", "sig", "net", "ok", "late", "miss", "rst", "wdt", "hs"]
-HEALTH_VALUE = re.compile(r"[0-9A-Za-z._,:+-]{0,40}")
+HEALTH_SHORT = {"day": "Day", "sent": "Sent", "bk": "Backlog", "bd": "Day avg", "bn": "Night avg", "bmin": "Lowest",
+                "bv": "Battery", "ne": "Errors", "sig": "Signal", "net": "Net", "q": "Waiting", "rst": "Restarts",
+                "wdt": "Watchdog", "hs": "Health"}
+HEALTH_HISTORY = ["day", "sent", "bk", "bd", "bn", "bmin", "ne", "sig", "q", "rst", "wdt", "hs"]
+HEALTH_VALUE = re.compile(r"[0-9A-Za-z._,:+ -]{0,60}")
 
 
 def _f(v):
@@ -218,6 +245,9 @@ HEALTH_RULES = [    # (field, needs a look if, class, text)
     ("wdt", lambda v: _f(v) > 0, "bad", lambda v: f"{v} watchdog restart(s)"),
     ("bv", lambda v: _f(v) < 11.0, "bad", lambda v: f"Battery {v} V"),
     ("bmin", lambda v: _f(v) < 11.0, "wait", lambda v: f"Battery fell to {v} V"),
+    ("bn", lambda v: _f(v) < 11.5, "wait", lambda v: f"Night battery average {v} V"),
+    ("sent", lambda v: _f(v) <= 92, "wait", lambda v: f"Only {v} of 96 sent"),
+    ("ne", lambda v: _f(v) > 0, "wait", lambda v: f"{v} error(s) logged"),
     ("miss", lambda v: _f(v) >= 4, "wait", lambda v: f"{v} slots missed"),
     ("q", lambda v: _f(v) >= 4, "wait", lambda v: f"{v} records waiting"),
     ("sig", lambda v: _f(v) <= -105, "wait", lambda v: f"Weak signal {v} dBm"),
@@ -256,7 +286,7 @@ def unit_check(q, ip):
             con.execute("INSERT INTO stations (key, shown_id, profile, version, running_crc, unit_status, tried_crc,"
                         " last_seen, last_ip) VALUES (?,?,?,?,?,?,?,?,?)",
                         (key, stn, profile, version, crc, status, tried, now, ip))
-            add_event(con, stn, f"first check-in: {TYPES.get(profile, '?')} {version} ({crc})")
+            add_event(con, stn, f"first check-in: {TYPES.get(profile, '?')} {version} ({crc})", profile)
             st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
         else:
             if st["running_crc"] != crc:
@@ -415,6 +445,7 @@ details summary{cursor:pointer;color:var(--acc);font-size:14px}
 .seg a{padding:8px 14px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);text-decoration:none;font-weight:600;font-size:14px}
 .seg a span{color:var(--mute);font-weight:500;margin-left:4px}.seg a.on{background:var(--acc);border-color:var(--acc);color:var(--acc-ink)}
 .seg a.on span{color:var(--acc-ink);opacity:.8}
+.seg.types{margin:0 0 16px}.seg.types a{font-size:15px}.seg a.on .badt{color:var(--acc-ink)}
 table.list td{vertical-align:middle}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:var(--ok)}
 .dot.bad{background:var(--bad)}.dot.wait{background:var(--wait)}
@@ -445,19 +476,43 @@ def when(ts):
     return f"{text} ({age // 86400} days ago)"
 
 
-def page(title, body, tab=None, message="", script=""):
+TYPED_TABS = ("stations", "firmware", "history")
+
+
+def type_bar(tab, ptype):
+    """The unit type switch: Stations, Firmware files and History each show one type at a time.
+    Each type shows its station count and how many of them need a look, so nothing is missed."""
+    with db() as con:
+        stations = con.execute("SELECT * FROM stations").fetchall()
+    counts = type_counts(stations)
+    flagged = {p: 0 for p in TYPES}
+    for st in stations:
+        if st["profile"] in flagged and attention(st, health_of(st)):
+            flagged[st["profile"]] += 1
+    items = []
+    for p, t in TYPES.items():
+        warn = f" <b class='badt'>· {flagged[p]} need a look</b>" if flagged[p] else ""
+        items.append(f"<a href='/?tab={tab}&type={p}' class='{'on' if p == ptype else ''}'>{esc(t)} "
+                     f"<span>{counts[p]}</span>{warn}</a>")
+    return "<div class='seg types'>" + "".join(items) + "</div>"
+
+
+def page(title, body, tab=None, message="", script="", ptype=None):
     head = (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title>"
             f"<style>{PAGE_CSS}</style></head><body>")
     if tab is None:
         return (head + f"<main>{body}</main></body></html>").encode()
-    nav = "".join(f"<a href='/?tab={k}' class='{'on' if k == tab else ''}'>{t}</a>" for k, t in TABS)
+    tq = f"&type={ptype}" if ptype in TYPES else ""
+    nav = "".join(f"<a href='/?tab={k}{tq if k in TYPED_TABS else ''}' class='{'on' if k == tab else ''}'>{t}</a>"
+                  for k, t in TABS)
+    bar = type_bar(tab, ptype) if tab in TYPED_TABS and ptype in TYPES else ""
     msg = ""
     if message:
         cls = "msg bad" if message.lower().startswith(("file refused", "wrong", "not ", "no ", "the new", "build #")) and "deleted" not in message else "msg"
         msg = f"<div class='{cls}'>{esc(message)}</div>"
     return (head + f"<header><div class='top'><b>LPC-AIO stations &amp; firmware</b><a href='/logout'>Log out</a></div>"
-            f"<nav>{nav}</nav></header><main>{msg}{body}</main>{script}</body></html>").encode()
+            f"<nav>{nav}</nav></header><main>{bar}{msg}{body}</main>{script}</body></html>").encode()
 
 
 def build_name(b):
@@ -548,6 +603,14 @@ def fmt_health(key, v):
         return "<span class='okt'>OK</span>" if v == "OK" else f"<span class='badt'>{esc(v.replace('.', ', '))}</span>"
     if key == "net":
         return esc(f"{v}G") if v in ("2", "4") else esc(v)
+    if key == "day" and re.fullmatch(r"\d{8}", v):
+        try:
+            t = time.mktime(time.strptime(v, "%Y%m%d"))
+        except ValueError:
+            return esc(v)
+        return esc(time.strftime("%d %b", time.localtime(t - 86400)) + " 08:45 to " + time.strftime("%d %b", time.localtime(t)) + " 08:30")
+    if key == "err":
+        return f"<span class='badt'>{esc(v)}</span>"
     if key == "gps" and "," in v:
         lat, _, lon = v.partition(",")
         return f"<a href='https://maps.google.com/?q={esc(lat)},{esc(lon)}' target='_blank' rel='noopener'>{esc(v)}</a>"
@@ -562,6 +625,15 @@ def type_counts(stations):
     return counts
 
 
+def pick_type(ptype):
+    """The type asked for, or the one with the most stations."""
+    if ptype in TYPES:
+        return ptype
+    with db() as con:
+        counts = type_counts(con.execute("SELECT profile FROM stations").fetchall())
+    return max(TYPES, key=lambda p: (counts[p], -p))
+
+
 def stations_tab(ptype, search):
     with db() as con:
         builds = con.execute("SELECT * FROM builds ORDER BY id DESC").fetchall()
@@ -569,34 +641,28 @@ def stations_tab(ptype, search):
         stations = con.execute("SELECT * FROM stations ORDER BY CAST(key AS INTEGER), key").fetchall()
         st_builds = {s["key"]: target_build(con, s) for s in stations}
     by_id = {b["id"]: b for b in builds}
-    counts = type_counts(stations)
-    if ptype not in TYPES:
-        ptype = max(TYPES, key=lambda p: (counts[p], -p))     # The busiest type first
     h = []
 
-    # Needs attention: every type, so nothing is missed by looking at one tab
+    # Needs attention: this type's stations (the type switch above counts the others)
     flagged = []
     for s in stations:
+        if s["profile"] != ptype:
+            continue
         a = attention(s, health_of(s))
         if a:
             flagged.append((s, a))
-    h.append("<div class='card'><h2>Needs attention</h2>")
+    h.append(f"<div class='card'><h2>{esc(TYPES[ptype])}: needs attention</h2>")
     if flagged:
-        h.append("<div class='scroll'><table><tr><th>Station</th><th>Type</th><th>What</th></tr>")
+        h.append("<div class='scroll'><table><tr><th>Station</th><th>What</th></tr>")
         for s, a in flagged:
             pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a)
             h.append(f"<tr><td class='nw'><a href='/s?k={esc(s['key'])}'><b>{esc(s['shown_id'])}</b></a></td>"
-                     f"<td class='nw'>{esc(TYPES.get(s['profile'], '?'))}</td><td>{pills}</td></tr>")
+                     f"<td>{pills}</td></tr>")
         h.append("</table></div>")
     else:
-        h.append("<p class='hint' style='margin:0'><span class='okt'>Nothing.</span> Every station checked in within "
-                 "26 hours and reports no problem.</p>")
+        h.append(f"<p class='hint' style='margin:0'><span class='okt'>Nothing.</span> Every {esc(TYPES[ptype])} station "
+                 "checked in within 26 hours and reports no problem.</p>")
     h.append("</div>")
-
-    # Type tabs
-    h.append("<div class='seg'>" + "".join(
-        f"<a href='/?tab=stations&type={p}' class='{'on' if p == ptype else ''}'>{esc(t)} <span>{counts[p]}</span></a>"
-        for p, t in TYPES.items()) + "</div>")
 
     # The type's stations
     rows = [s for s in stations if s["profile"] == ptype]
@@ -608,14 +674,20 @@ def stations_tab(ptype, search):
              f"<input type='hidden' name='type' value='{ptype}'><input name='q' value='{esc(search)}' "
              f"placeholder='Find a station ID' size='16'><button class='plain'>Find</button></form></div>"
              "<div class='scroll'><table class='list'><tr><th>Station</th><th>Firmware</th><th>Battery</th>"
-             "<th>Signal</th><th>On time (24 h)</th><th>Last check</th><th>Update</th></tr>")
+             "<th>Signal</th><th>Sent (last day)</th><th>Last check</th><th>Update</th></tr>")
     for s in rows:
         hl = health_of(s)
         cls, label, _, pct = station_state(s, st_builds[s["key"]])
         a = attention(s, hl)
         dot = f"<span class='dot {a[0][0]}' title='{esc(', '.join(t for _, t in a))}'></span>" if a else "<span class='dot'></span>"
         bar = f"<div class='bar'><i style='width:{pct}%'></i></div>" if pct is not None else ""
-        ontime = (f"{esc(hl['ok'])}<span class='mute'>/96</span>" if hl.get("ok") else "<span class='mute'>—</span>")
+        if hl.get("sent"):
+            bk = f" <span class='mute'>({esc(hl['bk'])} backlog)</span>" if hl.get("bk") not in (None, "", "0") else ""
+            ontime = f"{esc(hl['sent'])}<span class='mute'>/96</span>{bk}"
+        elif hl.get("ok"):
+            ontime = f"{esc(hl['ok'])}<span class='mute'>/96 (24 h)</span>"
+        else:
+            ontime = "<span class='mute'>—</span>"
         h.append(f"<tr><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(s['shown_id'])}</b></a></td>"
                  f"<td class='nw'>{esc(s['version']) or '<span class=mute>—</span>'}</td>"
                  f"<td class='nw'>{fmt_health('bv', hl.get('bv'))}</td><td class='nw'>{fmt_health('sig', hl.get('sig'))}</td>"
@@ -626,7 +698,7 @@ def stations_tab(ptype, search):
     h.append("</table></div>")
     if not any(health_of(s) for s in rows) and rows:
         h.append("<p class='hint' style='margin:10px 0 0'>Battery, signal and slot counts come in the daily health "
-                 "report, from firmware v6.9.60 on.</p>")
+                 "report (firmware v6.9.60 on; the last whole day from v6.9.62).</p>")
     h.append("</div>")
 
     # Send an update, for this type only
@@ -670,7 +742,7 @@ setInterval(function(){{
   if(!busy) location.replace('/?tab=stations&type={ptype}' + {json.dumps('&q=' + search) if search else "''"});
 }},30000);
 </script>"""
-    return "".join(h), script, ptype
+    return "".join(h), script
 
 
 def station_page(key, message=""):
@@ -700,10 +772,15 @@ def station_page(key, message=""):
              f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
 
     # Health
-    h.append("<div class='card'><h2>Health</h2><p class='hint'>From the unit's last daily report.</p><div class='kv'>")
+    h.append("<div class='card'><h2>Health</h2><p class='hint'>From the unit's last daily report (13:00 to 14:15, "
+             "about the day 08:45 to 08:30 before it).</p><div class='kv'>")
     for key_, label_, _unit in HEALTH_FIELDS:
         if key_ in ("sens", "sv") and s["profile"] != 2 and not hl.get(key_):
             continue        # Sensors and solar: TWS only, unless a TRG sends them
+        if key_ in HEALTH_LEGACY and key_ not in hl:
+            continue
+        if key_ in ("day", "sent", "bk", "bd", "bn", "ne", "err") and "ok" in hl and key_ not in hl:
+            continue        # A v6.9.60-61 report: it has the 24-hour counts instead
         h.append(f"<div><span>{esc(label_)}</span><span>{fmt_health(key_, hl.get(key_))}</span></div>")
     h.append("</div></div>")
 
@@ -741,12 +818,12 @@ def station_page(key, message=""):
     if not events:
         h.append("<tr><td colspan='2' class='mute'>Nothing yet.</td></tr>")
     h.append("</table></div></div>")
-    return page(f"Station {s['shown_id']}", "".join(h), "stations", message)
+    return page(f"Station {s['shown_id']}", "".join(h), "stations", message, ptype=s["profile"])
 
 
-def firmware_tab():
+def firmware_tab(ptype):
     with db() as con:
-        builds = con.execute("SELECT * FROM builds ORDER BY id DESC").fetchall()
+        builds = con.execute("SELECT * FROM builds WHERE profile=? ORDER BY id DESC", (ptype,)).fetchall()
         targets = {r["build_id"] for r in con.execute("SELECT build_id FROM type_targets WHERE build_id IS NOT NULL")}
         used_by = {}
         for s in con.execute("SELECT shown_id, target FROM stations WHERE target NOT IN ('type','hold')"):
@@ -755,12 +832,14 @@ def firmware_tab():
          "<ol class='steps'><li>Use the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
          "<code>fw_bihar.hex</code> or <code>fw_ksn_tws.hex</code>.</li>"
          "<li>The station type and version are read from the file. A damaged or wrong file is refused.</li>"
-         "<li>Uploading sends it to nobody. Choose stations on the <a href='/?tab=stations'>Stations</a> tab.</li></ol>"
+         "<li>It is filed under its own type, whichever type is chosen above.</li>"
+         f"<li>Uploading sends it to nobody. Choose stations on the <a href='/?tab=stations&type={ptype}'>Stations</a> tab.</li></ol>"
          "<form method='post' action='/upload' enctype='multipart/form-data' class='stack'>"
+         f"<input type='hidden' name='back' value='/?tab=firmware&type={ptype}'>"
          "<div><label class='f'>File</label><input type='file' name='file' accept='.hex' required></div>"
          "<div><label class='f'>Note (optional)</label><input name='note' placeholder='e.g. SMS fix, for test team' size='34' maxlength='60'></div>"
          "<div><button>Upload</button></div></form></div>"]
-    h.append("<div class='card'><h2>Uploaded firmware</h2><div class='scroll'><table>"
+    h.append(f"<div class='card'><h2>{esc(TYPES[ptype])} firmware</h2><div class='scroll'><table>"
              "<tr><th>Version</th><th>Type</th><th>Uploaded</th><th>Note</th><th>Set for</th><th></th></tr>")
     for b in builds:
         users = []
@@ -772,17 +851,20 @@ def firmware_tab():
                  f"<td class='nw'>{esc(TYPES.get(b['profile'], '?'))}</td><td>{esc(when(b['uploaded_at']))}</td>"
                  f"<td>{esc(b['note'])}</td><td>{esc(', '.join(users)) or '<span class=mute>nobody</span>'}</td>"
                  f"<td><form method='post' action='/build/delete' onsubmit=\"return confirm('Delete {esc(b['version'])} (#{b['id']})?')\">"
+                 f"<input type='hidden' name='back' value='/?tab=firmware&type={ptype}'>"
                  f"<input type='hidden' name='id' value='{b['id']}'><button class='del small'>Delete</button></form></td></tr>")
     if not builds:
-        h.append("<tr><td colspan='6' class='mute'>No firmware uploaded yet.</td></tr>")
+        h.append(f"<tr><td colspan='6' class='mute'>No {esc(TYPES[ptype])} firmware uploaded yet.</td></tr>")
     h.append("</table></div></div>")
     return "".join(h)
 
 
-def history_tab():
+def history_tab(ptype):
     with db() as con:
-        events = con.execute("SELECT * FROM events ORDER BY id DESC LIMIT 300").fetchall()
-    h = ["<div class='card'><h2>History</h2><p class='hint'>The newest first.</p><div class='scroll'><table>"
+        events = con.execute("SELECT * FROM events WHERE profile=? OR profile IS NULL ORDER BY id DESC LIMIT 300",
+                             (ptype,)).fetchall()
+    h = [f"<div class='card'><h2>{esc(TYPES[ptype])} history</h2><p class='hint'>The newest first. Office events "
+         "that belong to no type (password) show under every type.</p><div class='scroll'><table>"
          "<tr><th>When</th><th>Station</th><th>What happened</th></tr>"]
     for e in events:
         t = e["text"]
@@ -808,18 +890,20 @@ def password_tab():
 
 def office_page(tab, message="", q=None):
     q = q or {}
-    if tab == "firmware":
-        return page("Firmware files", firmware_tab(), tab, message)
-    if tab == "history":
-        return page("History", history_tab(), tab, message)
     if tab == "password":
         return page("Password", password_tab(), tab, message)
     try:
         ptype = int(q.get("type", ""))
     except ValueError:
         ptype = -1
-    body, script, _ = stations_tab(ptype, q.get("q", "").strip()[:12])
-    return page("LPC-AIO stations", body, "stations", message, script)
+    ptype = pick_type(ptype)
+    name = TYPES[ptype]
+    if tab == "firmware":
+        return page(f"{name} firmware", firmware_tab(ptype), tab, message, ptype=ptype)
+    if tab == "history":
+        return page(f"{name} history", history_tab(ptype), tab, message, ptype=ptype)
+    body, script = stations_tab(ptype, q.get("q", "").strip()[:12])
+    return page(f"{name} stations", body, "stations", message, script, ptype=ptype)
 
 
 def login_page(error=""):
@@ -852,17 +936,17 @@ def do_upload(parts):
     data = parts.get("file", b"")
     note = parts.get("note", b"").decode("utf-8", "replace").strip()[:60]
     if not data:
-        return "No file chosen."
+        return "No file chosen.", None
     try:
         profile, version, image_crc, _ = parse_firmware_hex(data)
     except ValueError as e:
-        return f"File refused: {e}"
+        return f"File refused: {e}", None
     image_crc = f"{image_crc:08X}"
     file_crc = f"{zlib.crc32(data) & 0xFFFFFFFF:08X}"
     with _db_lock, db() as con:
         same = con.execute("SELECT id FROM builds WHERE file_crc=? OR image_crc=?", (file_crc, image_crc)).fetchone()
         if same:
-            return f"Build #{same['id']} is this same firmware: nothing uploaded."
+            return f"Build #{same['id']} is this same firmware: nothing uploaded.", profile
         cur = con.execute("INSERT INTO builds (profile, version, image_crc, file_crc, size, note, uploaded_at)"
                           " VALUES (?,?,?,?,?,?,?)", (profile, version, image_crc, file_crc, len(data), note, int(time.time())))
         build_id = cur.lastrowid
@@ -870,9 +954,9 @@ def do_upload(parts):
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, os.path.join(BUILDS_DIR, f"{build_id}.hex"))
-        add_event(con, "", f"build #{build_id} uploaded: {TYPES[profile]} {version} ({image_crc}) {note}")
+        add_event(con, "", f"build #{build_id} uploaded: {TYPES[profile]} {version} ({image_crc}) {note}", profile)
     return (f"Uploaded {version} for {TYPES[profile]} as #{build_id}. "
-            "Nobody gets it yet: send it from the Stations tab.")
+            "Nobody gets it yet: send it from the Stations tab."), profile
 
 
 def do_send(f, stn_keys):
@@ -900,7 +984,7 @@ def do_send(f, stn_keys):
                         "ON CONFLICT(profile) DO UPDATE SET build_id=excluded.build_id", (b["profile"], build_id))
             for st in con.execute("SELECT * FROM stations WHERE profile=? AND target IN ('type','hold')", (b["profile"],)).fetchall():
                 con.execute("UPDATE stations SET target='type', result='', offered_crc=NULL WHERE key=?", (st["key"],))
-            add_event(con, "", f"office set: all {TYPES[b['profile']]} stations get build #{build_id} {b['version']}")
+            add_event(con, "", f"office set: all {TYPES[b['profile']]} stations get build #{build_id} {b['version']}", b["profile"])
     if not sent and not all_type:
         return "Not sent: tick at least one station of this type." + (f" Skipped (other type): {', '.join(skipped)}." if skipped else "")
     parts = []
@@ -1016,7 +1100,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect("/login")
         message, tab = "", "stations"
         if url.path == "/upload":
-            message, tab = do_upload({k: (v if isinstance(v, bytes) else v.encode()) for k, v in f.items()}), "firmware"
+            parts = {k: (v if isinstance(v, bytes) else v.encode()) for k, v in f.items()}
+            message, up_type = do_upload(parts)
+            tab = "firmware"
+            f = {"back": f"/?tab=firmware&type={up_type}" if up_type is not None else
+                 parts.get("back", b"").decode("utf-8", "replace")}
         elif url.path == "/send":
             message = do_send(f, lists.get("stn", []))
         elif url.path == "/station":
@@ -1045,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
                     con.execute("INSERT INTO type_targets (profile, build_id) VALUES (?,?) "
                                 "ON CONFLICT(profile) DO UPDATE SET build_id=excluded.build_id", (int(f["profile"]), build))
                     add_event(con, "", f"office set: all {TYPES[int(f['profile'])]} stations get "
-                                       f"{'build #' + str(build) if build else 'nothing'}")
+                                       f"{'build #' + str(build) if build else 'nothing'}", int(f["profile"]))
                     message = (f"Every {TYPES[int(f['profile'])]} station set to get build #{build}." if build else
                                f"Whole-type update stopped for {TYPES[int(f['profile'])]}.")
         elif url.path == "/build/delete":
@@ -1053,6 +1141,7 @@ class Handler(BaseHTTPRequestHandler):
             if f.get("id", "").isdigit():
                 build_id = int(f["id"])
                 with _db_lock, db() as con:
+                    b = con.execute("SELECT profile FROM builds WHERE id=?", (build_id,)).fetchone()
                     used = con.execute("SELECT 1 FROM type_targets WHERE build_id=? UNION SELECT 1 FROM stations WHERE target=?",
                                        (build_id, str(build_id))).fetchone()
                     if used:
@@ -1063,7 +1152,7 @@ class Handler(BaseHTTPRequestHandler):
                             os.remove(os.path.join(BUILDS_DIR, f"{build_id}.hex"))
                         except OSError:
                             pass
-                        add_event(con, "", f"build #{build_id} deleted")
+                        add_event(con, "", f"build #{build_id} deleted", b["profile"] if b else None)
                         message = f"Build #{build_id} deleted."
         elif url.path == "/password":
             tab = "password"
@@ -1086,7 +1175,7 @@ class Handler(BaseHTTPRequestHandler):
                 message = "Password changed. Use the new one from now on."
         from urllib.parse import quote
         back = f.get("back", "") if isinstance(f.get("back", ""), str) else ""
-        if not re.fullmatch(r"/(\?tab=stations&type=[0-2]|s\?k=[0-9A-Za-z]{1,12})", back):
+        if not re.fullmatch(r"/(\?tab=(stations|firmware|history)&type=[0-2]|s\?k=[0-9A-Za-z]{1,12})", back):
             back = f"/?tab={tab}"
         self.redirect(back + ("&m=" + quote(message) if message else ""))
 

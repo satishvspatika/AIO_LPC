@@ -29,6 +29,7 @@ typedef struct __attribute__((packed)) {
 } errlog_page_t;
 
 _Static_assert(sizeof(errlog_page_t) == PAGE_SIZE, "error log page must be one flash page");
+_Static_assert(TOTAL_PAGES == ERRLOG_ENTRIES, "errlog.h must give the ring size");
 
 #define IAP_LOCATION 0x1FFF1FF1UL
 typedef void (*iap_entry_t)(unsigned long[], unsigned long[]);
@@ -304,6 +305,16 @@ static void sync_to_card(void)
         snprintf(line, sizeof(line), "%010lu\r\n", (unsigned long)s_synced);
         storage_state_save(ERRORS_SYNC_FILENAME, line);
     }
+}
+
+const char *errlog_entry(uint32_t i, uint32_t *seq)
+{
+    const errlog_page_t *p = (i < TOTAL_PAGES) ? page_at(i) : NULL;
+    if (!p || p->magic != ERRLOG_MAGIC || !page_valid(p) || memchr(p->text, '\0', sizeof(p->text)) == NULL) {
+        return NULL;
+    }
+    *seq = p->seq;
+    return p->text;
 }
 
 bool errlog_idle(void)

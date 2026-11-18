@@ -435,6 +435,55 @@ const flash_log_page_t *flash_log_last_delivered(void)
     return best;
 }
 
+/* The newest outage/resumed markers only: enough for the last few days, whose records are the ones asked
+ * about. Static, not on the caller's stack (the main task has about 260 bytes spare). */
+#define VISIT_MARKERS 24
+static uint32_t s_mk_ref[VISIT_MARKERS], s_mk_at[VISIT_MARKERS];
+static uint8_t s_mk_outage[VISIT_MARKERS];
+
+void flash_log_visit_records(flash_log_visit_fn fn, void *ctx)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (p->magic != LOG_MAGIC || (p->type != TYPE_OUTAGE && p->type != TYPE_RESUMED) || !page_valid(p)) {
+            continue;
+        }
+        uint32_t m = n;
+        if (n < VISIT_MARKERS) {
+            n++;
+        } else {
+            m = 0;                                  /* Full: replace the oldest, if this one is newer */
+            for (uint32_t k = 1; k < VISIT_MARKERS; k++) {
+                if (s_mk_at[k] < s_mk_at[m]) {
+                    m = k;
+                }
+            }
+            if (s_mk_at[m] > p->seq) {
+                continue;
+            }
+        }
+        s_mk_ref[m] = (uint32_t)p->slot_id;
+        s_mk_at[m] = p->seq;
+        s_mk_outage[m] = (p->type == TYPE_OUTAGE);
+    }
+    for (uint32_t i = 0; i < TOTAL_PAGES; i++) {
+        const flash_log_page_t *p = page_at(i);
+        if (p->magic != LOG_MAGIC || p->type != TYPE_RECORD || !page_valid(p)) {
+            continue;
+        }
+        /* The marker in force for this record: the latest one at or before it */
+        int best = -1;
+        for (uint32_t m = 0; m < n; m++) {
+            if (s_mk_ref[m] <= p->seq && (best < 0 || s_mk_ref[m] > s_mk_ref[best] ||
+                                          (s_mk_ref[m] == s_mk_ref[best] && s_mk_at[m] > s_mk_at[best]))) {
+                best = (int)m;
+            }
+        }
+        fn(p->record, has_payload(p), best >= 0 && s_mk_outage[best], ctx);
+    }
+}
+
 const flash_log_page_t *flash_log_newest_record(void)
 {
     const flash_log_page_t *best = NULL;

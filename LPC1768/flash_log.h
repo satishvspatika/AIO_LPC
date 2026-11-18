@@ -60,6 +60,12 @@ bool flash_log_note_rejected(uint32_t record_seq, int strikes_allowed);
 /* How many of the newest records, up to limit, were made with no network */
 int flash_log_no_network_run(int limit);
 
+/* v6.9.62 health report: calls fn for every record held. sendable: it has a payload (a record kept
+ * while sending was stopped has none). late: not delivered in its own slot (inside an outage), so
+ * queued or sent later. */
+typedef void (*flash_log_visit_fn)(const char *record, bool sendable, bool late, void *ctx);
+void flash_log_visit_records(flash_log_visit_fn fn, void *ctx);
+
 /* Erase Data: wipes the whole log */
 void flash_log_erase_all(void);
 

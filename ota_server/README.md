@@ -20,14 +20,18 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
 
 ## Use (office page)
 
-- **Stations**: "Needs attention" first (every type), then a tab per station type with a count, one row per
-  station: firmware, battery, signal, slots on time, last check, update state. Click a station for its page:
+- **Unit type switch** (top of Stations, Firmware files and History): KSNDMC TRG, BIHAR TRG, KSNDMC TWS,
+  each with its station count and how many need a look. Everything below it is that type only.
+- **Stations**: "Needs attention" for the type, then one row per station: firmware, battery, signal, records
+  sent the last day (and how many by backlog), last check, update state. Click a station for its page:
   latest health report, firmware update control, health history, events.
 - **Send an update** (on each type's tab): choose the firmware, tick the stations, Send. "Every station of this
   type" also covers stations that check in later. Try one station first.
 - **Firmware files**: upload the file that goes on the SD card (`fw_ksn_trg.hex`, `fw_bihar.hex`,
   `fw_ksn_tws.hex`). It is refused unless it is a whole main-firmware file with the right header and CRC.
-  Uploading sends it to nobody.
+  Uploading sends it to nobody. It is filed under its own type (read from the file) and the page then shows
+  that type. The list shows the chosen type's files only.
+- **History**: the chosen type's events (a password change shows under every type).
 - A station checks twice a day (00:30 to 02:15 and 12:30 to 14:15, by station number; v6.9.60 and earlier: 01:00 and 13:00), or after every delivered slot with `OTA.NOW`
   on its card. It appears on the page by itself at its first check (firmware v6.9.55 build 23 and later).
 
@@ -35,7 +39,10 @@ A station that went back to its old firmware is not offered the same build again
 
 ## Health report
 
-Units from v6.9.60 add health fields to their daily check (`docs/SYSTEM_DESIGN.md` 7.7). The fields, their
+Units from v6.9.60 add health fields to their daily check (`docs/SYSTEM_DESIGN.md` 7.7). From v6.9.62 the
+report comes once a day (the 12:30-14:15 check) and covers the last whole MET day (08:45 to 08:30): records
+sent of 96 and how many by backlog, day and night battery averages, lowest battery, errors logged and the
+newest one. The fields, their
 names on the page and the "needs attention" limits are `HEALTH_FIELDS` and `HEALTH_RULES` in `lpc_ota.py`:
 change them there. Reports are kept 400 days.
 

@@ -1,4 +1,5 @@
-/* Host test for health.c (v6.9.60): the health report built from a pretend SLOTS.CSV, card and unit.
+/* Host test for health.c (v6.9.60; v6.9.62 MET-day report): the health report built from a pretend
+ * SLOTS.CSV, flash record log, error log and unit.
  * Build and run from bench/host_tests.sh. */
 #include "health.h"
 #include "user_config.h"
@@ -7,6 +8,8 @@
 #include "flash_nvram.h"
 #include "fw_app.h"
 #include "fw_update.h"
+#include "flash_log.h"
+#include "errlog.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,6 +76,26 @@ static int32_t s_lat = 0, s_lon = 0;
 bool flash_nvram_get_location(int32_t *lat, int32_t *lon) { *lat = s_lat; *lon = s_lon; return true; }
 const char *fw_app_845_version(void) { return "v1.16"; }
 
+/* ---- flash record log and error log ---- */
+typedef struct { char rec[72]; bool sendable, late; } rec_t;
+static rec_t s_recs[400];
+static int s_nrec;
+void flash_log_visit_records(flash_log_visit_fn fn, void *ctx)
+{
+    for (int i = 0; i < s_nrec; i++) fn(s_recs[i].rec, s_recs[i].sendable, s_recs[i].late, ctx);
+}
+static void add_rec(long t, const char *bat, int sig, bool sendable, bool late)    /* t: seconds since 2026-11-00 */
+{
+    long d = t / 86400, h = (t / 3600) % 24, m = (t / 60) % 60;
+    int sample = (int)(((h * 60 + m) / 15 + 61) % 96);
+    rec_t *r = &s_recs[s_nrec++];
+    snprintf(r->rec, sizeof(r->rec), "%02d,2026-11-%02ld,%02ld:%02ld,000.00,006.00,%04d,%s", sample, d, h, m, sig, bat);
+    r->sendable = sendable; r->late = late;
+}
+static const char *s_err[ERRLOG_ENTRIES];
+static uint32_t s_err_seq[ERRLOG_ENTRIES];
+const char *errlog_entry(uint32_t i, uint32_t *seq) { if (i >= ERRLOG_ENTRIES || !s_err[i]) return NULL; *seq = s_err_seq[i]; return s_err[i]; }
+
 static void row(const char *slot14, const char *result, const char *reason, int dur, const char *bat, const char *boot)
 {
     s_csv_len += (size_t)snprintf(s_csv + s_csv_len, sizeof(s_csv) - s_csv_len, "%.12s02,%s,%s,%s,1,-71,%d,%s,%s,0\r\n",
@@ -99,46 +122,84 @@ int main(void)
 {
     telemetry_data_t now;
     memset(&now, 0, sizeof(now));
-    snprintf(now.present_time, sizeof(now.present_time), "20261117133102");
+    snprintf(now.present_time, sizeof(now.present_time), "20261118130102");
     now.bat1_volt = 12.62f;
 
-    /* 1. A full day: 2 days of rows (only the last 95 slots before 13:30 count), with a gap, queued
-     *    slots, a slot recorded twice (the OTA install restart), an operator slot and the header */
+    /* 1. The MET day 17 Nov 08:45 to 18 Nov 08:30 (k = 0..95), with records of the day before it and
+     *    of today around it. Two slots missing (unit off), one stopped (no payload), two off-filled
+     *    (late, battery copied: not counted), one late and sent, one late and still waiting. */
+    const long day0 = 17L * 86400 + 8 * 3600 + 45 * 60;
+    for (long t = day0 - 8 * 900; t < day0; t += 900) add_rec(t, "09.00", -80, true, true);   /* 17 Nov 06:45-08:30: the day before, not counted */
+    for (int k = 0; k < 96; k++) {
+        const long t = day0 + k * 900L;
+        const char *bat = (k >= 5 && k <= 28) ? "12.50" : (k >= 53 && k <= 76) ? "11.50" : "12.00";
+        if (k == 5 || k == 6) continue;
+        if (k == 7) { add_rec(t, bat, -85, false, false); continue; }
+        if (k == 40 || k == 41) { add_rec(t, "10.00", -112, true, true); continue; }
+        add_rec(t, bat, -85, true, k == 50 || k == 94);
+    }
+    for (long t = day0 + 96 * 900L; t <= 18L * 86400 + 13 * 3600; t += 900)        /* Today, to 13:00 */
+        add_rec(t, "13.00", -85, true, t == 18L * 86400 + 10 * 3600);
+    s_err[0] = "v6.9.61 [2026-11-16 20:00:01 +30s] [ERROR] Old error"; s_err_seq[0] = 5;
+    s_err[3] = "v6.9.61 [2026-11-17 20:00:01 +30s] [ERROR] SD card not available: records are being kept in flash"; s_err_seq[3] = 10;
+    s_err[4] = "v6.9.61 [2026-11-18 05:00:01 +30s] [ERROR] Could not save last slot to SD card"; s_err_seq[4] = 12;
+    s_err[5] = "v6.9.61 [2026-11-18 10:00:01 +30s] [ERROR] Today, not counted"; s_err_seq[5] = 13;
+    s_err[6] = "v6.9.61 [T+00:00:02.950] [ERROR] No time"; s_err_seq[6] = 14;
+    /* Time on per slot still from SLOTS.CSV */
     s_csv_len = 0;
     s_csv_len += (size_t)snprintf(s_csv, sizeof(s_csv), "time,slot,result,reason,http_attempts,csq_dbm,duration_sec,battery_v,boot,backlog\r\n");
-    const long end = 17L * 86400 + 13 * 3600 + 30 * 60;     /* This slot: 17 Nov 13:30 */
-    int expect_ok = 0, expect_late = 0;
+    const long end = 18L * 86400 + 13 * 3600;
     for (long t = end - 2 * 86400; t < end; t += 900) {
         char s14[16];
         slot_name(s14, t);
-        const bool counted = (end - t) <= 95 * 900;
-        long k = (end - t) / 900;
-        if (k == 10 || k == 11) continue;                                   /* Unit off: no rows */
-        if (k == 20 || k == 21) { row(s14, "BACKLOG", "NO_REPLY", 86, "11.74", "SCHEDULED"); if (counted) expect_late++; continue; }
-        if (k == 30) { row(s14, "SENT", "OK_NAME", 113, "11.40", "OPERATOR"); row(s14, "SENT", "OK_NAME", 2, "12.45", "SCHEDULED"); if (counted) expect_ok++; continue; }
-        row(s14, "SENT", "OK_NAME", 20, k == 200 ? "10.00" : "12.30", "SCHEDULED");   /* 10.00: too old to count */
-        if (counted) expect_ok++;
+        row(s14, "SENT", "OK_NAME", 20, "12.30", "SCHEDULED");
+        if ((end - t) / 900 == 30) row(s14, "SENT", "OK_NAME", 113, "11.40", "OPERATOR");
     }
     CHECK(s_csv_len > 9000);    /* So the read starts mid-line and must skip the partial one */
-    const char *q = health_query(&now, 0);
+    const char *q = health_query(&now, 2);  /* Today's late one and the day's k = 94 still waiting */
     printf("%s\n", q);
-    CHECK(atoi(field(q, "ok")) == expect_ok + 1);           /* + this slot */
-    CHECK(atoi(field(q, "late")) == expect_late && expect_late == 2);
-    CHECK(atoi(field(q, "miss")) == 96 - (expect_ok + 1) - expect_late);
-    CHECK(atoi(field(q, "miss")) == 2);                     /* The two slots with the unit off */
-    CHECK(!strcmp(field(q, "bmin"), "11.40"));              /* The operator slot's reading counts, the old 10.00 doesn't */
-    CHECK(!strcmp(field(q, "bv"), "12.62"));
+    CHECK(!strcmp(field(q, "day"), "20261118"));
+    CHECK(atoi(field(q, "sent")) == 92);    /* 96 - 2 missing - 1 stopped - 1 waiting */
+    CHECK(atoi(field(q, "bk")) == 3);       /* 2 off-filled + k = 50 */
+    CHECK(!strcmp(field(q, "bd"), "12.50") && !strcmp(field(q, "bn"), "11.50"));
+    CHECK(!strcmp(field(q, "bmin"), "11.50"));  /* The off-filled 10.00 and 16 Nov's 09.00 don't count */
+    CHECK(!strcmp(field(q, "ne"), "2"));
+    CHECK(!strcmp(field(q, "err"), "Could+not+save+last+slot+to+SD+card"));
+    CHECK(!strcmp(field(q, "bv"), "12.62") && !strcmp(field(q, "q"), "2"));
     CHECK(!strcmp(field(q, "hs"), "OK") && !strcmp(field(q, "rst"), "0") && !strcmp(field(q, "wdt"), "0"));
-    CHECK(!strcmp(field(q, "op"), "BSNL-Mobile") && !strcmp(field(q, "net"), "4") && !strcmp(field(q, "sig"), "-71"));
-    CHECK(!strcmp(field(q, "ctrl"), "v1.16") && !strcmp(field(q, "clk"), "34") && !strcmp(field(q, "q"), "0"));
-    CHECK(atoi(field(q, "dur")) >= 19 && atoi(field(q, "dur")) <= 22);   /* Scheduled slots only */
-    CHECK(field(q, "gps") == NULL && strlen(q) < 280);
+    CHECK(!strcmp(field(q, "op"), "BSNL+Mobile") && !strcmp(field(q, "net"), "4") && !strcmp(field(q, "sig"), "-71"));
+    CHECK(!strcmp(field(q, "ctrl"), "v1.16") && !strcmp(field(q, "clk"), "34"));
+    CHECK(atoi(field(q, "dur")) == 20);     /* Scheduled slots only */
+    CHECK(field(q, "gps") == NULL && field(q, "ok") == NULL && field(q, "miss") == NULL);
+
+    /* 1b. Nothing waiting: all late ones delivered. More waiting than late: capped */
+    q = health_query(&now, 0);
+    CHECK(atoi(field(q, "sent")) == 93 && atoi(field(q, "bk")) == 4);
+    q = health_query(&now, 50);
+    CHECK(atoi(field(q, "sent")) == 89 && atoi(field(q, "bk")) == 0);
+
+    /* 1c. Day and night averages are averages (rounded), not the last value */
+    {
+        health_day_t d;
+        health_day_start(&d, "20261118130102");
+        health_day_record("05,2026-11-17,10:00,000.00,006.00,-085,12.00", true, false, &d);
+        health_day_record("06,2026-11-17,10:15,000.00,006.00,-085,12.01", true, false, &d);
+        health_day_record("53,2026-11-17,22:00,000.00,006.00,-085,11.00", true, false, &d);
+        health_day_record("54,2026-11-18,03:45,000.00,006.00,-104,11.03", true, true, &d);   /* Gap-filled: measured, counts */
+        health_day_record("55,2026-11-18,04:00,000.00,006.00,-085,10.50", true, false, &d);  /* Neither window */
+        health_day_record("56,2026-11-18,16:00,000.00,006.00,-085,12.00", true, false, &d);  /* After now: ignored */
+        health_day_record("garbage", true, false, &d);
+        CHECK(d.recs == 5 && d.late == 1 && d.bd_n == 2 && d.bn_n == 2 && d.bmin == 1050);
+        CHECK((d.bd_sum + 1) / 2 == 1201 && (d.bn_sum + 1) / 2 == 1102);
+        /* TWS record: the same last two fields */
+        health_day_record("57,2026-11-17,11:00,025.1,071.3,02.4,0185,-071,12.40", true, false, &d);
+        CHECK(d.recs == 6 && d.bd_n == 3);
+    }
 
     /* 2. Restarts: counted until a report is taken; codes in hs */
     health_note_restart(true); health_note_restart(false); health_note_restart(false);
     q = health_query(&now, 3);
     CHECK(!strcmp(field(q, "wdt"), "1") && !strcmp(field(q, "rst"), "2") && !strcmp(field(q, "hs"), "WDOG.CRASH"));
-    CHECK(!strcmp(field(q, "q"), "3"));
     health_sent();
     q = health_query(&now, 0);
     CHECK(!strcmp(field(q, "hs"), "OK") && !strcmp(field(q, "wdt"), "0"));
@@ -147,26 +208,42 @@ int main(void)
     CHECK(!strcmp(field(q, "hs"), "WDOG"));
     health_sent();
 
-    /* 3. Location (south and west negative), a 2G slot, an operator name with odd characters */
-    s_lat = -12345678; s_lon = 77583500; s_net = 2; s_carrier = "Airtel&IoT=1";
-    q = health_query(&now, 0);
+    /* 3. Location (south and west negative), a 2G slot, an operator name with odd characters, and the
+     *    longest report fits (long error text, gps, faults) */
+    s_lat = -12345678; s_lon = 77583500; s_net = 2; s_carrier = "Airtel&IoT=1 Long Name";
+    s_err[7] = "v6.9.61 [2026-11-18 06:00:01 +30s] [ERROR] Slot 2026-11-16 16:30 was stored but did not finish (power lost?): queued to send";
+    s_err_seq[7] = 20;
+    health_note_restart(true); health_note_restart(false);
+    q = health_query(&now, 999);
+    printf("%s (%zu)\n", q, strlen(q));
     CHECK(!strcmp(field(q, "gps"), "-12.345678,77.583500") && !strcmp(field(q, "net"), "2"));
-    CHECK(!strcmp(field(q, "op"), "Airtel-IoT-1"));
+    CHECK(!strcmp(field(q, "op"), "Airtel-IoT-1+Lo")   /* 15 characters kept */);
+    CHECK(strlen(field(q, "err")) == 48 && !strncmp(field(q, "err"), "Slot+2026-11-16+16:30+was+stored+but+did+not+fin", 48));
+    CHECK(!strcmp(field(q, "ne"), "3"));
+    CHECK(strlen(q) < 330 && strlen(q) + 70 < 400);   /* With the check's own fields, s_path is 400 */
+    health_sent();
+    s_err[7] = NULL;
 
-    /* 4. No SLOTS.CSV, or an empty one: only this slot is known */
-    s_have_csv = false;
+    /* 4. A bench report at night (02:00): the day reported is the one that closed at 08:30 yesterday */
+    snprintf(now.present_time, sizeof(now.present_time), "20261118020005");
     q = health_query(&now, 0);
-    CHECK(!strcmp(field(q, "ok"), "1") && !strcmp(field(q, "miss"), "95") && !strcmp(field(q, "bmin"), "12.62"));
-    s_have_csv = true; s_csv_len = 0;
-    q = health_query(&now, 0);
-    CHECK(!strcmp(field(q, "ok"), "1") && !strcmp(field(q, "dur"), "0"));
+    CHECK(!strcmp(field(q, "day"), "20261117"));
+    CHECK(atoi(field(q, "sent")) == 8 && atoi(field(q, "bk")) == 8);     /* Only its last 8 (06:45 to 08:30) are held */
+    CHECK(!strcmp(field(q, "ne"), "1") && !strcmp(field(q, "err"), "Old+error"));
 
-    /* 5. Damaged rows and a NO_CLOCK row are passed over */
-    s_csv_len = 0;
-    row("20261117131500", "SENT", "OK_NAME", 20, "12.10", "SCHEDULED");
-    s_csv_len += (size_t)snprintf(s_csv + s_csv_len, 200, "NO_CLOCK,NO_CLOCK,LOST,INVALID_CLOCK,0,-113,0,0.00,SCHEDULED,0\r\n20261117,,,\r\ngarbage\r\n");
+    /* 5. No records, no errors, no SLOTS.CSV: zeros, no averages, lowest is now */
+    s_nrec = 0; memset(s_err, 0, sizeof(s_err)); s_have_csv = false;
+    snprintf(now.present_time, sizeof(now.present_time), "20261118130102");
     q = health_query(&now, 0);
-    CHECK(!strcmp(field(q, "ok"), "2") && !strcmp(field(q, "bmin"), "12.10"));
+    CHECK(!strcmp(field(q, "sent"), "0") && !strcmp(field(q, "bk"), "0") && !strcmp(field(q, "ne"), "0"));
+    CHECK(field(q, "bd") == NULL && field(q, "bn") == NULL && field(q, "err") == NULL);
+    CHECK(!strcmp(field(q, "bmin"), "12.62") && !strcmp(field(q, "dur"), "0") && !strcmp(field(q, "day"), "20261118"));
+
+    /* 6. No clock: nothing counted */
+    snprintf(now.present_time, sizeof(now.present_time), "NO_CLOCK");
+    add_rec(day0, "12.00", -85, true, false);
+    q = health_query(&now, 0);
+    CHECK(!strcmp(field(q, "sent"), "0") && !strcmp(field(q, "day"), ""));
 
     printf("%s: health_test, %d checks, %d failed\n", s_fails ? "FAILED" : "ALL PASS", s_checks, s_fails);
     return s_fails ? 1 : 0;
