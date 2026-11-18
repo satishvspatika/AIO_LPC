@@ -48,11 +48,18 @@ change them there. Reports are kept 400 days.
 
 ## Update the server code
 
-From the server (Hostinger browser terminal), after the change is pushed; `<commit>` is its hash:
+After the change is pushed, in the Hostinger browser terminal as root:
 
-    cp /opt/lpc-ota/lpc_ota.py /opt/lpc-ota/lpc_ota.py.before && curl -fsSL -o /tmp/lpc_ota.py https://raw.githubusercontent.com/satishvspatika/AIO_LPC/<commit>/ota_server/lpc_ota.py && python3 -m py_compile /tmp/lpc_ota.py && install -o lpcota -g lpcota -m 644 /tmp/lpc_ota.py /opt/lpc-ota/lpc_ota.py && systemctl restart lpc-ota && systemctl is-active lpc-ota
+    ./deploy_now.sh            # the newest code on the branch
+    ./deploy_now.sh 63fc70f    # or a given commit
+    ./deploy_now.sh back       # undo the last update
 
-Back: `cp /opt/lpc-ota/lpc_ota.py.before /opt/lpc-ota/lpc_ota.py && systemctl restart lpc-ota`.
+It touches only `/opt/lpc-ota/lpc_ota.py` (keeping the old one as `lpc_ota.py.before`) and restarts only
+`lpc-ota`; it checks the file compiles before installing it and says if it was already running that code.
+Put the script in `/root` once:
+
+    curl -fsSL -o /root/deploy_now.sh https://raw.githubusercontent.com/satishvspatika/AIO_LPC/v6.2.9-untested/ota_server/deploy_now.sh && chmod 700 /root/deploy_now.sh
+
 The database gains its new table and columns by itself at the first start.
 
 Do not open `ota.db` as root while the service runs (files made by root lock the service out).
