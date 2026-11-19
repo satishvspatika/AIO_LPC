@@ -63,6 +63,15 @@ TYPES.update(ESP_TYPES)
 TYPE_KEYS = {str(p) for p in TYPES}
 
 
+def sid(row):
+    """The station ID as people know it. ESP32 stations check in as E<id> (to keep them apart from LPC
+    stations of the same number); the E is not shown."""
+    shown = row["shown_id"] or ""
+    if "profile" in row.keys() and row["profile"] in ESP_TYPES and shown[:1] == "E":
+        return shown[1:]
+    return shown
+
+
 def family(profile):
     """The board family of a type: what the office page groups and labels by."""
     return "ESP32" if profile in ESP_TYPES else "LPC1768"
@@ -569,6 +578,12 @@ details summary{cursor:pointer;color:var(--acc);font-size:14px}
 .seg a span{color:var(--mute);font-weight:500;margin-left:4px}.seg a.on{background:var(--acc);border-color:var(--acc);color:var(--acc-ink)}
 .seg a.on span{color:var(--acc-ink);opacity:.8}
 .seg.types{margin:0 0 10px;align-items:center}
+.famtabs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:0 0 12px}
+.famtab{display:flex;flex-direction:column;gap:2px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);text-decoration:none}
+.famtab b{font-size:17px}.famtab span{color:var(--mute);font-size:14px}
+.famtab.on.lpc1768{border:2px solid #3b4a7a;background:#eef0f8}.famtab.on.esp32{border:2px solid #1f6f5c;background:#e9f5f1}
+.here{font-size:20px;font-weight:700;margin:4px 0 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.here .mute{font-size:15px;font-weight:500}
 .fam{display:inline-block;padding:3px 9px;border-radius:6px;font-size:12px;font-weight:700;letter-spacing:.04em;background:var(--line);color:var(--ink);vertical-align:middle}
 .fam.esp32{background:#1f6f5c;color:#fff}.fam.lpc1768{background:#3b4a7a;color:#fff}.seg.types a{font-size:15px}.seg a.on .badt{color:var(--acc-ink)}
 table.list td{vertical-align:middle}
@@ -605,31 +620,38 @@ TYPED_TABS = ("stations", "firmware", "history")
 
 
 def type_bar(tab, ptype):
-    """The unit type switch: Stations, Firmware files and History each show one type at a time.
-    Each type shows its station count and how many of them need a look, so nothing is missed."""
+    """Where you are: first the board family (LPC1768 or ESP32), then the station type within it.
+    Each shows its station count, and how many need a look, so nothing is missed."""
     with db() as con:
         stations = con.execute("SELECT * FROM stations").fetchall()
+        used = {r["profile"] for r in con.execute("SELECT profile FROM builds UNION SELECT profile FROM stations")}
     counts = type_counts(stations)
     flagged = {p: 0 for p in TYPES}
     for st in stations:
         if st["profile"] in flagged and attention(st, health_of(st)):
             flagged[st["profile"]] += 1
-    with db() as con:
-        used = {r["profile"] for r in con.execute("SELECT profile FROM builds UNION SELECT profile FROM stations")}
-    rows = []
+    cur = "ESP32" if ptype in ESP_TYPES else "LPC1768"
+    fams = []
     for fam, group in (("LPC1768", LPC_TYPES), ("ESP32", ESP_TYPES)):
-        items = []
-        for p, t in group.items():
-            if fam == "ESP32" and p not in used and p != ptype:
-                continue    # an ESP32 type shows once it has a station or a build
-            warn = f" <b class='badt'>· {flagged[p]} need a look</b>" if flagged[p] else ""
-            label = t.split(" · ", 1)[1]
-            items.append(f"<a href='/?tab={tab}&type={p}' class='{'on' if p == ptype else ''}'>{esc(label)} "
-                         f"<span>{counts[p]}</span>{warn}</a>")
-        if not items:
-            items.append("<span class='mute' style='padding:8px 0'>no stations yet</span>")
-        rows.append(f"<div class='seg types'><span class='fam {fam.lower()}'>{fam}</span>" + "".join(items) + "</div>")
-    return "".join(rows)
+        n = sum(counts[p] for p in group)
+        bad = sum(flagged[p] for p in group)
+        first = max(group, key=lambda p: (counts[p], p in used, -p))
+        target = ptype if fam == cur else first
+        fams.append(f"<a href='/?tab={tab}&type={target}' class='famtab {fam.lower()}{' on' if fam == cur else ''}'>"
+                    f"<b>{fam}</b><span>{n} station{'s' if n != 1 else ''}"
+                    + (f" · <b class='badt'>{bad} need a look</b>" if bad else "") + "</span></a>")
+    group = LPC_TYPES if cur == "LPC1768" else ESP_TYPES
+    items = []
+    for p, t in group.items():
+        if cur == "ESP32" and p not in used and p != ptype:
+            continue    # an ESP32 type shows once it has a station or a build
+        warn = f" <b class='badt'>· {flagged[p]}</b>" if flagged[p] else ""
+        items.append(f"<a href='/?tab={tab}&type={p}' class='{'on' if p == ptype else ''}'>{esc(t.split(' · ', 1)[1])} "
+                     f"<span>{counts[p]}</span>{warn}</a>")
+    here = (f"<div class='here'><span class='fam {cur.lower()}'>{cur}</span> {esc(TYPES[ptype].split(' · ', 1)[1])}"
+            f" <span class='mute'>· {counts[ptype]} station{'s' if counts[ptype] != 1 else ''}</span></div>")
+    return (f"<div class='famtabs'>{''.join(fams)}</div>"
+            f"<div class='seg types'>{''.join(items)}</div>{here}")
 
 
 def page(title, body, tab=None, message="", script="", ptype=None):
@@ -646,12 +668,15 @@ def page(title, body, tab=None, message="", script="", ptype=None):
     if message:
         cls = "msg bad" if message.lower().startswith(("file refused", "wrong", "not ", "no ", "the new", "build #")) and "deleted" not in message else "msg"
         msg = f"<div class='{cls}'>{esc(message)}</div>"
-    return (head + f"<header><div class='top'><b>AIO stations &amp; firmware</b> <span class='fam'>LPC1768 · ESP32</span><a href='/logout'>Log out</a></div>"
+    return (head + f"<header><div class='top'><b>AIO stations &amp; firmware</b><a href='/logout'>Log out</a></div>"
             f"<nav>{nav}</nav></header><main>{bar}{msg}{body}</main>{script}</body></html>").encode()
 
 
-def build_name(b):
-    return f"{b['version']} · {TYPES.get(b['profile'], 'LPC1768 CTRL board, every LPC type')} (#{b['id']})"
+def build_name(b, with_type=False):
+    """A build as listed: version and number; CTRL files say so; the type only where several types mix."""
+    if b["profile"] == CTRL_PROFILE:
+        return f"{b['version']} · CTRL board (#{b['id']})"
+    return f"{b['version']} (#{b['id']})" + (f" · {TYPES.get(b['profile'], '?')}" if with_type else "")
 
 
 def ctrl_state(s, b):
@@ -921,31 +946,33 @@ def stations_tab(ptype, search):
         a = attention(s, health_of(s))
         if a:
             flagged.append((s, a))
-    h.append(f"<div class='card'><h2>{esc(TYPES[ptype])}: needs attention</h2>")
+    h.append("<div class='card'><h2>Needs attention</h2>")
     if flagged:
         h.append("<div class='scroll'><table><tr><th>Station</th><th>What</th></tr>")
         for s, a in flagged:
             pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a)
             line = summary_line(health_of(s))
-            h.append(f"<tr><td class='nw'><a href='/s?k={esc(s['key'])}'><b>{esc(s['shown_id'])}</b></a></td>"
+            h.append(f"<tr><td class='nw'><a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
                      f"<td>{pills}{'<div class=mute style=margin-top:4px>' + line + '</div>' if line else ''}</td></tr>")
         h.append("</table></div>")
     else:
-        h.append(f"<p class='hint' style='margin:0'><span class='okt'>Nothing.</span> Every {esc(TYPES[ptype])} station "
+        h.append(f"<p class='hint' style='margin:0'><span class='okt'>Nothing.</span> Every station of this type "
                  "checked in within 26 hours and reports no problem.</p>")
     h.append("</div>")
 
     # The type's stations
+    esp = ptype in ESP_TYPES
     rows = [s for s in stations if s["profile"] == ptype]
     if search:
         rows = [s for s in rows if search.lstrip("0") in s["shown_id"].lstrip("0")]
     h.append(f"<div class='card'><div class='row' style='justify-content:space-between;margin-bottom:10px'>"
-             f"<h2 style='margin:0'>{esc(TYPES[ptype])} stations</h2>"
+             f"<h2 style='margin:0'>Stations</h2>"
              f"<form method='get' action='/' class='row'><input type='hidden' name='tab' value='stations'>"
              f"<input type='hidden' name='type' value='{ptype}'><input name='q' value='{esc(search)}' "
              f"placeholder='Find a station ID' size='16'><button class='plain'>Find</button></form></div>"
-             "<div class='scroll'><table class='list'><tr><th>Station</th><th>Firmware</th><th>Sent (last day)</th>"
-             "<th>Battery day / night</th><th>Carrier</th><th>Last check</th><th>Update</th></tr>")
+             "<div class='scroll'><table class='list'><tr><th>Station</th><th>Firmware</th>"
+             + ("<th>Running image</th>" if esp else "<th>Sent (last day)</th><th>Battery day / night</th><th>Carrier</th>")
+             + "<th>Last check</th><th>Update</th></tr>")
     for s in rows:
         hl = health_of(s)
         cls, label, _, pct = station_state(s, st_builds[s["key"]])
@@ -957,9 +984,11 @@ def stations_tab(ptype, search):
         else:
             bat = "<span class='mute'>—</span>"
         carrier = esc(hl.get("op") or "") + (f" <span class='mute'>{esc(hl['net'])}G</span>" if hl.get("net") in ("2", "4") else "")
-        h.append(f"<tr><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(s['shown_id'])}</b></a></td>"
-                 f"<td class='nw'>{fw_text(s, hl)}</td><td class='nw'>{sent_text(hl)}</td>"
-                 f"<td class='nw'>{bat}</td><td class='nw'>{carrier or '<span class=mute>—</span>'}</td>"
+        middle = (f"<td class='nw'><span class='crc'>{esc(s['running_crc'])}</span></td>" if esp else
+                  f"<td class='nw'>{sent_text(hl)}</td><td class='nw'>{bat}</td>"
+                  f"<td class='nw'>{carrier or '<span class=mute>—</span>'}</td>")
+        h.append(f"<tr><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
+                 f"<td class='nw'>{fw_text(s, hl)}</td>{middle}"
                  f"<td class='nw'>{esc(when(s['last_seen']))}</td>"
                  f"<td class='nw'><span class='pill {cls}'>{esc(label)}</span>{bar}"
                  + (f"<div style='margin-top:4px'><span class='pill {st_ctrl[s['key']][0]}'>{esc(st_ctrl[s['key']][1])}</span></div>"
@@ -977,15 +1006,15 @@ def stations_tab(ptype, search):
 
     # Send an update, for this type only
     tb = [b for b in builds if b["profile"] == ptype or (b["profile"] == CTRL_PROFILE and ptype in LPC_TYPES)]
-    h.append(f"<div class='card'><h2>Send an update to {esc(TYPES[ptype])} stations</h2>")
+    h.append("<div class='card'><h2>Send an update</h2>")
     if not tb:
-        h.append(f"<p class='hint' style='margin:0'>No {esc(TYPES[ptype])} firmware uploaded yet: see "
+        h.append(f"<p class='hint' style='margin:0'>No firmware of this type uploaded yet: see "
                  "<a href='/?tab=firmware'>Firmware files</a>.</p></div>")
     else:
         opts = "".join(f"<option value='{b['id']}'>{esc(build_name(b))}{' · ' + esc(b['note']) if b['note'] else ''}</option>"
                        for b in tb)
         ticks = "".join(f"<label class='tick'><input type='checkbox' name='stn' value='{esc(s['key'])}'>"
-                        f"<span><b>{esc(s['shown_id'])}</b> <span class='mute'>{esc(s['version'] or 'not seen yet')}</span></span></label>"
+                        f"<span><b>{esc(sid(s))}</b> <span class='mute'>{esc(s['version'] or 'not seen yet')}</span></span></label>"
                         for s in stations if s["profile"] == ptype)
         h.append("<p class='hint'>Choose the firmware, tick the stations, press Send. Try one station first. "
                  + ("An ESP32 station downloads it over a few slots, checks it, restarts into it and keeps it once it "
@@ -996,7 +1025,7 @@ def stations_tab(ptype, search):
                  f"<div><label class='f' for='bsel'>1. Firmware</label><select id='bsel' name='build' required>{opts}</select></div>"
                  f"<div><label class='f'>2. Stations</label><div class='ticks'>{ticks or '<span class=mute>None yet.</span>'}</div></div>"
                  "<label class='tick' style='align-self:flex-start'><input type='checkbox' name='all' value='1'>"
-                 f"<span>Every {esc(TYPES[ptype])} station, including ones that check in later</span></label>"
+                 f"<span>Every station of this type, including ones that check in later</span></label>"
                  "<div><button>Send update</button></div></form>")
         wb = by_id.get(targets.get(ptype))
         if wb:
@@ -1043,7 +1072,7 @@ def station_page(key, message=""):
     # Summary
     pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a) or "<span class='pill ok'>No problem reported</span>"
     h.append(f"<div class='card'><div class='row' style='justify-content:space-between'><h2 style='margin:0;font-size:22px'>"
-             f"{esc(s['shown_id'])} <span class='fam {family(s['profile']).lower()}'>{family(s['profile'])}</span> "
+             f"{esc(sid(s))} <span class='fam {family(s['profile']).lower()}'>{family(s['profile'])}</span> "
              f"<span class='mute' style='font-size:15px;font-weight:400'>{esc(TYPES.get(s['profile'], '?'))}</span></h2>"
              f"<div>{pills}</div></div>"
              f"<div class='kv' style='margin-top:14px'>"
@@ -1140,7 +1169,7 @@ def firmware_tab(ptype):
          "<div><label class='f'>File</label><input type='file' name='file' accept='.hex,.bin' required></div>"
          "<div><label class='f'>Note (optional)</label><input name='note' placeholder='e.g. SMS fix, for test team' size='34' maxlength='60'></div>"
          "<div><button>Upload</button></div></form></div>"]
-    h.append(f"<div class='card'><h2>{esc(TYPES[ptype])}{' and CTRL' if ptype in LPC_TYPES else ''} firmware</h2><div class='scroll'><table>"
+    h.append(f"<div class='card'><h2>Firmware files{' (and CTRL board files)' if ptype in LPC_TYPES else ''}</h2><div class='scroll'><table>"
              "<tr><th>Version</th><th>Type</th><th>Uploaded</th><th>Note</th><th>Set for</th><th></th></tr>")
     for b in builds:
         users = []
@@ -1164,13 +1193,13 @@ def history_tab(ptype):
     with db() as con:
         events = con.execute("SELECT * FROM events WHERE profile=? OR profile IS NULL ORDER BY id DESC LIMIT 300",
                              (ptype,)).fetchall()
-    h = [f"<div class='card'><h2>{esc(TYPES[ptype])} history</h2><p class='hint'>The newest first. Office events "
+    h = [f"<div class='card'><h2>History</h2><p class='hint'>The newest first. Office events "
          "that belong to no type (password) show under every type.</p><div class='scroll'><table>"
          "<tr><th>When</th><th>Station</th><th>What happened</th></tr>"]
     for e in events:
         t = e["text"]
         cls = "badt" if t.startswith("FAILED") else "okt" if t.startswith("UPDATED") else ""
-        h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='nw'>{esc(e['station']) or '<span class=mute>office</span>'}</td>"
+        h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='nw'>{esc(e['station'][1:] if e['profile'] in ESP_TYPES and (e['station'] or '')[:1] == 'E' else e['station']) or '<span class=mute>office</span>'}</td>"
                  f"<td class='{cls}'>{esc(t)}</td></tr>")
     if not events:
         h.append("<tr><td colspan='3' class='mute'>Nothing yet.</td></tr>")
@@ -1287,7 +1316,7 @@ def do_send(f, stn_keys):
                     continue
                 con.execute("UPDATE stations SET ctrl_target=?, ctrl_result='', ctrl_offered='' WHERE key=?", (str(build_id), key))
                 add_event(con, st["shown_id"], f"office set: CTRL gets build #{build_id} {b['version']}")
-                sent.append(st["shown_id"])
+                sent.append(sid(st))
             if not sent:
                 return "Not sent: tick at least one station."
             return (f"CTRL {b['version']} set for {', '.join(sent)}. Each takes it at its next check, after any "
@@ -1297,11 +1326,11 @@ def do_send(f, stn_keys):
             if st is None:
                 continue
             if st["profile"] != b["profile"]:
-                skipped.append(st["shown_id"])
+                skipped.append(sid(st))
                 continue
             con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL WHERE key=?", (str(build_id), key))
             add_event(con, st["shown_id"], f"office set: gets build #{build_id} {b['version']}")
-            sent.append(st["shown_id"])
+            sent.append(sid(st))
         if all_type:
             con.execute("INSERT INTO type_targets (profile, build_id) VALUES (?,?) "
                         "ON CONFLICT(profile) DO UPDATE SET build_id=excluded.build_id", (b["profile"], build_id))
@@ -1438,9 +1467,9 @@ class Handler(BaseHTTPRequestHandler):
                     if st:
                         con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL WHERE key=?", (target, st["key"]))
                         add_event(con, st["shown_id"], f"office set: {'updates resumed (follows its type)' if target == 'type' else 'updates stopped' if target == 'hold' else 'gets build #' + target}")
-                        message = (f"Updates stopped for {st['shown_id']}." if target == "hold" else
-                                   f"Updates resumed for {st['shown_id']}." if target == "type" else
-                                   f"Station {st['shown_id']} set. It acts on this at its next check.")
+                        message = (f"Updates stopped for {sid(st)}." if target == "hold" else
+                                   f"Updates resumed for {sid(st)}." if target == "type" else
+                                   f"Station {sid(st)} set. It acts on this at its next check.")
         elif url.path == "/station/ctrl":
             target = f.get("target", "")
             if target == "" or target.isdigit():
@@ -1449,8 +1478,8 @@ class Handler(BaseHTTPRequestHandler):
                     if st:
                         con.execute("UPDATE stations SET ctrl_target=?, ctrl_result='', ctrl_offered='' WHERE key=?", (target, st["key"]))
                         add_event(con, st["shown_id"], "office set: " + (f"CTRL gets build #{target}" if target else "no CTRL update"))
-                        message = (f"Station {st['shown_id']}: CTRL set. It acts on this at its next check." if target else
-                                   f"Station {st['shown_id']}: no CTRL update.")
+                        message = (f"Station {sid(st)}: CTRL set. It acts on this at its next check." if target else
+                                   f"Station {sid(st)}: no CTRL update.")
         elif url.path == "/station/add":
             stn = f.get("id", "")
             if re.fullmatch(r"[0-9A-Za-z]{1,12}", stn) and f.get("profile", "") in TYPE_KEYS:
