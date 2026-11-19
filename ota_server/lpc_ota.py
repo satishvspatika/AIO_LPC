@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""LPC-AIO firmware-over-the-air server. One file, Python standard library only.
+"""AIO firmware-over-the-air server for LPC1768 and ESP32 stations. One file, Python standard library only.
+(Named lpc_ota.py and serving /lpc/ for history: it began with the LPC1768 stations. ESP32 AIO9 stations use the
+same two requests.)
 
 Units (port 80, through nginx, paths under /lpc/):
   GET /lpc/check?id=&p=&cc=&v=&c=&s=&t= -> "OTA NONE", "OTA FW <file bytes> <file crc> <image crc>" or
@@ -9,6 +11,8 @@ Units (port 80, through nginx, paths under /lpc/):
 Office (port 5002, login): tabs Stations (send an update, see each station's state), Firmware files
 (upload), History, Password (change the admin password; kept hashed in the database, ota.env is the fallback).
 
+ESP32 AIO9 stations (types 10-27) use the same two requests with a .bin app image: the server checks its
+segments, checksum, SHA-256 and the AIOOTA1 type block before accepting it.
 A file is accepted only if it is a complete main-firmware .hex, or (v6.9.63) a CTRL ctrl.hex, whose image
 header and CRC are right: the same checks the unit makes before it installs anything. A CTRL file is the
 same for every station type; a station gets it only when it has no main-board update waiting.
@@ -45,7 +49,24 @@ CTRL_SLOT_A_BASE = 0x2400       # v6.9.63: CTRL (LPC845) firmware, ctrl.hex
 CTRL_SLOT_SIZE = 0x6000
 CTRL_BOARD_ID = 0x845
 CTRL_PROFILE = 9                # builds.profile of a CTRL file: for every station type
-TYPES = {0: "KSNDMC TRG", 1: "BIHAR TRG", 2: "KSNDMC TWS"}
+LPC_OLD_NAMES = {0: "KSNDMC TRG", 1: "BIHAR TRG", 2: "KSNDMC TWS"}   # as written in older history events
+LPC_TYPES = {p: f"LPC1768 · {t}" for p, t in LPC_OLD_NAMES.items()}
+TYPES = dict(LPC_TYPES)
+# ESP32 AIO9 stations. The firmware compiles its type number into an "AIOOTA1" block (ota_esp.ino):
+# base + 0 for the Nuvoton UI (-N), + 1 for the Matrix UI (-M). Station ids are sent with an "E" in
+# front so an ESP station never shares a key with an LPC one of the same number.
+ESP_BASES = {10: "KSNDMC TRG", 12: "BIHAR TRG", 14: "KSNDMC TWS", 16: "KSNDMC TWS-AP", 18: "KSNDMC TWS-RF",
+             20: "SPATIKA TRG", 22: "SPATIKA TWS", 24: "SPATIKA TWS-RF", 26: "SPATIKA TWS-RP"}
+ESP_UI = ("Nuvoton", "Matrix")
+ESP_TYPES = {b + ui: f"ESP32 · {name} · {ESP_UI[ui]}" for b, name in ESP_BASES.items() for ui in (0, 1)}
+TYPES.update(ESP_TYPES)
+TYPE_KEYS = {str(p) for p in TYPES}
+
+
+def family(profile):
+    """The board family of a type: what the office page groups and labels by."""
+    return "ESP32" if profile in ESP_TYPES else "LPC1768"
+ESP_MAX_IMAGE = 0x1B0000        # the 8 MB layout's app slot (the unit checks its own slot size too)
 MAX_UPLOAD = 2 * 1024 * 1024
 MAX_PIECE = 2048
 UNIT_STATUS = {"0": "idle", "1": "downloading", "2": "file ready, installing", "3": "install failed, went back",
@@ -114,10 +135,63 @@ def parse_firmware_hex(data):
     if ctrl:
         version = bytes(img[off + 20:off + 36]).split(b"\0")[0].decode("ascii", "replace")
         return CTRL_PROFILE, version, crc, len(img)
-    if profile not in TYPES:
+    if profile not in LPC_TYPES:
         raise ValueError(f"unknown station type {profile}")
     version = bytes(img[off + 20:off + 36]).split(b"\0")[0].decode("ascii", "replace")
     return profile, version, crc, len(img)
+
+
+def parse_esp_bin(data):
+    """An ESP32 app image (.bin) as built by arduino-cli. Returns (profile, version, image_id, length).
+    image_id is the first 4 bytes of the ELF SHA-256 in the app description: what the running unit
+    reports as its image (esp_app_get_description()). Raises ValueError saying what is wrong."""
+    if len(data) < 0x200 or data[0] != 0xE9:
+        raise ValueError("not an ESP32 app image (.bin)")
+    if len(data) > ESP_MAX_IMAGE:
+        raise ValueError(f"image is {len(data)} bytes: larger than the app slot ({ESP_MAX_IMAGE})")
+    nseg = data[1]
+    chip_id = struct.unpack_from("<H", data, 12)[0]
+    hash_appended = data[23]
+    if chip_id != 0:
+        raise ValueError(f"image is for another chip (chip id {chip_id}), not the ESP32")
+    if not 1 <= nseg <= 16:
+        raise ValueError("bad segment count: a damaged file")
+    off, csum = 24, 0xEF
+    for _ in range(nseg):
+        if off + 8 > len(data):
+            raise ValueError("the file stops inside a segment header")
+        seg_len = struct.unpack_from("<I", data, off + 4)[0]
+        off += 8
+        if off + seg_len > len(data):
+            raise ValueError("the file stops inside a segment")
+        for b in data[off:off + seg_len]:
+            csum ^= b
+        off += seg_len
+    off += 16 - (off % 16)          # padding; its last byte is the checksum
+    if data[off - 1] != csum:
+        raise ValueError("image checksum is wrong: a damaged file")
+    if hash_appended:
+        if off + 32 > len(data) or hashlib.sha256(data[:off]).digest() != data[off:off + 32]:
+            raise ValueError("image SHA-256 is wrong: a damaged file")
+        off += 32
+    if off != len(data):
+        raise ValueError(f"{len(data) - off} extra bytes after the image")
+    if struct.unpack_from("<I", data, 0x20)[0] != 0xABCD5432:
+        raise ValueError("no app description in the image")
+    image_id = data[0x20 + 144:0x20 + 148].hex().upper()
+    i = data.find(b"AIOOTA1\0")
+    if i < 0 or i + 28 > len(data):
+        raise ValueError("no AIOOTA1 block: this firmware has no OTA support (v6.56 or later needed)")
+    profile = struct.unpack_from("<i", data, i + 8)[0]
+    version = data[i + 12:i + 28].split(b"\0")[0].decode("ascii", "replace")
+    if profile not in ESP_TYPES:
+        raise ValueError(f"unknown ESP32 station type {profile}")
+    return profile, version, int(image_id, 16), len(data)
+
+
+def build_file(build_id, profile):
+    """Where a build's file is kept: <id>.hex for LPC and CTRL, <id>.bin for ESP32."""
+    return os.path.join(BUILDS_DIR, f"{build_id}.{'bin' if profile in ESP_TYPES else 'hex'}")
 
 
 # ---------------------------------------------------------------- database
@@ -164,7 +238,7 @@ def init_db():
             con.execute("UPDATE events SET profile=(SELECT profile FROM stations WHERE stations.shown_id=events.station)"
                         " WHERE station != ''")
             for e in con.execute("SELECT id, text FROM events WHERE station='' OR station IS NULL").fetchall():
-                p = next((k for k, t in TYPES.items() if t in e["text"]), None)
+                p = next((k for k, t in LPC_OLD_NAMES.items() if t in e["text"]), None)
                 m = re.match(r"build #(\d+)", e["text"])
                 if p is None and m:
                     b = con.execute("SELECT profile FROM builds WHERE id=?", (int(m.group(1)),)).fetchone()
@@ -390,7 +464,7 @@ def unit_piece(q):
     if build is None:
         return 404, b"OTA GONE\n"
     try:
-        with open(os.path.join(BUILDS_DIR, f"{build['id']}.hex"), "rb") as f:
+        with open(build_file(build["id"], build["profile"]), "rb") as f:
             f.seek(off)
             piece = f.read(n)
     except OSError:
@@ -494,7 +568,9 @@ details summary{cursor:pointer;color:var(--acc);font-size:14px}
 .seg a{padding:8px 14px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);text-decoration:none;font-weight:600;font-size:14px}
 .seg a span{color:var(--mute);font-weight:500;margin-left:4px}.seg a.on{background:var(--acc);border-color:var(--acc);color:var(--acc-ink)}
 .seg a.on span{color:var(--acc-ink);opacity:.8}
-.seg.types{margin:0 0 16px}.seg.types a{font-size:15px}.seg a.on .badt{color:var(--acc-ink)}
+.seg.types{margin:0 0 10px;align-items:center}
+.fam{display:inline-block;padding:3px 9px;border-radius:6px;font-size:12px;font-weight:700;letter-spacing:.04em;background:var(--line);color:var(--ink);vertical-align:middle}
+.fam.esp32{background:#1f6f5c;color:#fff}.fam.lpc1768{background:#3b4a7a;color:#fff}.seg.types a{font-size:15px}.seg a.on .badt{color:var(--acc-ink)}
 table.list td{vertical-align:middle}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:var(--ok)}
 .dot.bad{background:var(--bad)}.dot.wait{background:var(--wait)}
@@ -538,12 +614,22 @@ def type_bar(tab, ptype):
     for st in stations:
         if st["profile"] in flagged and attention(st, health_of(st)):
             flagged[st["profile"]] += 1
-    items = []
-    for p, t in TYPES.items():
-        warn = f" <b class='badt'>· {flagged[p]} need a look</b>" if flagged[p] else ""
-        items.append(f"<a href='/?tab={tab}&type={p}' class='{'on' if p == ptype else ''}'>{esc(t)} "
-                     f"<span>{counts[p]}</span>{warn}</a>")
-    return "<div class='seg types'>" + "".join(items) + "</div>"
+    with db() as con:
+        used = {r["profile"] for r in con.execute("SELECT profile FROM builds UNION SELECT profile FROM stations")}
+    rows = []
+    for fam, group in (("LPC1768", LPC_TYPES), ("ESP32", ESP_TYPES)):
+        items = []
+        for p, t in group.items():
+            if fam == "ESP32" and p not in used and p != ptype:
+                continue    # an ESP32 type shows once it has a station or a build
+            warn = f" <b class='badt'>· {flagged[p]} need a look</b>" if flagged[p] else ""
+            label = t.split(" · ", 1)[1]
+            items.append(f"<a href='/?tab={tab}&type={p}' class='{'on' if p == ptype else ''}'>{esc(label)} "
+                         f"<span>{counts[p]}</span>{warn}</a>")
+        if not items:
+            items.append("<span class='mute' style='padding:8px 0'>no stations yet</span>")
+        rows.append(f"<div class='seg types'><span class='fam {fam.lower()}'>{fam}</span>" + "".join(items) + "</div>")
+    return "".join(rows)
 
 
 def page(title, body, tab=None, message="", script="", ptype=None):
@@ -560,12 +646,12 @@ def page(title, body, tab=None, message="", script="", ptype=None):
     if message:
         cls = "msg bad" if message.lower().startswith(("file refused", "wrong", "not ", "no ", "the new", "build #")) and "deleted" not in message else "msg"
         msg = f"<div class='{cls}'>{esc(message)}</div>"
-    return (head + f"<header><div class='top'><b>LPC-AIO stations &amp; firmware</b><a href='/logout'>Log out</a></div>"
+    return (head + f"<header><div class='top'><b>AIO stations &amp; firmware</b> <span class='fam'>LPC1768 · ESP32</span><a href='/logout'>Log out</a></div>"
             f"<nav>{nav}</nav></header><main>{bar}{msg}{body}</main>{script}</body></html>").encode()
 
 
 def build_name(b):
-    return f"{b['version']} · {TYPES.get(b['profile'], 'CTRL, every type')} (#{b['id']})"
+    return f"{b['version']} · {TYPES.get(b['profile'], 'LPC1768 CTRL board, every LPC type')} (#{b['id']})"
 
 
 def ctrl_state(s, b):
@@ -702,6 +788,8 @@ def _v(h, k, unit=""):
 
 def fw_text(s, h):
     """Main firmware with the CTRL firmware next to it."""
+    if s["profile"] in ESP_TYPES:      # ESP32 stations have no CTRL board
+        return f"<b>{esc(s['version']) or '—'}</b>"
     ctrl = h.get("ctrl") or ""
     return (f"<b>{esc(s['version']) or '—'}</b> <span class='mute'>· CTRL</span> "
             + (f"<b>{esc(ctrl)}</b>" if ctrl else "<span class='mute'>—</span>"))
@@ -879,13 +967,16 @@ def stations_tab(ptype, search):
     if not rows:
         h.append(f"<tr><td colspan='7' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
     h.append("</table></div>")
-    if not any(health_of(s) for s in rows) and rows:
+    if ptype in ESP_TYPES and rows:
+        h.append("<p class='hint' style='margin:10px 0 0'>ESP32 stations send their health to the Spatika health "
+                 "server; this page shows their firmware and updates.</p>")
+    elif not any(health_of(s) for s in rows) and rows:
         h.append("<p class='hint' style='margin:10px 0 0'>Battery, signal and slot counts come in the daily health "
                  "report (firmware v6.9.60 on; the last whole day from v6.9.62).</p>")
     h.append("</div>")
 
     # Send an update, for this type only
-    tb = [b for b in builds if b["profile"] in (ptype, CTRL_PROFILE)]
+    tb = [b for b in builds if b["profile"] == ptype or (b["profile"] == CTRL_PROFILE and ptype in LPC_TYPES)]
     h.append(f"<div class='card'><h2>Send an update to {esc(TYPES[ptype])} stations</h2>")
     if not tb:
         h.append(f"<p class='hint' style='margin:0'>No {esc(TYPES[ptype])} firmware uploaded yet: see "
@@ -897,8 +988,10 @@ def stations_tab(ptype, search):
                         f"<span><b>{esc(s['shown_id'])}</b> <span class='mute'>{esc(s['version'] or 'not seen yet')}</span></span></label>"
                         for s in stations if s["profile"] == ptype)
         h.append("<p class='hint'>Choose the firmware, tick the stations, press Send. Try one station first. "
-                 "A CTRL file goes to the CTRL board of the ticked stations, after any main-board update; "
-                 "they need main firmware v6.9.63 or later.</p>"
+                 + ("An ESP32 station downloads it over a few slots, checks it, restarts into it and keeps it once it "
+                    "has sent a record; otherwise it goes back to its old firmware by itself.</p>" if ptype in ESP_TYPES else
+                    "A CTRL file goes to the CTRL board of the ticked stations, after any main-board update; "
+                    "they need main firmware v6.9.63 or later.</p>") +
                  f"<form method='post' action='/send' class='stack'><input type='hidden' name='back' value='/?tab=stations&type={ptype}'>"
                  f"<div><label class='f' for='bsel'>1. Firmware</label><select id='bsel' name='build' required>{opts}</select></div>"
                  f"<div><label class='f'>2. Stations</label><div class='ticks'>{ticks or '<span class=mute>None yet.</span>'}</div></div>"
@@ -950,23 +1043,27 @@ def station_page(key, message=""):
     # Summary
     pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a) or "<span class='pill ok'>No problem reported</span>"
     h.append(f"<div class='card'><div class='row' style='justify-content:space-between'><h2 style='margin:0;font-size:22px'>"
-             f"{esc(s['shown_id'])} <span class='mute' style='font-size:15px;font-weight:400'>{esc(TYPES.get(s['profile'], '?'))}</span></h2>"
+             f"{esc(s['shown_id'])} <span class='fam {family(s['profile']).lower()}'>{family(s['profile'])}</span> "
+             f"<span class='mute' style='font-size:15px;font-weight:400'>{esc(TYPES.get(s['profile'], '?'))}</span></h2>"
              f"<div>{pills}</div></div>"
              f"<div class='kv' style='margin-top:14px'>"
              f"<div><span>Firmware</span><span>{fw_text(s, hl)} <span class='crc'>{esc(s['running_crc'])}</span></span></div>"
              f"<div><span>Last check</span>{esc(when(s['last_seen']))}</div>"
-             f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware v6.9.60 on)</span>'}</div>"
+             + (f"<div><span>Board</span>ESP32 AIO9</div>" if s["profile"] in ESP_TYPES else
+                f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware v6.9.60 on)</span>'}</div>") +
              f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
 
-    # Health
-    old_report = bool(hl) and hl.get("sent") in (None, "")
-    h.append("<div class='card'><h2>Health</h2><p class='hint'>From the daily report at 12:30-14:15, about the day "
-             "08:45 to 08:30 before it." + (" <b>This report is from firmware before v6.9.62</b>, which doesn't send "
-                                            "the day's counts or battery averages." if old_report else "") +
-             "</p><div class='kv'>")
-    for label_, value in health_rows(s, hl):
-        h.append(f"<div><span>{esc(label_)}</span><span>{value}</span></div>")
-    h.append("</div></div>")
+    # Health (LPC1768 stations: their daily report comes with the check. ESP32 stations report to the
+    # Spatika health server)
+    if s["profile"] not in ESP_TYPES:
+        old_report = bool(hl) and hl.get("sent") in (None, "")
+        h.append("<div class='card'><h2>Health</h2><p class='hint'>From the daily report at 12:30-14:15, about the day "
+                 "08:45 to 08:30 before it." + (" <b>This report is from firmware before v6.9.62</b>, which doesn't send "
+                                                "the day's counts or battery averages." if old_report else "") +
+                 "</p><div class='kv'>")
+        for label_, value in health_rows(s, hl):
+            h.append(f"<div><span>{esc(label_)}</span><span>{value}</span></div>")
+        h.append("</div></div>")
 
     # Update
     opts = [("type", "Same as its type"), ("hold", "Nothing (updates stopped)")] + [
@@ -978,46 +1075,51 @@ def station_page(key, message=""):
              f"<form method='post' action='/station' class='row' style='margin-top:10px'><input type='hidden' name='key' value='{esc(s['key'])}'>"
              f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='tsel'>Gets</label>"
              f"<select id='tsel' name='target'>{sel}</select><button>Set</button></form>")
-    # v6.9.63: CTRL
-    cst = ctrl_state(s, cbuild)
-    copts = [("", "Nothing")] + [(str(b["id"]), build_name(b)) for b in cbuilds]
-    csel = "".join(f"<option value='{esc(v)}'{' selected' if v == (s['ctrl_target'] or '') else ''}>{esc(t)}</option>" for v, t in copts)
-    h.append(f"<h2 style='margin-top:18px'>CTRL firmware</h2><p class='hint'>Running CRC "
-             f"<span class='crc'>{esc(s['ctrl_crc']) or '— (main firmware before v6.9.63 does not say)'}</span></p>"
-             + (f"<p style='margin:0 0 6px'><span class='pill {cst[0]}'>{esc(cst[1])}</span></p>" if cst else "") +
-             f"<form method='post' action='/station/ctrl' class='row'><input type='hidden' name='key' value='{esc(s['key'])}'>"
-             f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='csel'>Gets</label>"
-             f"<select id='csel' name='target'>{csel}</select><button>Set</button></form></div>")
+    # v6.9.63: CTRL (LPC1768 stations only: ESP32 stations have no CTRL board)
+    if s["profile"] in ESP_TYPES:
+        h.append("</div>")
+    else:
+        cst = ctrl_state(s, cbuild)
+        copts = [("", "Nothing")] + [(str(b["id"]), build_name(b)) for b in cbuilds]
+        csel = "".join(f"<option value='{esc(v)}'{' selected' if v == (s['ctrl_target'] or '') else ''}>{esc(t)}</option>" for v, t in copts)
+        h.append(f"<h2 style='margin-top:18px'>CTRL firmware</h2><p class='hint'>Running CRC "
+                 f"<span class='crc'>{esc(s['ctrl_crc']) or '— (main firmware before v6.9.63 does not say)'}</span></p>"
+                 + (f"<p style='margin:0 0 6px'><span class='pill {cst[0]}'>{esc(cst[1])}</span></p>" if cst else "") +
+                 f"<form method='post' action='/station/ctrl' class='row'><input type='hidden' name='key' value='{esc(s['key'])}'>"
+                 f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='csel'>Gets</label>"
+                 f"<select id='csel' name='target'>{csel}</select><button>Set</button></form></div>")
 
-    # Health history
-    h.append("<div class='card'><h2>Health history</h2><div class='scroll'><table><tr><th>Received</th>" +
-             "".join(f"<th>{esc(t)}</th>" for t, _ in HISTORY_COLS) + "</tr>")
-    for r in reports:
-        try:
-            d = json.loads(r["data"])
-        except ValueError:
-            d = {}
-        h.append(f"<tr><td class='nw'>{esc(when(r['at']))}</td>" +
-                 "".join(f"<td class='nw'>{fn(d)}</td>" for _, fn in HISTORY_COLS) + "</tr>")
-    if not reports:
-        h.append(f"<tr><td colspan='{len(HISTORY_COLS) + 1}' class='mute'>No health report yet.</td></tr>")
-    h.append("</table></div></div>")
+    # Health history (LPC1768 stations only)
+    if s["profile"] not in ESP_TYPES:
+        h.append("<div class='card'><h2>Health history</h2><div class='scroll'><table><tr><th>Received</th>" +
+                 "".join(f"<th>{esc(t)}</th>" for t, _ in HISTORY_COLS) + "</tr>")
+        for r in reports:
+            try:
+                d = json.loads(r["data"])
+            except ValueError:
+                d = {}
+            h.append(f"<tr><td class='nw'>{esc(when(r['at']))}</td>" +
+                     "".join(f"<td class='nw'>{fn(d)}</td>" for _, fn in HISTORY_COLS) + "</tr>")
+        if not reports:
+            h.append(f"<tr><td colspan='{len(HISTORY_COLS) + 1}' class='mute'>No health report yet.</td></tr>")
+        h.append("</table></div></div>")
 
-    # Events
-    h.append("<div class='card'><h2>Events</h2><div class='scroll'><table><tr><th>When</th><th>What happened</th></tr>")
-    for e in events:
-        t = e["text"]
-        c = "badt" if t.startswith("FAILED") else "okt" if t.startswith("UPDATED") else ""
-        h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='{c}'>{esc(t)}</td></tr>")
-    if not events:
-        h.append("<tr><td colspan='2' class='mute'>Nothing yet.</td></tr>")
-    h.append("</table></div></div>")
+        # Events
+        h.append("<div class='card'><h2>Events</h2><div class='scroll'><table><tr><th>When</th><th>What happened</th></tr>")
+        for e in events:
+            t = e["text"]
+            c = "badt" if t.startswith("FAILED") else "okt" if t.startswith("UPDATED") else ""
+            h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='{c}'>{esc(t)}</td></tr>")
+        if not events:
+            h.append("<tr><td colspan='2' class='mute'>Nothing yet.</td></tr>")
+        h.append("</table></div></div>")
     return page(f"Station {s['shown_id']}", "".join(h), "stations", message, ptype=s["profile"])
 
 
 def firmware_tab(ptype):
     with db() as con:
-        builds = con.execute("SELECT * FROM builds WHERE profile IN (?,?) ORDER BY profile, id DESC", (ptype, CTRL_PROFILE)).fetchall()
+        ctrl_too = CTRL_PROFILE if ptype in LPC_TYPES else ptype     # ESP32 stations have no CTRL board
+        builds = con.execute("SELECT * FROM builds WHERE profile IN (?,?) ORDER BY profile, id DESC", (ptype, ctrl_too)).fetchall()
         targets = {r["build_id"] for r in con.execute("SELECT build_id FROM type_targets WHERE build_id IS NOT NULL")}
         used_by = {}
         for s in con.execute("SELECT shown_id, target FROM stations WHERE target NOT IN ('type','hold')"):
@@ -1026,18 +1128,19 @@ def firmware_tab(ptype):
             if s["ctrl_target"].isdigit():
                 used_by.setdefault(int(s["ctrl_target"]), []).append(s["shown_id"] + " (CTRL)")
     h = ["<div class='card'><h2>Upload firmware</h2>"
-         "<ol class='steps'><li>Use the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
+         "<ol class='steps'><li><b>LPC1768 stations:</b> the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
          "<code>fw_bihar.hex</code>, <code>fw_ksn_tws.hex</code>, or <code>ctrl.hex</code> for the CTRL board "
-         "(one file for every type).</li>"
+         "(one file for every type).</li><li><b>ESP32 stations:</b> the build's <code>.bin</code> (AIO9 v6.56 or later). "
+         "Its station type (unit, Nuvoton or Matrix) is read from the file. For 4 MB units upload the 4 MB build.</li>"
          "<li>The station type and version are read from the file. A damaged or wrong file is refused.</li>"
          "<li>It is filed under its own type, whichever type is chosen above.</li>"
          f"<li>Uploading sends it to nobody. Choose stations on the <a href='/?tab=stations&type={ptype}'>Stations</a> tab.</li></ol>"
          "<form method='post' action='/upload' enctype='multipart/form-data' class='stack'>"
          f"<input type='hidden' name='back' value='/?tab=firmware&type={ptype}'>"
-         "<div><label class='f'>File</label><input type='file' name='file' accept='.hex' required></div>"
+         "<div><label class='f'>File</label><input type='file' name='file' accept='.hex,.bin' required></div>"
          "<div><label class='f'>Note (optional)</label><input name='note' placeholder='e.g. SMS fix, for test team' size='34' maxlength='60'></div>"
          "<div><button>Upload</button></div></form></div>"]
-    h.append(f"<div class='card'><h2>{esc(TYPES[ptype])} and CTRL firmware</h2><div class='scroll'><table>"
+    h.append(f"<div class='card'><h2>{esc(TYPES[ptype])}{' and CTRL' if ptype in LPC_TYPES else ''} firmware</h2><div class='scroll'><table>"
              "<tr><th>Version</th><th>Type</th><th>Uploaded</th><th>Note</th><th>Set for</th><th></th></tr>")
     for b in builds:
         users = []
@@ -1046,7 +1149,7 @@ def firmware_tab(ptype):
         users += used_by.get(b["id"], [])
         h.append(f"<tr><td class='nw'><b>{esc(b['version'])}</b> <span class='mute'>#{b['id']}</span><br>"
                  f"<span class='crc'>CRC {esc(b['image_crc'])} · {b['size'] // 1024} KB</span></td>"
-                 f"<td class='nw'>{esc(TYPES.get(b['profile'], 'CTRL, every type'))}</td><td>{esc(when(b['uploaded_at']))}</td>"
+                 f"<td class='nw'>{esc(TYPES.get(b['profile'], 'LPC1768 CTRL board, every LPC type'))}</td><td>{esc(when(b['uploaded_at']))}</td>"
                  f"<td>{esc(b['note'])}</td><td>{esc(', '.join(users)) or '<span class=mute>nobody</span>'}</td>"
                  f"<td><form method='post' action='/build/delete' onsubmit=\"return confirm('Delete {esc(b['version'])} (#{b['id']})?')\">"
                  f"<input type='hidden' name='back' value='/?tab=firmware&type={ptype}'>"
@@ -1106,7 +1209,7 @@ def office_page(tab, message="", q=None):
 
 def login_page(error=""):
     err = f"<p class='badt'>{esc(error)}</p>" if error else ""
-    return page("Log in", f"<div class='card login'><h2>LPC-AIO firmware updates</h2><p class='hint'>Log in</p>{err}"
+    return page("Log in", f"<div class='card login'><h2>AIO firmware updates</h2><p class='hint' style='margin:0 0 6px'>LPC1768 and ESP32 stations</p><p class='hint'>Log in</p>{err}"
                 "<form method='post' action='/login'>"
                 "<input name='user' placeholder='User' autocomplete='username' required>"
                 "<input name='password' type='password' placeholder='Password' autocomplete='current-password' required>"
@@ -1136,7 +1239,10 @@ def do_upload(parts):
     if not data:
         return "No file chosen.", None
     try:
-        profile, version, image_crc, _ = parse_firmware_hex(data)
+        if data[:1] == b"\xe9":
+            profile, version, image_crc, _ = parse_esp_bin(data)
+        else:
+            profile, version, image_crc, _ = parse_firmware_hex(data)
     except ValueError as e:
         return f"File refused: {e}", None
     image_crc = f"{image_crc:08X}"
@@ -1151,7 +1257,7 @@ def do_upload(parts):
         tmp = os.path.join(BUILDS_DIR, f"{build_id}.tmp")
         with open(tmp, "wb") as f:
             f.write(data)
-        os.replace(tmp, os.path.join(BUILDS_DIR, f"{build_id}.hex"))
+        os.replace(tmp, build_file(build_id, profile))
         kind = TYPES.get(profile, "CTRL")
         add_event(con, "", f"build #{build_id} uploaded: {kind} {version} ({image_crc}) {note}",
                   None if profile == CTRL_PROFILE else profile)
@@ -1173,8 +1279,8 @@ def do_send(f, stn_keys):
             # v6.9.63: a CTRL file, to the ticked stations (or every station of the type shown, as they are now)
             keys = list(stn_keys)
             if all_type and f.get("back", "").startswith("/?tab=stations&type="):
-                t = f["back"][-1]
-                keys += [r["key"] for r in con.execute("SELECT key FROM stations WHERE profile=?", (int(t),)) if t.isdigit()]
+                t = f["back"].rsplit("=", 1)[-1]
+                keys += [r["key"] for r in con.execute("SELECT key FROM stations WHERE profile=?", (int(t),))] if t.isdigit() else []
             for key in dict.fromkeys(keys):
                 st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
                 if st is None:
@@ -1347,14 +1453,14 @@ class Handler(BaseHTTPRequestHandler):
                                    f"Station {st['shown_id']}: no CTRL update.")
         elif url.path == "/station/add":
             stn = f.get("id", "")
-            if re.fullmatch(r"[0-9A-Za-z]{1,12}", stn) and f.get("profile", "") in ("0", "1", "2"):
+            if re.fullmatch(r"[0-9A-Za-z]{1,12}", stn) and f.get("profile", "") in TYPE_KEYS:
                 with _db_lock, db() as con:
                     con.execute("INSERT OR IGNORE INTO stations (key, shown_id, profile, version, running_crc, unit_status,"
                                 " tried_crc, last_seen, last_ip) VALUES (?,?,?,'','','0','',0,'')",
                                 (station_key(stn), stn, int(f["profile"])))
                 message = f"Station {stn} added."
         elif url.path == "/type":
-            if f.get("profile", "") in ("0", "1", "2") and (f.get("build", "") == "" or f.get("build", "").isdigit()):
+            if f.get("profile", "") in TYPE_KEYS and (f.get("build", "") == "" or f.get("build", "").isdigit()):
                 with _db_lock, db() as con:
                     build = int(f["build"]) if f.get("build") else None
                     con.execute("INSERT INTO type_targets (profile, build_id) VALUES (?,?) "
@@ -1377,7 +1483,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         con.execute("DELETE FROM builds WHERE id=?", (build_id,))
                         try:
-                            os.remove(os.path.join(BUILDS_DIR, f"{build_id}.hex"))
+                            os.remove(build_file(build_id, b["profile"] if b else -1))
                         except OSError:
                             pass
                         add_event(con, "", f"build #{build_id} deleted", b["profile"] if b else None)
@@ -1403,7 +1509,7 @@ class Handler(BaseHTTPRequestHandler):
                 message = "Password changed. Use the new one from now on."
         from urllib.parse import quote
         back = f.get("back", "") if isinstance(f.get("back", ""), str) else ""
-        if not re.fullmatch(r"/(\?tab=(stations|firmware|history)&type=[0-2]|s\?k=[0-9A-Za-z]{1,12})", back):
+        if not re.fullmatch(r"/(\?tab=(stations|firmware|history)&type=[0-9]{1,2}|s\?k=[0-9A-Za-z]{1,12})", back):
             back = f"/?tab={tab}"
         self.redirect(back + ("&m=" + quote(message) if message else ""))
 
