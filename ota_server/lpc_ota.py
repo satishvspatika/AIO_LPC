@@ -77,8 +77,8 @@ def family(profile):
     return "ESP32" if profile in ESP_TYPES else "LPC1768"
 ESP_MAX_IMAGE = 0x1B0000        # the 8 MB layout's app slot (the unit checks its own slot size too)
 MAX_UPLOAD = 2 * 1024 * 1024
-MAX_PIECE = 2048
-UNIT_STATUS = {"0": "idle", "1": "downloading", "2": "file ready, installing", "3": "install failed, went back",
+MAX_PIECE = 4096                # LPC units ask for 1 KB; ESP32 units for up to 4 KB
+UNIT_STATUS = {"0": "idle", "1": "downloading", "2": "file ready, installing (ESP32: new firmware on trial)", "3": "install failed, went back",
                "4": "file refused", "5": "no SD card"}
 
 _db_lock = threading.Lock()
@@ -404,6 +404,11 @@ def unit_check(q, ip):
             result = ""
         elif build["profile"] != profile:
             result = "target is for another station type: not offered"
+        elif build["image_crc"] == crc and status == "2" and profile in ESP_TYPES:
+            # ESP32: running the new image but still on trial (kept only once it has sent a record)
+            if not result.startswith("on trial"):
+                add_event(con, stn, f"on trial: build {build['id']} {build['version']} ({crc}) started, waiting for its first record")
+            result = "on trial: running the new firmware, not confirmed yet"
         elif build["image_crc"] == crc:
             if st["offered_crc"] == crc and not result.startswith("updated"):
                 add_event(con, stn, f"UPDATED to build {build['id']} {build['version']} ({crc})")
@@ -721,6 +726,10 @@ def station_state(s, build):
         return "off", "Updates stopped", "This station won't update until you resume it.", None
     if build is None:
         return "off", "No update set", "", None
+    if res.startswith("on trial"):
+        return ("busy", f"On trial: {build['version']}",
+                "Running the new firmware. It is kept once it has sent a record; if it crashes or sends nothing "
+                "for 2 hours it goes back to its old firmware by itself.", None)
     if res.startswith("updated"):
         return "ok", f"Updated to {build['version']}", "", None
     if res == "running the target":
