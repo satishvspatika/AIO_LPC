@@ -581,7 +581,8 @@ details summary{cursor:pointer;color:var(--acc);font-size:14px}
 .famtabs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:0 0 12px}
 .famtab{display:flex;flex-direction:column;gap:2px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);text-decoration:none}
 .famtab b{font-size:17px}.famtab span{color:var(--mute);font-size:14px}
-.famtab.on.lpc1768{border:2px solid #3b4a7a;background:#eef0f8}.famtab.on.esp32{border:2px solid #1f6f5c;background:#e9f5f1}
+.famtab.on{color:#fff}.famtab.on span{color:#fff;opacity:.9}.famtab.on .badt{color:#fff;opacity:1;text-decoration:underline}
+.famtab.on.lpc1768{border:2px solid #3b4a7a;background:#3b4a7a}.famtab.on.esp32{border:2px solid #1f6f5c;background:#1f6f5c}
 .here{font-size:20px;font-weight:700;margin:4px 0 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .here .mute{font-size:15px;font-weight:500}
 .fam{display:inline-block;padding:3px 9px;border-radius:6px;font-size:12px;font-weight:700;letter-spacing:.04em;background:var(--line);color:var(--ink);vertical-align:middle}
