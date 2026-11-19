@@ -83,6 +83,44 @@ UNIT_STATUS = {"0": "idle", "1": "downloading", "2": "file ready, installing (ES
 
 _db_lock = threading.Lock()
 
+# Download speed for the office page: the latest pieces each station fetched, (time, bytes it has).
+# Memory only: after a restart the speed shows again once a few pieces have come.
+DL_SEEN = {}
+_dl_lock = threading.Lock()
+DL_PAUSED_AFTER_S = 90          # no piece for this long: the unit stopped for the slot, goes on next slot
+
+
+def note_piece(key, have):
+    now = time.time()
+    with _dl_lock:
+        pts = DL_SEEN.setdefault(key, [])
+        if pts and have < pts[-1][1]:
+            pts.clear()             # started again from the beginning
+        pts.append((now, have))
+        del pts[:-40]
+
+
+def dl_rate(key):
+    """(bytes per second over the last 2 minutes or None, seconds since the last piece or None)."""
+    now = time.time()
+    with _dl_lock:
+        pts = list(DL_SEEN.get(key, []))
+    if not pts:
+        return None, None
+    age = now - pts[-1][0]
+    pts = [p for p in pts if pts[-1][0] - p[0] <= 120]
+    if len(pts) < 3 or pts[-1][0] - pts[0][0] < 3:
+        return None, age
+    return (pts[-1][1] - pts[0][1]) / (pts[-1][0] - pts[0][0]), age
+
+
+def fmt_left(sec):
+    if sec < 60:
+        return "under a minute"
+    if sec < 3600:
+        return f"about {round(sec / 60)} min"
+    return f"about {sec / 3600:.1f} h"
+
 
 # ---------------------------------------------------------------- firmware file checks
 
@@ -489,6 +527,8 @@ def unit_piece(q):
         col = "ctrl_result" if build["profile"] == CTRL_PROFILE else "result"
         con.execute(f"UPDATE stations SET progress=?, {col}=? WHERE key=?",
                     (off + len(piece), f"downloading: {100 * (off + len(piece)) // build['size']}%", station_key(stn)))
+    if build["profile"] != CTRL_PROFILE:
+        note_piece(station_key(stn), off + len(piece))
     return 200, b"@%08X\n" % (zlib.crc32(piece) & 0xFFFFFFFF) + piece
 
 
@@ -530,75 +570,109 @@ def password_ok(user, pw):
 # ---------------------------------------------------------------- office pages
 
 PAGE_CSS = """
-:root{--bg:#f4f6f8;--card:#fff;--ink:#17202b;--mute:#667085;--line:#e2e6ea;--acc:#1f6feb;--acc-ink:#fff;
---ok:#16794c;--ok-bg:#e6f4ec;--bad:#b42318;--bad-bg:#fdecea;--wait:#9a5b00;--wait-bg:#fff4e0;--busy:#1f5fc4;--busy-bg:#e8f0fd;--off-bg:#eef0f3}
-@media (prefers-color-scheme: dark){:root{--bg:#10141a;--card:#191f27;--ink:#e6e9ee;--mute:#98a2b3;--line:#2a323d;--acc:#5b9cff;--acc-ink:#0b1220;
---ok:#4ac48a;--ok-bg:#12301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#232a34}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-header{background:var(--card);border-bottom:1px solid var(--line)}
-.top{max-width:1000px;margin:0 auto;padding:12px 16px 0;display:flex;justify-content:space-between;align-items:center;gap:12px}
-.top b{font-size:17px}.top a{color:var(--mute);text-decoration:none;font-size:14px}
-nav{max-width:1000px;margin:0 auto;padding:0 16px;display:flex;gap:4px;overflow-x:auto}
-nav a{padding:10px 14px;color:var(--mute);text-decoration:none;border-bottom:3px solid transparent;white-space:nowrap;font-weight:500}
-nav a.on{color:var(--ink);border-bottom-color:var(--acc)}
-main{max-width:1000px;margin:0 auto;padding:16px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
-h2{margin:0 0 4px;font-size:17px}.hint{margin:0 0 14px;color:var(--mute);font-size:14px}
+:root{--bg:#f3f5f9;--card:#fff;--ink:#141b26;--mute:#5f6b7d;--line:#e3e8ef;--soft:#f7f9fc;--acc:#2563eb;--acc-ink:#fff;--acc-soft:#e8efff;
+--ok:#137a4b;--ok-bg:#e3f5ea;--bad:#b42318;--bad-bg:#fdeceb;--wait:#975a00;--wait-bg:#fff3dc;--busy:#1d5fd1;--busy-bg:#e6efff;--off-bg:#eef1f5;
+--esp:#16725d;--lpc:#3b4a85;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06)}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--card:#161c25;--ink:#e7ebf1;--mute:#9aa5b5;--line:#273141;--soft:#1b2330;--acc:#5b9cff;--acc-ink:#0b1220;--acc-soft:#16294a;
+--ok:#4cc68d;--ok-bg:#11301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#222a35;
+--esp:#2f9c82;--lpc:#6d7fc4;--shadow:none}}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.top{max-width:1120px;margin:0 auto;padding:12px 20px 0;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink)}
+.brand .mark{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--acc),#16725d);color:#fff;display:grid;place-items:center;font-weight:800;font-size:12px;letter-spacing:.04em}
+.brand b{font-size:16px;display:block;line-height:1.2}.brand small{color:var(--mute);font-size:12px}
+.top .out{color:var(--mute);text-decoration:none;font-size:14px;padding:6px 12px;border:1px solid var(--line);border-radius:8px}
+.top .out:hover{color:var(--ink);background:var(--soft)}
+nav{max-width:1120px;margin:0 auto;padding:6px 20px 0;display:flex;gap:2px;overflow-x:auto}
+nav a{padding:10px 14px;color:var(--mute);text-decoration:none;border-bottom:2px solid transparent;white-space:nowrap;font-weight:600;font-size:14px}
+nav a:hover{color:var(--ink)}nav a.on{color:var(--acc);border-bottom-color:var(--acc)}
+main{max-width:1120px;margin:0 auto;padding:20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px;box-shadow:var(--shadow);min-width:0}
+h2{margin:0 0 4px;font-size:16px;font-weight:700}.hint{margin:0 0 14px;color:var(--mute);font-size:14px}
+.head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}.head h2{margin:0}
 .msg{padding:12px 16px;border-radius:10px;margin-bottom:16px;background:var(--busy-bg);color:var(--ink);border:1px solid var(--line)}
 .msg.bad{background:var(--bad-bg)}
-input,select,button{font:inherit;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+input,select,button{font:inherit;padding:8px 12px;border:1px solid var(--line);border-radius:9px;background:var(--card);color:var(--ink);max-width:100%}
+input:focus,select:focus{outline:2px solid var(--acc-soft);border-color:var(--acc)}
 button{background:var(--acc);color:var(--acc-ink);border-color:var(--acc);cursor:pointer;font-weight:600}
-button.plain{background:transparent;color:var(--ink);border-color:var(--line);font-weight:500}
+button:hover{filter:brightness(1.07)}
+button.plain{background:var(--card);color:var(--ink);border-color:var(--line);font-weight:500}
 button.del{background:transparent;color:var(--bad);border-color:var(--line);font-weight:500}
 button.small{padding:4px 10px;font-size:13px}
-label.f{display:block;font-weight:600;margin:14px 0 6px}label.f:first-child{margin-top:0}
-.stack{display:flex;flex-direction:column;gap:12px}
-.list{display:flex;flex-direction:column;gap:10px}
-.st{display:grid;grid-template-columns:1fr auto;gap:6px 16px;align-items:center;padding:14px;border:1px solid var(--line);border-radius:10px}
-.st .id{font-size:17px;font-weight:700}.st .sub{color:var(--mute);font-size:13px}
-.st .right{text-align:right}
-.pill{display:inline-block;padding:3px 11px;border-radius:999px;font-size:13px;font-weight:600;white-space:nowrap}
+label.f{display:block;font-weight:600;margin:14px 0 6px;font-size:14px}label.f:first-child{margin-top:0}
+.stack{display:flex;flex-direction:column;gap:14px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;font-size:13px;font-weight:600;white-space:nowrap}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.85}
 .pill.ok{background:var(--ok-bg);color:var(--ok)}.pill.bad{background:var(--bad-bg);color:var(--bad)}
 .pill.wait{background:var(--wait-bg);color:var(--wait)}.pill.busy{background:var(--busy-bg);color:var(--busy)}
 .pill.off{background:var(--off-bg);color:var(--mute)}
-.bar{height:6px;background:var(--off-bg);border-radius:3px;overflow:hidden;margin-top:6px;min-width:140px}
-.bar i{display:block;height:100%;background:var(--busy)}
+.bar{height:8px;background:var(--off-bg);border-radius:99px;overflow:hidden;margin-top:7px;min-width:150px}
+.bar i{display:block;height:100%;background:var(--busy);border-radius:99px;transition:width .8s ease}
+.bar.live i{background-image:linear-gradient(45deg,rgba(255,255,255,.28) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.28) 50%,rgba(255,255,255,.28) 75%,transparent 75%);background-size:16px 16px;animation:stripes 1s linear infinite}
+@keyframes stripes{to{background-position:16px 0}}
+.bar.big{height:12px;min-width:0;flex:1}
+.prog{display:flex;align-items:center;gap:12px;margin:12px 0 4px}.prog .js-pct{font-weight:700;font-variant-numeric:tabular-nums;min-width:44px;text-align:right}
+.sub{color:var(--mute);font-size:12px;margin-top:4px;white-space:nowrap}
 .ticks{display:flex;flex-wrap:wrap;gap:8px}
-.tick{display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;cursor:pointer}
-.tick input{margin:0;width:17px;height:17px}
-.tick.hide{display:none}
+.tick{display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--line);border-radius:9px;cursor:pointer;background:var(--soft);max-width:100%}
+.tick:hover{border-color:var(--acc)}.tick:has(input:checked){border-color:var(--acc);background:var(--acc-soft)}
+.tick input{margin:0;width:17px;height:17px}.tick span{min-width:0;overflow-wrap:anywhere}.tick.hide{display:none}
 .scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:14px}
-th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--mute);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap}
-td.nw{white-space:nowrap}code,.crc{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--mute)}
-a{color:var(--acc)}.mute{color:var(--mute)}.okt{color:var(--ok)}.badt{color:var(--bad)}
-.steps{margin:0 0 14px;padding-left:20px;color:var(--mute);font-size:14px}
-details summary{cursor:pointer;color:var(--acc);font-size:14px}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.login{max-width:360px;margin:12vh auto}.login input{width:100%;margin-bottom:10px}.login button{width:100%}
+th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mute);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap;background:var(--soft)}
+tr:last-child td{border-bottom:0}table.list tbody tr:hover td,table.list tr:hover td{background:var(--soft)}
+table.list td{vertical-align:middle}td.nw{white-space:nowrap}
+code,.crc{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--mute)}
+a{color:var(--acc)}td a{text-decoration:none}td a:hover{text-decoration:underline}
+.mute{color:var(--mute)}.okt{color:var(--ok)}.badt{color:var(--bad)}
+.steps{margin:0 0 14px;padding-left:20px;color:var(--mute);font-size:14px}.steps li{margin:3px 0}
+details summary{cursor:pointer;color:var(--acc);font-size:14px;font-weight:600}
+.login{max-width:380px;margin:12vh auto}.login input{width:100%;margin-bottom:10px}.login button{width:100%;padding:10px}
 .pw input{width:100%;max-width:340px}
-@media (max-width:600px){.st{grid-template-columns:1fr}.st .right{text-align:left}}
 .seg{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
-.seg a{padding:8px 14px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);text-decoration:none;font-weight:600;font-size:14px}
+.seg a{padding:7px 14px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);text-decoration:none;font-weight:600;font-size:14px}
+.seg a:hover{border-color:var(--acc)}
 .seg a span{color:var(--mute);font-weight:500;margin-left:4px}.seg a.on{background:var(--acc);border-color:var(--acc);color:var(--acc-ink)}
-.seg a.on span{color:var(--acc-ink);opacity:.8}
-.seg.types{margin:0 0 10px;align-items:center}
-.famtabs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:0 0 12px}
-.famtab{display:flex;flex-direction:column;gap:2px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);text-decoration:none}
-.famtab b{font-size:17px}.famtab span{color:var(--mute);font-size:14px}
-.famtab.on{color:#fff}.famtab.on span{color:#fff;opacity:.9}.famtab.on .badt{color:#fff;opacity:1;text-decoration:underline}
-.famtab.on.lpc1768{border:2px solid #3b4a7a;background:#3b4a7a}.famtab.on.esp32{border:2px solid #1f6f5c;background:#1f6f5c}
-.here{font-size:20px;font-weight:700;margin:4px 0 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.seg a.on span{color:var(--acc-ink);opacity:.8}.seg.types{margin:0 0 10px;align-items:center}.seg a.on .badt{color:var(--acc-ink)}
+.famtabs{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 14px}
+.famtab{display:flex;flex-direction:column;gap:2px;padding:14px 18px;border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--ink);text-decoration:none;box-shadow:var(--shadow)}
+.famtab:hover{border-color:var(--acc)}.famtab b{font-size:17px}.famtab span{color:var(--mute);font-size:14px}
+.famtab.on{color:#fff}.famtab.on span{color:#fff;opacity:.92}.famtab.on .badt{color:#fff;opacity:1;text-decoration:underline}
+.famtab.on.lpc1768{border-color:var(--lpc);background:var(--lpc)}.famtab.on.esp32{border-color:var(--esp);background:var(--esp)}
+.here{font-size:21px;font-weight:700;margin:6px 0 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .here .mute{font-size:15px;font-weight:500}
 .fam{display:inline-block;padding:3px 9px;border-radius:6px;font-size:12px;font-weight:700;letter-spacing:.04em;background:var(--line);color:var(--ink);vertical-align:middle}
-.fam.esp32{background:#1f6f5c;color:#fff}.fam.lpc1768{background:#3b4a7a;color:#fff}.seg.types a{font-size:15px}.seg a.on .badt{color:var(--acc-ink)}
-table.list td{vertical-align:middle}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:var(--ok)}
+.fam.esp32{background:var(--esp);color:#fff}.fam.lpc1768{background:var(--lpc);color:#fff}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:9px;background:var(--ok);vertical-align:middle}
 .dot.bad{background:var(--bad)}.dot.wait{background:var(--wait)}
-.kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px 18px}
-.kv>div{display:flex;flex-direction:column;gap:2px}.kv>div>span:first-child{color:var(--mute);font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+.kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px 20px}
+.kv>div{display:flex;flex-direction:column;gap:2px;min-width:0}.kv>div>span:first-child{color:var(--mute);font-size:12px;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
 td .pill{margin:1px 2px}
-select,input{max-width:100%}.card{min-width:0}.tick{max-width:100%}.tick span{min-width:0;overflow-wrap:anywhere}
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:0 0 16px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;box-shadow:var(--shadow)}
+.tile span{display:block;color:var(--mute);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.tile b{display:block;font-size:26px;line-height:1.25;font-variant-numeric:tabular-nums}
+.tile.look b{color:var(--bad)}.tile.busy b{color:var(--busy)}.tile.ok b{color:var(--ok)}
+.live-tag{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mute);font-weight:600}
+.live-tag i{width:8px;height:8px;border-radius:50%;background:var(--mute)}
+.live-tag.on{color:var(--busy)}.live-tag.on i{background:var(--busy);animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.25}}
+.steps-bar{list-style:none;display:flex;margin:16px 0 8px;padding:0;counter-reset:s}
+.steps-bar li{flex:1;position:relative;text-align:center;font-size:13px;color:var(--mute);font-weight:600}
+.steps-bar li::before{content:"";position:absolute;top:14px;left:-50%;width:100%;height:3px;background:var(--line);z-index:0}
+.steps-bar li:first-child::before{display:none}
+.steps-bar .num{position:relative;z-index:1;display:grid;place-items:center;width:30px;height:30px;margin:0 auto 6px;border-radius:50%;background:var(--card);border:2px solid var(--line);font-size:13px}
+.steps-bar li.done{color:var(--ink)}.steps-bar li.done .num{background:var(--ok);border-color:var(--ok);color:#fff;font-size:0}
+.steps-bar li.done .num::after{content:"✓";font-size:14px}.steps-bar li.done::before,.steps-bar li.now::before,.steps-bar li.fail::before{background:var(--ok)}
+.steps-bar li.now{color:var(--busy)}.steps-bar li.now .num{border-color:var(--busy);color:var(--busy);box-shadow:0 0 0 4px var(--busy-bg)}
+.steps-bar li.fail{color:var(--bad)}.steps-bar li.fail .num{background:var(--bad);border-color:var(--bad);color:#fff}
+.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.hero h1{margin:0;font-size:24px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.back{display:inline-block;margin:0 0 12px;text-decoration:none;font-weight:600;font-size:14px}
+@media (max-width:700px){.tiles{grid-template-columns:repeat(2,1fr)}.famtabs{grid-template-columns:1fr}main{padding:14px}.top,nav{padding-left:14px;padding-right:14px}
+.steps-bar .lbl{font-size:11px}}
 """
 
 TABS = [("stations", "Stations"), ("firmware", "Firmware files"), ("history", "History"), ("password", "Password")]
@@ -660,7 +734,7 @@ def type_bar(tab, ptype):
             f"<div class='seg types'>{''.join(items)}</div>{here}")
 
 
-def page(title, body, tab=None, message="", script="", ptype=None):
+def page(title, body, tab=None, message="", script="", ptype=None, type_bar_shown=True):
     head = (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title>"
             f"<style>{PAGE_CSS}</style></head><body>")
@@ -669,12 +743,14 @@ def page(title, body, tab=None, message="", script="", ptype=None):
     tq = f"&type={ptype}" if ptype in TYPES else ""
     nav = "".join(f"<a href='/?tab={k}{tq if k in TYPED_TABS else ''}' class='{'on' if k == tab else ''}'>{t}</a>"
                   for k, t in TABS)
-    bar = type_bar(tab, ptype) if tab in TYPED_TABS and ptype in TYPES else ""
+    bar = type_bar(tab, ptype) if type_bar_shown and tab in TYPED_TABS and ptype in TYPES else ""
     msg = ""
     if message:
         cls = "msg bad" if message.lower().startswith(("file refused", "wrong", "not ", "no ", "the new", "build #")) and "deleted" not in message else "msg"
         msg = f"<div class='{cls}'>{esc(message)}</div>"
-    return (head + f"<header><div class='top'><b>AIO stations &amp; firmware</b><a href='/logout'>Log out</a></div>"
+    return (head + "<header><div class='top'><a class='brand' href='/'><span class='mark'>AIO</span>"
+            "<span><b>AIO stations</b><small>Firmware updates &amp; health</small></span></a>"
+            "<a class='out' href='/logout'>Log out</a></div>"
             f"<nav>{nav}</nav></header><main>{bar}{msg}{body}</main>{script}</body></html>").encode()
 
 
@@ -738,13 +814,141 @@ def station_state(s, build):
         pct = s["progress"] * 100 // build["size"] if build["size"] else 0
         pct = max(0, min(100, pct))
         if pct >= 100:
-            return "busy", "Downloaded", "Installs when this slot ends, then reports the new version at its next check.", 100
-        return "busy", f"Downloading {pct}%", "", pct
+            if s["profile"] in ESP_TYPES:
+                return ("busy", "Downloaded", "Checked; it installs when this slot ends. From firmware 6.56c the unit "
+                        "reports the new version in the next slot; older firmware reports it at its next "
+                        "twice-a-day check (13:00 or 01:00, up to 45 min later by station number).", 100)
+            return ("busy", "Downloaded", "Installs when this slot ends, then reports the new version at its next "
+                    "check (12:30-14:15 or 00:30-02:15).", 100)
+        return "busy", f"Downloading {pct}%", dl_text(s, build), pct
     if us == "2":
         return "busy", "Installing", "", None
     if res.startswith("offered"):
         return "busy", "Starting download", "", None
     return "wait", "Waiting for next check", f"It will get {build['version']} at its next check.", None
+
+
+def dl_text(s, build):
+    """'580 of 1266 KB · 6.4 KB/s · about 2 min left', or 'paused' between slots."""
+    size = build["size"] or 1
+    have = max(0, min(s["progress"] or 0, size))
+    text = f"{have // 1024} of {size // 1024} KB"
+    rate, age = dl_rate(s["key"])
+    if age is not None and age > DL_PAUSED_AFTER_S:
+        return text + " · paused, goes on in the unit's next slot"
+    if rate and rate > 0:
+        return text + f" · {rate / 1024:.1f} KB/s · {fmt_left((size - have) / rate)} left"
+    return text
+
+
+UPDATE_STEPS = ("Sent", "Downloading", "Installing", "Updated")
+
+
+def update_step(label):
+    """Where the update is, for the stepper: 1-4 the step it is at (5 all done), -n failed at step n, 0 none."""
+    if label.startswith(("Updated", "Up to date")):
+        return 5
+    if label.startswith(("On trial", "Downloaded", "Installing")):
+        return 3
+    if label.startswith(("Downloading", "Starting download")):
+        return 2
+    if label.startswith("Waiting for next check"):
+        return 1
+    if label == "Update failed":
+        return -3
+    if label == "File refused":
+        return -2
+    return 0
+
+
+def stepper(s, label):
+    names = list(UPDATE_STEPS)
+    if s["profile"] in ESP_TYPES:
+        names[2] = "On trial"
+    return (f"<ol class='steps-bar js-steps' data-step='{update_step(label)}'>"
+            + "".join(f"<li data-i='{i}'><span class='num'>{i}</span><span class='lbl'>{esc(n)}</span></li>"
+                      for i, n in enumerate(names, 1)) + "</ol>")
+
+
+def live_row(s, build, ctrl):
+    """One station's live state, as the office page's script redraws it."""
+    cls, label, detail, pct = station_state(s, build)
+    a = attention(s, health_of(s))
+    return {"k": s["key"], "cls": cls, "label": label, "detail": detail, "pct": pct,
+            "short": dl_text(s, build) if label.startswith("Downloading") else "",
+            "step": update_step(label), "seen": when(s["last_seen"]), "ver": s["version"] or "—",
+            "crc": s["running_crc"] or "", "dot": a[0][0] if a else "ok",
+            "dot_t": ", ".join(t for _, t in a), "ctrl": list(ctrl) if ctrl else None, "busy": cls == "busy"}
+
+
+def tile_counts(rows):
+    return {"total": len(rows), "look": sum(r["dot"] != "ok" for r in rows),
+            "busy": sum(r["busy"] for r in rows), "ok": sum(r["cls"] == "ok" for r in rows)}
+
+
+def live_json(q):
+    with db() as con:
+        if q.get("k"):
+            stations = con.execute("SELECT * FROM stations WHERE key=?", (q["k"],)).fetchall()
+        else:
+            try:
+                p = int(q.get("type", ""))
+            except ValueError:
+                p = -1
+            stations = con.execute("SELECT * FROM stations WHERE profile=?", (p,)).fetchall()
+        rows = [live_row(s, target_build(con, s), ctrl_state(s, ctrl_build(con, s))) for s in stations]
+    return json.dumps({"rows": rows, "busy": any(r["busy"] for r in rows), "tiles": tile_counts(rows),
+                       "at": time.strftime("%H:%M:%S")}).encode()
+
+
+LIVE_JS = """<script>
+(function(){
+var URL_=%s,timer=null;
+function each(el,sel,f){el.querySelectorAll(sel).forEach(f);}
+function apply(d){
+  d.rows.forEach(function(r){
+    document.querySelectorAll('[data-k="'+r.k+'"]').forEach(function(el){
+      each(el,'.js-pill',function(p){p.className='pill js-pill '+r.cls;p.textContent=r.label;});
+      each(el,'.js-bar',function(b){b.hidden=(r.pct===null);b.firstElementChild.style.width=(r.pct||0)+'%%';
+        b.classList.toggle('live',r.cls==='busy'&&r.pct!==null&&r.pct<100);});
+      each(el,'.js-pct',function(p){p.textContent=r.pct===null?'':r.pct+'%%';});
+      each(el,'.js-detail',function(p){p.textContent=r.detail;p.hidden=!r.detail;});
+      each(el,'.js-short',function(p){p.textContent=r.short;p.hidden=!r.short;});
+      each(el,'.js-seen',function(p){p.textContent=r.seen;});
+      each(el,'.js-ver',function(p){p.textContent=r.ver;});
+      each(el,'.js-crc',function(p){p.textContent=r.crc;});
+      each(el,'.js-dot',function(p){p.className='dot js-dot'+(r.dot==='ok'?'':' '+r.dot);p.title=r.dot_t;});
+      each(el,'.js-steps',function(o){o.dataset.step=r.step;paint(o);});
+    });
+  });
+  for(var k in d.tiles){var t=document.getElementById('tile-'+k);if(t)t.textContent=d.tiles[k];}
+  var s=document.getElementById('live');
+  if(s){s.className='live-tag'+(d.busy?' on':'');s.lastChild.textContent=d.busy?' Live · every 3 s':' Live · '+d.at;}
+  return d.busy;
+}
+function paint(o){
+  var n=parseInt(o.dataset.step||'0',10);
+  o.querySelectorAll('li').forEach(function(li){
+    var i=parseInt(li.dataset.i,10);
+    li.className=n<0?(i<-n?'done':i===-n?'fail':''):(i<n?'done':i===n?'now':'');
+  });
+}
+document.querySelectorAll('.js-steps').forEach(paint);
+function tick(){
+  if(document.hidden){timer=setTimeout(tick,5000);return;}
+  fetch(URL_,{credentials:'same-origin',cache:'no-store'})
+    .then(function(r){if(!r.ok||r.redirected)throw 0;return r.json();})
+    .then(function(d){timer=setTimeout(tick,apply(d)?3000:20000);})
+    .catch(function(){timer=setTimeout(tick,30000);});
+}
+document.addEventListener('visibilitychange',function(){if(!document.hidden){clearTimeout(timer);tick();}});
+timer=setTimeout(tick,1500);
+})();
+</script>"""
+
+
+def live_script(url):
+    return LIVE_JS % json.dumps(url)
 
 
 STALE_AFTER_S = 26 * 3600      # A unit checks once a day: no check for longer than this needs a look
@@ -948,6 +1152,14 @@ def stations_tab(ptype, search):
     by_id = {b["id"]: b for b in builds}
     h = []
 
+    # At a glance, kept up to date by the page's script
+    tiles = tile_counts([live_row(s, st_builds[s["key"]], st_ctrl[s["key"]]) for s in stations if s["profile"] == ptype])
+    h.append("<div class='tiles'>"
+             f"<div class='tile'><span>Stations</span><b id='tile-total'>{tiles['total']}</b></div>"
+             f"<div class='tile look'><span>Need a look</span><b id='tile-look'>{tiles['look']}</b></div>"
+             f"<div class='tile busy'><span>Updating now</span><b id='tile-busy'>{tiles['busy']}</b></div>"
+             f"<div class='tile ok'><span>Updated / up to date</span><b id='tile-ok'>{tiles['ok']}</b></div></div>")
+
     # Needs attention: this type's stations (the type switch above counts the others)
     flagged = []
     for s in stations:
@@ -975,8 +1187,8 @@ def stations_tab(ptype, search):
     rows = [s for s in stations if s["profile"] == ptype]
     if search:
         rows = [s for s in rows if search.lstrip("0") in s["shown_id"].lstrip("0")]
-    h.append(f"<div class='card'><div class='row' style='justify-content:space-between;margin-bottom:10px'>"
-             f"<h2 style='margin:0'>Stations</h2>"
+    h.append(f"<div class='card'><div class='head'>"
+             f"<div class='row' style='gap:12px'><h2>Stations</h2><span id='live' class='live-tag'><i></i> Live</span></div>"
              f"<form method='get' action='/' class='row'><input type='hidden' name='tab' value='stations'>"
              f"<input type='hidden' name='type' value='{ptype}'><input name='q' value='{esc(search)}' "
              f"placeholder='Find a station ID' size='16'><button class='plain'>Find</button></form></div>"
@@ -987,20 +1199,26 @@ def stations_tab(ptype, search):
         hl = health_of(s)
         cls, label, _, pct = station_state(s, st_builds[s["key"]])
         a = attention(s, hl)
-        dot = f"<span class='dot {a[0][0]}' title='{esc(', '.join(t for _, t in a))}'></span>" if a else "<span class='dot'></span>"
-        bar = f"<div class='bar'><i style='width:{pct}%'></i></div>" if pct is not None else ""
+        dot = (f"<span class='dot js-dot {a[0][0]}' title='{esc(', '.join(t for _, t in a))}'></span>" if a
+               else "<span class='dot js-dot'></span>")
+        live = pct is not None and pct < 100
+        bar = (f"<div class='bar js-bar{' live' if live else ''}'{'' if pct is not None else ' hidden'}>"
+               f"<i style='width:{pct or 0}%'></i></div>")
+        short = dl_text(s, st_builds[s["key"]]) if label.startswith("Downloading") else ""
+        bar += f"<div class='sub js-short'{'' if short else ' hidden'}>{esc(short)}</div>"
         if hl.get("bd") or hl.get("bn"):
             bat = f"{esc(hl.get('bd') or '—')} / {esc(hl.get('bn') or '—')} <span class='mute'>V</span>"
         else:
             bat = "<span class='mute'>—</span>"
         carrier = esc(hl.get("op") or "") + (f" <span class='mute'>{esc(hl['net'])}G</span>" if hl.get("net") in ("2", "4") else "")
-        middle = (f"<td class='nw'><span class='crc'>{esc(s['running_crc'])}</span></td>" if esp else
+        middle = (f"<td class='nw'><span class='crc js-crc'>{esc(s['running_crc'])}</span></td>" if esp else
                   f"<td class='nw'>{sent_text(hl)}</td><td class='nw'>{bat}</td>"
                   f"<td class='nw'>{carrier or '<span class=mute>—</span>'}</td>")
-        h.append(f"<tr><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
-                 f"<td class='nw'>{fw_text(s, hl)}</td>{middle}"
-                 f"<td class='nw'>{esc(when(s['last_seen']))}</td>"
-                 f"<td class='nw'><span class='pill {cls}'>{esc(label)}</span>{bar}"
+        fw = f"<b class='js-ver'>{esc(s['version']) or '—'}</b>" if esp else fw_text(s, hl)
+        h.append(f"<tr data-k='{esc(s['key'])}'><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
+                 f"<td class='nw'>{fw}</td>{middle}"
+                 f"<td class='nw js-seen'>{esc(when(s['last_seen']))}</td>"
+                 f"<td class='nw'><span class='pill js-pill {cls}'>{esc(label)}</span>{bar}"
                  + (f"<div style='margin-top:4px'><span class='pill {st_ctrl[s['key']][0]}'>{esc(st_ctrl[s['key']][1])}</span></div>"
                     if st_ctrl[s["key"]] else "") + "</td></tr>")
     if not rows:
@@ -1052,14 +1270,9 @@ def stations_tab(ptype, search):
                                                  for p, t in TYPES.items()) +
              "</select><button class='plain'>Add</button></form></details>")
 
-    script = f"""<script>
-setInterval(function(){{
-  var busy=document.querySelector('input[type=checkbox]:checked')||
-    (document.activeElement&&/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName));
-  if(!busy) location.replace('/?tab=stations&type={ptype}' + {json.dumps('&q=' + search) if search else "''"});
-}},30000);
-</script>"""
-    return "".join(h), script
+    # Live: the rows, bars and tiles are redrawn in place (every 3 s while a station is updating), so
+    # nothing ticked or typed on the page is lost (it used to reload the whole page every 30 s)
+    return "".join(h), live_script(f"/live?type={ptype}")
 
 
 def station_page(key, message=""):
@@ -1077,17 +1290,18 @@ def station_page(key, message=""):
     cls, label, detail, pct = station_state(s, build)
     a = attention(s, hl)
     back = f"/?tab=stations&type={s['profile']}"
-    h = [f"<p style='margin:0 0 12px'><a href='{back}'>← {esc(TYPES.get(s['profile'], '?'))} stations</a></p>"]
+    h = [f"<div data-k='{esc(s['key'])}'><a class='back' href='{back}'>← {esc(TYPES.get(s['profile'], '?'))} stations</a>"]
 
     # Summary
     pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a) or "<span class='pill ok'>No problem reported</span>"
-    h.append(f"<div class='card'><div class='row' style='justify-content:space-between'><h2 style='margin:0;font-size:22px'>"
+    fw = (f"<b class='js-ver'>{esc(s['version']) or '—'}</b>" if s["profile"] in ESP_TYPES else fw_text(s, hl))
+    h.append(f"<div class='card'><div class='hero'><h1>"
              f"{esc(sid(s))} <span class='fam {family(s['profile']).lower()}'>{family(s['profile'])}</span> "
-             f"<span class='mute' style='font-size:15px;font-weight:400'>{esc(TYPES.get(s['profile'], '?'))}</span></h2>"
+             f"<span class='mute' style='font-size:15px;font-weight:500'>{esc(TYPES.get(s['profile'], '?').split(' · ', 1)[-1])}</span></h1>"
              f"<div>{pills}</div></div>"
-             f"<div class='kv' style='margin-top:14px'>"
-             f"<div><span>Firmware</span><span>{fw_text(s, hl)} <span class='crc'>{esc(s['running_crc'])}</span></span></div>"
-             f"<div><span>Last check</span>{esc(when(s['last_seen']))}</div>"
+             f"<div class='kv' style='margin-top:16px'>"
+             f"<div><span>Firmware</span><span>{fw} <span class='crc js-crc'>{esc(s['running_crc'])}</span></span></div>"
+             f"<div><span>Last check</span><span class='js-seen'>{esc(when(s['last_seen']))}</span></div>"
              + (f"<div><span>Board</span>ESP32 AIO9</div>" if s["profile"] in ESP_TYPES else
                 f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware v6.9.60 on)</span>'}</div>") +
              f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
@@ -1108,9 +1322,16 @@ def station_page(key, message=""):
     opts = [("type", "Same as its type"), ("hold", "Nothing (updates stopped)")] + [
         (str(b["id"]), build_name(b)) for b in builds]
     sel = "".join(f"<option value='{esc(v)}'{' selected' if v == s['target'] else ''}>{esc(t)}</option>" for v, t in opts)
-    bar = f"<div class='bar' style='max-width:260px'><i style='width:{pct}%'></i></div>" if pct is not None else ""
-    h.append(f"<div class='card'><h2>Firmware update</h2><p style='margin:0 0 6px'><span class='pill {cls}'>{esc(label)}</span></p>{bar}"
-             f"{'<p class=hint>' + esc(detail) + '</p>' if detail else ''}"
+    live = pct is not None and pct < 100
+    bar = (f"<div class='prog js-bar-wrap'><div class='bar big js-bar{' live' if live else ''}'{'' if pct is not None else ' hidden'}>"
+           f"<i style='width:{pct or 0}%'></i></div><span class='js-pct'>{'' if pct is None else str(pct) + '%'}</span></div>")
+    steps = stepper(s, label) if build is not None and s["target"] != "hold" else ""
+    target_txt = (f"<p class='hint' style='margin:4px 0 0'>Target: <b>{esc(build['version'])}</b> "
+                  f"<span class='crc'>{esc(build['image_crc'])}</span></p>" if build is not None else "")
+    h.append(f"<div class='card'><div class='head'><div class='row' style='gap:12px'><h2>Firmware update</h2>"
+             f"<span id='live' class='live-tag'><i></i> Live</span></div>"
+             f"<span class='pill js-pill {cls}'>{esc(label)}</span></div>{target_txt}{steps}{bar}"
+             f"<p class='hint js-detail'{'' if detail else ' hidden'}>{esc(detail)}</p>"
              f"<form method='post' action='/station' class='row' style='margin-top:10px'><input type='hidden' name='key' value='{esc(s['key'])}'>"
              f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='tsel'>Gets</label>"
              f"<select id='tsel' name='target'>{sel}</select><button>Set</button></form>")
@@ -1143,16 +1364,18 @@ def station_page(key, message=""):
             h.append(f"<tr><td colspan='{len(HISTORY_COLS) + 1}' class='mute'>No health report yet.</td></tr>")
         h.append("</table></div></div>")
 
-        # Events
-        h.append("<div class='card'><h2>Events</h2><div class='scroll'><table><tr><th>When</th><th>What happened</th></tr>")
-        for e in events:
-            t = e["text"]
-            c = "badt" if t.startswith("FAILED") else "okt" if t.startswith("UPDATED") else ""
-            h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='{c}'>{esc(t)}</td></tr>")
-        if not events:
-            h.append("<tr><td colspan='2' class='mute'>Nothing yet.</td></tr>")
-        h.append("</table></div></div>")
-    return page(f"Station {s['shown_id']}", "".join(h), "stations", message, ptype=s["profile"])
+    # Events (every station: an ESP32 station's update steps show here too)
+    h.append("<div class='card'><h2>Events</h2><div class='scroll'><table><tr><th>When</th><th>What happened</th></tr>")
+    for e in events:
+        t = e["text"]
+        c = "badt" if t.startswith("FAILED") else "okt" if t.startswith("UPDATED") else ""
+        h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='{c}'>{esc(t)}</td></tr>")
+    if not events:
+        h.append("<tr><td colspan='2' class='mute'>Nothing yet.</td></tr>")
+    h.append("</table></div></div>")
+    h.append("</div>")
+    return page(f"Station {sid(s)}", "".join(h), "stations", message, live_script(f"/live?k={s['key']}"),
+                ptype=s["profile"], type_bar_shown=False)
 
 
 def firmware_tab(ptype):
@@ -1161,11 +1384,11 @@ def firmware_tab(ptype):
         builds = con.execute("SELECT * FROM builds WHERE profile IN (?,?) ORDER BY profile, id DESC", (ptype, ctrl_too)).fetchall()
         targets = {r["build_id"] for r in con.execute("SELECT build_id FROM type_targets WHERE build_id IS NOT NULL")}
         used_by = {}
-        for s in con.execute("SELECT shown_id, target FROM stations WHERE target NOT IN ('type','hold')"):
-            used_by.setdefault(int(s["target"]), []).append(s["shown_id"])
-        for s in con.execute("SELECT shown_id, ctrl_target FROM stations WHERE ctrl_target != ''"):
+        for s in con.execute("SELECT shown_id, profile, target FROM stations WHERE target NOT IN ('type','hold')"):
+            used_by.setdefault(int(s["target"]), []).append(sid(s))
+        for s in con.execute("SELECT shown_id, profile, ctrl_target FROM stations WHERE ctrl_target != ''"):
             if s["ctrl_target"].isdigit():
-                used_by.setdefault(int(s["ctrl_target"]), []).append(s["shown_id"] + " (CTRL)")
+                used_by.setdefault(int(s["ctrl_target"]), []).append(sid(s) + " (CTRL)")
     h = ["<div class='card'><h2>Upload firmware</h2>"
          "<ol class='steps'><li><b>LPC1768 stations:</b> the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
          "<code>fw_bihar.hex</code>, <code>fw_ksn_tws.hex</code>, or <code>ctrl.hex</code> for the CTRL board "
@@ -1429,6 +1652,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect("/login")
         if url.path == "/":
             return self.send(200, office_page(q.get("tab", "stations"), q.get("m", ""), q))
+        if url.path == "/live":
+            return self.send(200, live_json(q), "application/json", (("Cache-Control", "no-store"),))
         if url.path == "/s":
             body = station_page(q.get("k", ""), q.get("m", ""))
             if body:

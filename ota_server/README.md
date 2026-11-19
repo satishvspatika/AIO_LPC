@@ -22,7 +22,10 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
 
 - **Unit type switch** (top of Stations, Firmware files and History): KSNDMC TRG, BIHAR TRG, KSNDMC TWS,
   each with its station count and how many need a look. Everything below it is that type only.
-- **Stations**: "Needs attention" for the type, then one row per station: firmware, battery, signal, records
+- **Live**: the Stations tab and each station's page redraw themselves (every 3 s while a station is updating,
+  every 20 s otherwise): progress bar, KB done, speed and time left, and the update steps Sent, Downloading,
+  Installing (ESP32: On trial), Updated. No reload is needed. A download that stops for the slot shows "paused".
+- **Stations**: the type's totals at the top (stations, need a look, updating now, updated), then "Needs attention" for the type, then one row per station: firmware, battery, signal, records
   sent the last day (and how many by backlog), last check, update state. Click a station for its page:
   latest health report, firmware update control, health history, events.
 - **Send an update** (on each type's tab): choose the firmware, tick the stations, Send. "Every station of this
