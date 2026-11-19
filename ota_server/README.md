@@ -45,6 +45,12 @@ A station that went back to its old firmware is not offered the same build again
 
 ## Health report
 
+ESP32 AIO9 stations send the same daily report from firmware 6.57 (with their 13:00 check, else the 01:00
+one), with the same field names; their Health card, history and "needs attention" show as for LPC stations,
+with their own battery limits (`ESP_BATTERY_RULES`: single Li-ion cell). They no longer use the Spatika
+health server (Contabo).
+
+
 Units from v6.9.60 add health fields to their daily check (`docs/SYSTEM_DESIGN.md` 7.7). From v6.9.62 the
 report comes once a day (the 12:30-14:15 check) and covers the last whole MET day (08:45 to 08:30): records
 sent of 96 and how many by backlog, day and night battery averages, lowest battery, errors logged and the

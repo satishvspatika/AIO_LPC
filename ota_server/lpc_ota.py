@@ -364,7 +364,7 @@ HEALTH_FIELDS = [   # (field, label, unit)
     ("miss", "Slots missed or unit off, 24 h", ""), # v6.9.60-61 only
 ]
 HEALTH_UNITS = {k: u for k, _, u in HEALTH_FIELDS}
-HEALTH_VALUE = re.compile(r"[0-9A-Za-z._,:+ -]{0,60}")
+HEALTH_VALUE = re.compile(r"[0-9A-Za-z_.,:+ -]{0,60}")   # ESP32 (6.57) codes use '_' (RTC_FAIL)
 
 
 def _f(v):
@@ -387,6 +387,16 @@ HEALTH_RULES = [    # (field, needs a look if, class, text)
     ("q", lambda v: _f(v) >= 4, "wait", lambda v: f"{v} records waiting"),
     ("sig", lambda v: _f(v) <= -105, "wait", lambda v: f"Weak signal {v} dBm"),
 ]
+
+# ESP32 AIO9 stations (firmware 6.57 on) run on a single Li-ion cell (4.2 V full), not the LPC units'
+# 12 V battery: their own battery limits. The modem stays off below 3.4 V (no GPRS), and no firmware
+# download starts below 3.7 V.
+ESP_BATTERY_RULES = [
+    ("bv", lambda v: _f(v) < 3.5, "bad", lambda v: f"Battery {v} V"),
+    ("bmin", lambda v: _f(v) < 3.5, "wait", lambda v: f"Battery fell to {v} V"),
+    ("bn", lambda v: _f(v) < 3.7, "wait", lambda v: f"Night battery average {v} V"),
+]
+ESP_HEALTH_RULES = [r for r in HEALTH_RULES if r[0] not in ("bv", "bmin", "bn")] + ESP_BATTERY_RULES
 
 
 def store_health(con, key, q, now):
@@ -980,7 +990,7 @@ def attention(s, h):
     if s["unit_status"] in ("4", "5"):
         out.append(("bad", UNIT_STATUS[s["unit_status"]].capitalize()))
     if h and s["health_at"] and now - s["health_at"] <= STALE_AFTER_S + 3600:
-        for key, test, cls, text in HEALTH_RULES:
+        for key, test, cls, text in (ESP_HEALTH_RULES if s["profile"] in ESP_TYPES else HEALTH_RULES):
             v = h.get(key)
             if v is None or v == "":
                 continue
@@ -1193,8 +1203,8 @@ def stations_tab(ptype, search):
              f"<input type='hidden' name='type' value='{ptype}'><input name='q' value='{esc(search)}' "
              f"placeholder='Find a station ID' size='16'><button class='plain'>Find</button></form></div>"
              "<div class='scroll'><table class='list'><tr><th>Station</th><th>Firmware</th>"
-             + ("<th>Running image</th>" if esp else "<th>Sent (last day)</th><th>Battery day / night</th><th>Carrier</th>")
-             + "<th>Last check</th><th>Update</th></tr>")
+             "<th>Sent (last day)</th><th>Battery day / night</th><th>Carrier</th>"
+             "<th>Last check</th><th>Update</th></tr>")
     for s in rows:
         hl = health_of(s)
         cls, label, _, pct = station_state(s, st_builds[s["key"]])
@@ -1211,10 +1221,10 @@ def stations_tab(ptype, search):
         else:
             bat = "<span class='mute'>—</span>"
         carrier = esc(hl.get("op") or "") + (f" <span class='mute'>{esc(hl['net'])}G</span>" if hl.get("net") in ("2", "4") else "")
-        middle = (f"<td class='nw'><span class='crc js-crc'>{esc(s['running_crc'])}</span></td>" if esp else
-                  f"<td class='nw'>{sent_text(hl)}</td><td class='nw'>{bat}</td>"
+        middle = (f"<td class='nw'>{sent_text(hl)}</td><td class='nw'>{bat}</td>"
                   f"<td class='nw'>{carrier or '<span class=mute>—</span>'}</td>")
-        fw = f"<b class='js-ver'>{esc(s['version']) or '—'}</b>" if esp else fw_text(s, hl)
+        fw = (f"<b class='js-ver'>{esc(s['version']) or '—'}</b><div class='sub crc js-crc'>{esc(s['running_crc'])}</div>"
+              if esp else fw_text(s, hl))
         h.append(f"<tr data-k='{esc(s['key'])}'><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
                  f"<td class='nw'>{fw}</td>{middle}"
                  f"<td class='nw js-seen'>{esc(when(s['last_seen']))}</td>"
@@ -1224,12 +1234,10 @@ def stations_tab(ptype, search):
     if not rows:
         h.append(f"<tr><td colspan='7' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
     h.append("</table></div>")
-    if ptype in ESP_TYPES and rows:
-        h.append("<p class='hint' style='margin:10px 0 0'>ESP32 stations send their health to the Spatika health "
-                 "server; this page shows their firmware and updates.</p>")
-    elif not any(health_of(s) for s in rows) and rows:
+    if not any(health_of(s) for s in rows) and rows:
         h.append("<p class='hint' style='margin:10px 0 0'>Battery, signal and slot counts come in the daily health "
-                 "report (firmware v6.9.60 on; the last whole day from v6.9.62).</p>")
+                 "report: " + ("ESP32 firmware 6.57 on." if esp else "firmware v6.9.60 on; the last whole day from v6.9.62.")
+                 + "</p>")
     h.append("</div>")
 
     # Send an update, for this type only
@@ -1302,15 +1310,15 @@ def station_page(key, message=""):
              f"<div class='kv' style='margin-top:16px'>"
              f"<div><span>Firmware</span><span>{fw} <span class='crc js-crc'>{esc(s['running_crc'])}</span></span></div>"
              f"<div><span>Last check</span><span class='js-seen'>{esc(when(s['last_seen']))}</span></div>"
-             + (f"<div><span>Board</span>ESP32 AIO9</div>" if s["profile"] in ESP_TYPES else
-                f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware v6.9.60 on)</span>'}</div>") +
+             + (f"<div><span>Board</span>ESP32 AIO9</div>" if s["profile"] in ESP_TYPES else "")
+             + f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware ' + ('6.57' if s['profile'] in ESP_TYPES else 'v6.9.60') + ' on)</span>'}</div>" +
              f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
 
-    # Health (LPC1768 stations: their daily report comes with the check. ESP32 stations report to the
-    # Spatika health server)
-    if s["profile"] not in ESP_TYPES:
+    # Health: the daily report comes with the check (LPC1768; ESP32 from firmware 6.57)
+    if hl or s["profile"] not in ESP_TYPES:
         old_report = bool(hl) and hl.get("sent") in (None, "")
-        h.append("<div class='card'><h2>Health</h2><p class='hint'>From the daily report at 12:30-14:15, about the day "
+        when_txt = "about 13:00 (up to 45 min later by station number)" if s["profile"] in ESP_TYPES else "12:30-14:15"
+        h.append(f"<div class='card'><h2>Health</h2><p class='hint'>From the daily report at {when_txt}, about the day "
                  "08:45 to 08:30 before it." + (" <b>This report is from firmware before v6.9.62</b>, which doesn't send "
                                                 "the day's counts or battery averages." if old_report else "") +
                  "</p><div class='kv'>")
@@ -1349,8 +1357,8 @@ def station_page(key, message=""):
                  f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='csel'>Gets</label>"
                  f"<select id='csel' name='target'>{csel}</select><button>Set</button></form></div>")
 
-    # Health history (LPC1768 stations only)
-    if s["profile"] not in ESP_TYPES:
+    # Health history (ESP32 stations once they report, from firmware 6.57)
+    if reports or s["profile"] not in ESP_TYPES:
         h.append("<div class='card'><h2>Health history</h2><div class='scroll'><table><tr><th>Received</th>" +
                  "".join(f"<th>{esc(t)}</th>" for t, _ in HISTORY_COLS) + "</tr>")
         for r in reports:
