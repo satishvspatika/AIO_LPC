@@ -61,7 +61,7 @@ ESP_UI = ("Nuvoton", "Matrix")
 ESP_TYPES = {b + ui: f"ESP32 · {name} · {ESP_UI[ui]}" for b, name in ESP_BASES.items() for ui in (0, 1)}
 # DWLR (radar water-level) stations: ESP32 too, same AIOOTA1 block and requests (DWLR ota_esp.ino, from
 # DWLR-D15-S.13). One type per network; no UI variant and no daily health report.
-DWLR_TYPES = {28: "ESP32 · DWLR · SPATIKA", 30: "ESP32 · DWLR · KSNDMC"}
+DWLR_TYPES = {28: "ESP32 · DWLR · SPATIKA", 30: "ESP32 · DWLR · KSNDMC"}   # daily health report from DWLR-D15-S.22
 ESP_TYPES.update(DWLR_TYPES)
 TYPES.update(ESP_TYPES)
 TYPE_KEYS = {str(p) for p in TYPES}
@@ -1261,7 +1261,7 @@ def stations_tab(ptype, search):
              f"<input type='hidden' name='type' value='{ptype}'><input name='q' value='{esc(search)}' "
              f"placeholder='Find a station ID' size='16'><button class='plain'>Find</button></form></div>"
              "<div class='scroll'><table class='list'><tr><th>Station</th><th>Firmware</th>"
-             + ("" if ptype in DWLR_TYPES else "<th>Sent (last day)</th><th>Battery day / night</th><th>Carrier</th>")
+             + "<th>Sent (last day)</th><th>Battery day / night</th><th>Carrier</th>"
              + "<th>Last check</th><th>Update</th></tr>")
     for s in rows:
         hl = health_of(s)
@@ -1279,8 +1279,7 @@ def stations_tab(ptype, search):
         else:
             bat = "<span class='mute'>—</span>"
         carrier = esc(hl.get("op") or "") + (f" <span class='mute'>{esc(hl['net'])}G</span>" if hl.get("net") in ("2", "4") else "")
-        middle = ("" if ptype in DWLR_TYPES else
-                  f"<td class='nw'>{sent_text(hl)}</td><td class='nw'>{bat}</td>"
+        middle = (f"<td class='nw'>{sent_text(hl)}</td><td class='nw'>{bat}</td>"
                   f"<td class='nw'>{carrier or '<span class=mute>—</span>'}</td>")
         # Stop, while the update has not reached the unit yet (once downloaded it installs anyway)
         stop = (f"<form method='post' action='/station' class='rowact'><input type='hidden' name='key' value='{esc(s['key'])}'>"
@@ -1296,11 +1295,12 @@ def stations_tab(ptype, search):
                  + (f"<div style='margin-top:4px'><span class='pill {st_ctrl[s['key']][0]}'>{esc(st_ctrl[s['key']][1])}</span></div>"
                     if st_ctrl[s["key"]] else "") + "</td></tr>")
     if not rows:
-        h.append(f"<tr><td colspan='{4 if ptype in DWLR_TYPES else 7}' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
+        h.append(f"<tr><td colspan='7' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
     h.append("</table></div>")
-    if not any(health_of(s) for s in rows) and rows and ptype not in DWLR_TYPES:
+    if not any(health_of(s) for s in rows) and rows:
         h.append("<p class='hint' style='margin:10px 0 0'>Battery, signal and slot counts come in the daily health "
-                 "report: " + ("ESP32 firmware 6.57 on." if esp else "firmware v6.9.60 on; the last whole day from v6.9.62.")
+                 "report: " + ("DWLR firmware DWLR-D15-S.22 on." if ptype in DWLR_TYPES else "ESP32 firmware 6.57 on." if esp else
+                               "firmware v6.9.60 on; the last whole day from v6.9.62.")
                  + "</p>")
     h.append("</div>")
 
@@ -1370,8 +1370,7 @@ def station_page(key, message=""):
              f"<div><span>Firmware</span><span>{fw} <span class='crc js-crc'>{esc(s['running_crc'])}</span></span></div>"
              f"<div><span>Last check</span><span class='js-seen'>{esc(when(s['last_seen']))}</span></div>"
              + (f"<div><span>Board</span>{board_name(s['profile'])}</div>" if s["profile"] in ESP_TYPES else "")
-             + ("" if s["profile"] in DWLR_TYPES else
-                f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware ' + ('6.57' if s['profile'] in ESP_TYPES else 'v6.9.60') + ' on)</span>'}</div>") +
+             + f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware ' + ('DWLR-D15-S.22' if s['profile'] in DWLR_TYPES else '6.57' if s['profile'] in ESP_TYPES else 'v6.9.60') + ' on)</span>'}</div>" +
              f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
 
     # Health: the daily report comes with the check (LPC1768; ESP32 from firmware 6.57)

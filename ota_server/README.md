@@ -54,7 +54,8 @@ A station that went back to its old firmware is not offered the same build again
 DWLR (radar water-level) units are ESP32 stations too, from firmware DWLR-D15-S.13 (`DWLR/ota_esp.ino`):
 types **ESP32 · DWLR · SPATIKA** (28) and **ESP32 · DWLR · KSNDMC** (30). Upload the DWLR build's `.bin`
 on Firmware files; send it as for AIO9. They check at about 13:00 and 01:00 (every slot with `OTA.NOW` on
-their SD card) and send no daily health report.
+their SD card). From DWLR-D15-S.22 they send the daily health report like the AIO9 stations;
+`sens` carries the radar state (RADAR-OK, or RADAR-NOECHO:<slots>,ERR:<error bursts>).
 
 ## Health report
 
