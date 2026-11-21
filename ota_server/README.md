@@ -43,6 +43,13 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
 
 A station that went back to its old firmware is not offered the same build again: upload a new one.
 
+## DWLR stations
+
+DWLR (radar water-level) units are ESP32 stations too, from firmware DWLR-D15-S.13 (`DWLR/ota_esp.ino`):
+types **ESP32 · DWLR · SPATIKA** (28) and **ESP32 · DWLR · KSNDMC** (30). Upload the DWLR build's `.bin`
+on Firmware files; send it as for AIO9. They check at about 13:00 and 01:00 (every slot with `OTA.NOW` on
+their SD card) and send no daily health report.
+
 ## Health report
 
 ESP32 AIO9 stations send the same daily report from firmware 6.57 (with their 13:00 check, else the 01:00

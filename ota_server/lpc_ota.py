@@ -59,6 +59,10 @@ ESP_BASES = {10: "KSNDMC TRG", 12: "BIHAR TRG", 14: "KSNDMC TWS", 16: "KSNDMC TW
              20: "SPATIKA TRG", 22: "SPATIKA TWS", 24: "SPATIKA TWS-RF", 26: "SPATIKA TWS-RP"}
 ESP_UI = ("Nuvoton", "Matrix")
 ESP_TYPES = {b + ui: f"ESP32 · {name} · {ESP_UI[ui]}" for b, name in ESP_BASES.items() for ui in (0, 1)}
+# DWLR (radar water-level) stations: ESP32 too, same AIOOTA1 block and requests (DWLR ota_esp.ino, from
+# DWLR-D15-S.13). One type per network; no UI variant and no daily health report.
+DWLR_TYPES = {28: "ESP32 · DWLR · SPATIKA", 30: "ESP32 · DWLR · KSNDMC"}
+ESP_TYPES.update(DWLR_TYPES)
 TYPES.update(ESP_TYPES)
 TYPE_KEYS = {str(p) for p in TYPES}
 
@@ -70,6 +74,10 @@ def sid(row):
     if "profile" in row.keys() and row["profile"] in ESP_TYPES and shown[:1] == "E":
         return shown[1:]
     return shown
+
+
+def board_name(profile):
+    return "ESP32 DWLR" if profile in DWLR_TYPES else "ESP32 AIO9"
 
 
 def family(profile):
@@ -228,7 +236,7 @@ def parse_esp_bin(data):
     image_id = data[0x20 + 144:0x20 + 148].hex().upper()
     i = data.find(b"AIOOTA1\0")
     if i < 0 or i + 28 > len(data):
-        raise ValueError("no AIOOTA1 block: this firmware has no OTA support (v6.56 or later needed)")
+        raise ValueError("no AIOOTA1 block: this firmware has no OTA support (AIO9 v6.56 or DWLR-D15-S.13 or later needed)")
     profile = struct.unpack_from("<i", data, i + 8)[0]
     version = data[i + 12:i + 28].split(b"\0")[0].decode("ascii", "replace")
     if profile not in ESP_TYPES:
@@ -1234,7 +1242,7 @@ def stations_tab(ptype, search):
     if not rows:
         h.append(f"<tr><td colspan='7' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
     h.append("</table></div>")
-    if not any(health_of(s) for s in rows) and rows:
+    if not any(health_of(s) for s in rows) and rows and ptype not in DWLR_TYPES:
         h.append("<p class='hint' style='margin:10px 0 0'>Battery, signal and slot counts come in the daily health "
                  "report: " + ("ESP32 firmware 6.57 on." if esp else "firmware v6.9.60 on; the last whole day from v6.9.62.")
                  + "</p>")
@@ -1310,8 +1318,9 @@ def station_page(key, message=""):
              f"<div class='kv' style='margin-top:16px'>"
              f"<div><span>Firmware</span><span>{fw} <span class='crc js-crc'>{esc(s['running_crc'])}</span></span></div>"
              f"<div><span>Last check</span><span class='js-seen'>{esc(when(s['last_seen']))}</span></div>"
-             + (f"<div><span>Board</span>ESP32 AIO9</div>" if s["profile"] in ESP_TYPES else "")
-             + f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware ' + ('6.57' if s['profile'] in ESP_TYPES else 'v6.9.60') + ' on)</span>'}</div>" +
+             + (f"<div><span>Board</span>{board_name(s['profile'])}</div>" if s["profile"] in ESP_TYPES else "")
+             + ("" if s["profile"] in DWLR_TYPES else
+                f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware ' + ('6.57' if s['profile'] in ESP_TYPES else 'v6.9.60') + ' on)</span>'}</div>") +
              f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
 
     # Health: the daily report comes with the check (LPC1768; ESP32 from firmware 6.57)
@@ -1400,7 +1409,8 @@ def firmware_tab(ptype):
     h = ["<div class='card'><h2>Upload firmware</h2>"
          "<ol class='steps'><li><b>LPC1768 stations:</b> the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
          "<code>fw_bihar.hex</code>, <code>fw_ksn_tws.hex</code>, or <code>ctrl.hex</code> for the CTRL board "
-         "(one file for every type).</li><li><b>ESP32 stations:</b> the build's <code>.bin</code> (AIO9 v6.56 or later). "
+         "(one file for every type).</li><li><b>ESP32 stations:</b> the build's <code>.bin</code> (AIO9 v6.56 or later; "
+         "DWLR from DWLR-D15-S.13). "
          "Its station type (unit, Nuvoton or Matrix) is read from the file. For 4 MB units upload the 4 MB build.</li>"
          "<li>The station type and version are read from the file. A damaged or wrong file is refused.</li>"
          "<li>It is filed under its own type, whichever type is chosen above.</li>"
