@@ -1382,6 +1382,13 @@ def station_page(key, message=""):
              f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
 
     # Health: the daily report comes with the check (LPC1768; ESP32 from firmware 6.57)
+    # Health: shown for every station; an ESP32 station without a report yet says which firmware sends it
+    esp_first = ("DWLR-D15-S.22" if s["profile"] in DWLR_TYPES else "6.57") if s["profile"] in ESP_TYPES else ""
+    if not hl and esp_first:
+        h.append("<div class='card'><h2>Health</h2><p class='hint' style='margin:0'>No daily health report yet. "
+                 f"It comes once a day with the unit's 13:00 check (up to 45 min later by station number), from firmware "
+                 f"<b>{esp_first}</b> on; this station runs <b>{esc(s['version'] or 'unknown')}</b>. "
+                 "The first report follows the first whole day (08:45 to 08:30) on that firmware.</p></div>")
     if hl or s["profile"] not in ESP_TYPES:
         old_report = bool(hl) and hl.get("sent") in (None, "")
         when_txt = "about 13:00 (up to 45 min later by station number)" if s["profile"] in ESP_TYPES else "12:30-14:15"
@@ -1427,7 +1434,7 @@ def station_page(key, message=""):
                  f"<select id='csel' name='target'>{csel}</select><button>Set</button></form></div>")
 
     # Health history (ESP32 stations once they report, from firmware 6.57)
-    if reports or s["profile"] not in ESP_TYPES:
+    if True:   # every station (ESP32 too, before its first report)
         h.append("<div class='card'><h2>Health history</h2><div class='scroll'><table><tr><th>Received</th>" +
                  "".join(f"<th>{esc(t)}</th>" for t, _ in HISTORY_COLS) + "</tr>")
         for r in reports:
