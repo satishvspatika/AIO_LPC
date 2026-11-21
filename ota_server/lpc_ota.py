@@ -495,6 +495,9 @@ def unit_check(q, ip):
             offered = build["image_crc"]
             if st["offered_crc"] != offered:
                 add_event(con, stn, f"offered build {build['id']} {build['version']} ({offered})")
+                # a different file than last offered: the unit starts it from 0, so must the page
+                # (the old file's progress was shown against the new file's size)
+                con.execute("UPDATE stations SET progress=0 WHERE key=?", (key,))
             result = "offered, waiting for the unit"
         if offered:
             con.execute("UPDATE stations SET offered_crc=?, result=? WHERE key=?", (offered, result, key))
@@ -1619,7 +1622,7 @@ def do_send(f, stn_keys):
                 st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
                 if st is None:
                     continue
-                con.execute("UPDATE stations SET target='hold', result='', offered_crc=NULL WHERE key=?", (key,))
+                con.execute("UPDATE stations SET target='hold', result='', offered_crc=NULL, progress=0 WHERE key=?", (key,))
                 add_event(con, st["shown_id"], "office set: updates stopped")
                 stopped.append(sid(st))
         if not stopped:
@@ -1659,14 +1662,14 @@ def do_send(f, stn_keys):
             if st["profile"] != b["profile"]:
                 skipped.append(sid(st))
                 continue
-            con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL WHERE key=?", (str(build_id), key))
+            con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL, progress=0 WHERE key=?", (str(build_id), key))
             add_event(con, st["shown_id"], f"office set: gets build #{build_id} {b['version']}")
             sent.append(sid(st))
         if all_type:
             con.execute("INSERT INTO type_targets (profile, build_id) VALUES (?,?) "
                         "ON CONFLICT(profile) DO UPDATE SET build_id=excluded.build_id", (b["profile"], build_id))
             for st in con.execute("SELECT * FROM stations WHERE profile=? AND target IN ('type','hold')", (b["profile"],)).fetchall():
-                con.execute("UPDATE stations SET target='type', result='', offered_crc=NULL WHERE key=?", (st["key"],))
+                con.execute("UPDATE stations SET target='type', result='', offered_crc=NULL, progress=0 WHERE key=?", (st["key"],))
             add_event(con, "", f"office set: all {TYPES[b['profile']]} stations get build #{build_id} {b['version']}", b["profile"])
     if not sent and not all_type:
         return "Not sent: tick at least one station of this type." + (f" Skipped (other type): {', '.join(skipped)}." if skipped else "")
@@ -1798,7 +1801,7 @@ class Handler(BaseHTTPRequestHandler):
                 with _db_lock, db() as con:
                     st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
                     if st:
-                        con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL WHERE key=?", (target, st["key"]))
+                        con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL, progress=0 WHERE key=?", (target, st["key"]))
                         add_event(con, st["shown_id"], f"office set: {'updates resumed (follows its type)' if target == 'type' else 'updates stopped' if target == 'hold' else 'gets build #' + target}")
                         message = (f"Updates stopped for {sid(st)}." if target == "hold" else
                                    f"Updates resumed for {sid(st)}." if target == "type" else
