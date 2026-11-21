@@ -644,6 +644,7 @@ button.small{padding:4px 10px;font-size:13px}
 border:1px solid var(--line);border-left:4px solid var(--wait);background:var(--wait-bg);border-radius:14px}
 .banner>div{flex:1 1 380px;min-width:0}.banner b{display:block;font-size:15px}.banner span{color:var(--mute);font-size:14px}.banner span b{display:inline;color:var(--ink)}
 .banner form{margin:0}
+.card.danger .head{align-items:center;gap:16px;flex-wrap:wrap}.card.danger .head>div{flex:1 1 420px}
 .theme{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
 .theme button{background:var(--card);color:var(--mute);border:0;border-radius:0;padding:6px 10px;font-size:13px;font-weight:500}
 .theme button+button{border-left:1px solid var(--line)}.theme button.on{background:var(--acc-soft);color:var(--acc);font-weight:600}
@@ -1242,8 +1243,12 @@ def stations_tab(ptype, search):
         for s, a in flagged:
             pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a)
             line = summary_line(health_of(s))
+            stale = any(t.startswith("No check-in for") for _, t in a)
+            rm = (f"<form method='post' action='/station/delete' class='rowact' onsubmit=\"return confirm('Remove station {esc(sid(s))} from the office page? Its health history goes too; the History tab keeps its events. If the unit checks in again it comes back as a new station.')\">"
+                     f"<input type='hidden' name='key' value='{esc(s['key'])}'><input type='hidden' name='back' value='/?tab=stations&type={s['profile']}'>"
+                  "<button class='del small'>Remove</button></form>") if stale else ""
             h.append(f"<tr><td class='nw'><a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
-                     f"<td>{pills}{'<div class=mute style=margin-top:4px>' + line + '</div>' if line else ''}</td></tr>")
+                     f"<td><div class='upd' style='flex-wrap:wrap'>{pills}{rm}</div>{'<div class=mute style=margin-top:4px>' + line + '</div>' if line else ''}</td></tr>")
         h.append("</table></div>")
     else:
         h.append(f"<p class='hint' style='margin:0'><span class='okt'>Nothing.</span> Every station of this type "
@@ -1442,6 +1447,15 @@ def station_page(key, message=""):
     if not events:
         h.append("<tr><td colspan='2' class='mute'>Nothing yet.</td></tr>")
     h.append("</table></div></div>")
+    # Remove the station (e.g. a stale one): stations row and health history; events stay in History
+    stale = bool(s["last_seen"]) and int(time.time()) - s["last_seen"] > STALE_AFTER_S
+    h.append("<div class='card danger'><div class='head'><div><h2>Remove station</h2><p class='hint' style='margin:4px 0 0'>"
+             + ("This station has not checked in for over 26 hours. " if stale else "")
+             + "Removes it from this page with its health history. The History tab keeps its events. "
+             "If the unit checks in again, it comes back as a new station.</p></div>"
+             + f"<form method='post' action='/station/delete' class='rowact' onsubmit=\"return confirm('Remove station {esc(sid(s))} from the office page? Its health history goes too; the History tab keeps its events. If the unit checks in again it comes back as a new station.')\">"
+                     f"<input type='hidden' name='key' value='{esc(s['key'])}'><input type='hidden' name='back' value='/?tab=stations&type={s['profile']}'>"
+             "<button class='del'>Remove station</button></form></div></div>")
     h.append("</div>")
     return page(f"Station {sid(s)}", "".join(h), "stations", message, live_script(f"/live?k={s['key']}"),
                 ptype=s["profile"], type_bar_shown=False)
@@ -1789,6 +1803,15 @@ class Handler(BaseHTTPRequestHandler):
                         message = (f"Updates stopped for {sid(st)}." if target == "hold" else
                                    f"Updates resumed for {sid(st)}." if target == "type" else
                                    f"Station {sid(st)} set. It acts on this at its next check.")
+        elif url.path == "/station/delete":
+            with _db_lock, db() as con:
+                st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
+                if st:
+                    con.execute("DELETE FROM health WHERE key=?", (st["key"],))
+                    con.execute("DELETE FROM stations WHERE key=?", (st["key"],))
+                    add_event(con, st["shown_id"], "office: station removed from the office page", st["profile"])
+                    message = f"Station {sid(st)} removed. If it checks in again it comes back as a new station."
+                    f = {"back": f"/?tab=stations&type={st['profile']}"}
         elif url.path == "/station/ctrl":
             target = f.get("target", "")
             if target == "" or target.isdigit():
