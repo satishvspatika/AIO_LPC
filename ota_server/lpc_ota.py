@@ -83,6 +83,23 @@ def board_name(profile):
 def family(profile):
     """The board family of a type: what the office page groups and labels by."""
     return "ESP32" if profile in ESP_TYPES else "LPC1768"
+
+
+# The office page's top-level groups: (name, css class, types). DWLR has its own group so it is not lost
+# at the end of the AIO9 type row.
+AIO9_TYPES = {p: t for p, t in ESP_TYPES.items() if p not in DWLR_TYPES}
+GROUPS = (("LPC1768", "lpc1768", LPC_TYPES), ("ESP32 AIO9", "esp32", AIO9_TYPES), ("ESP32 DWLR", "dwlr", DWLR_TYPES))
+
+
+def group_of(profile):
+    """(name, css class, types) of the group a type is in."""
+    return next((g for g in GROUPS if profile in g[2]), GROUPS[0])
+
+
+def type_label(profile):
+    """A type's name within its group: "KSNDMC TRG · Nuvoton", "SPATIKA" (DWLR), "BIHAR TRG" (LPC)."""
+    t = TYPES.get(profile, "?").split(" · ", 1)[-1]
+    return t.split(" · ", 1)[-1] if profile in DWLR_TYPES else t
 ESP_MAX_IMAGE = 0x1B0000        # the 8 MB layout's app slot (the unit checks its own slot size too)
 MAX_UPLOAD = 2 * 1024 * 1024
 MAX_PIECE = 4096                # LPC units ask for 1 KB; ESP32 units for up to 4 KB
@@ -590,10 +607,10 @@ def password_ok(user, pw):
 PAGE_CSS = """
 :root{--bg:#f3f5f9;--card:#fff;--ink:#141b26;--mute:#5f6b7d;--line:#e3e8ef;--soft:#f7f9fc;--acc:#2563eb;--acc-ink:#fff;--acc-soft:#e8efff;
 --ok:#137a4b;--ok-bg:#e3f5ea;--bad:#b42318;--bad-bg:#fdeceb;--wait:#975a00;--wait-bg:#fff3dc;--busy:#1d5fd1;--busy-bg:#e6efff;--off-bg:#eef1f5;
---esp:#16725d;--lpc:#3b4a85;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06)}
+--esp:#16725d;--lpc:#3b4a85;--dwlr:#9a5b13;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06)}
 @media (prefers-color-scheme: dark){:root{--bg:#0d1117;--card:#161c25;--ink:#e7ebf1;--mute:#9aa5b5;--line:#273141;--soft:#1b2330;--acc:#5b9cff;--acc-ink:#0b1220;--acc-soft:#16294a;
 --ok:#4cc68d;--ok-bg:#11301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#222a35;
---esp:#2f9c82;--lpc:#6d7fc4;--shadow:none}}
+--esp:#2f9c82;--lpc:#6d7fc4;--dwlr:#d08a3a;--shadow:none}}
 *{box-sizing:border-box}[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
 header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
@@ -654,15 +671,15 @@ details summary{cursor:pointer;color:var(--acc);font-size:14px;font-weight:600}
 .seg a:hover{border-color:var(--acc)}
 .seg a span{color:var(--mute);font-weight:500;margin-left:4px}.seg a.on{background:var(--acc);border-color:var(--acc);color:var(--acc-ink)}
 .seg a.on span{color:var(--acc-ink);opacity:.8}.seg.types{margin:0 0 10px;align-items:center}.seg a.on .badt{color:var(--acc-ink)}
-.famtabs{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 14px}
+.famtabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0 0 14px}
 .famtab{display:flex;flex-direction:column;gap:2px;padding:14px 18px;border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--ink);text-decoration:none;box-shadow:var(--shadow)}
 .famtab:hover{border-color:var(--acc)}.famtab b{font-size:17px}.famtab span{color:var(--mute);font-size:14px}
 .famtab.on{color:#fff}.famtab.on span{color:#fff;opacity:.92}.famtab.on .badt{color:#fff;opacity:1;text-decoration:underline}
-.famtab.on.lpc1768{border-color:var(--lpc);background:var(--lpc)}.famtab.on.esp32{border-color:var(--esp);background:var(--esp)}
+.famtab.on.lpc1768{border-color:var(--lpc);background:var(--lpc)}.famtab.on.esp32{border-color:var(--esp);background:var(--esp)}.famtab.on.dwlr{border-color:var(--dwlr);background:var(--dwlr)}
 .here{font-size:21px;font-weight:700;margin:6px 0 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .here .mute{font-size:15px;font-weight:500}
 .fam{display:inline-block;padding:3px 9px;border-radius:6px;font-size:12px;font-weight:700;letter-spacing:.04em;background:var(--line);color:var(--ink);vertical-align:middle}
-.fam.esp32{background:var(--esp);color:#fff}.fam.lpc1768{background:var(--lpc);color:#fff}
+.fam.esp32{background:var(--esp);color:#fff}.fam.dwlr{background:var(--dwlr);color:#fff}.fam.lpc1768{background:var(--lpc);color:#fff}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:9px;background:var(--ok);vertical-align:middle}
 .dot.bad{background:var(--bad)}.dot.wait{background:var(--wait)}
 .kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px 20px}
@@ -689,7 +706,7 @@ td .pill{margin:1px 2px}
 .hero{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
 .hero h1{margin:0;font-size:24px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .back{display:inline-block;margin:0 0 12px;text-decoration:none;font-weight:600;font-size:14px}
-@media (max-width:700px){.tiles{grid-template-columns:repeat(2,1fr)}.famtabs{grid-template-columns:1fr}main{padding:14px}.top,nav{padding-left:14px;padding-right:14px}
+@media (max-width:700px){.tiles{grid-template-columns:repeat(2,1fr)}.famtabs{gap:6px;margin-bottom:10px}.famtab{padding:9px 10px;border-radius:11px}.famtab b{font-size:14px}.famtab span{font-size:12px}.seg.types{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:4px}.seg.types a{white-space:nowrap;flex:none}.here{font-size:18px}main{padding:14px}.top,nav{padding-left:14px;padding-right:14px}
 .steps-bar .lbl{font-size:11px}}
 """
 
@@ -728,25 +745,24 @@ def type_bar(tab, ptype):
     for st in stations:
         if st["profile"] in flagged and attention(st, health_of(st)):
             flagged[st["profile"]] += 1
-    cur = "ESP32" if ptype in ESP_TYPES else "LPC1768"
+    cur = group_of(ptype)
     fams = []
-    for fam, group in (("LPC1768", LPC_TYPES), ("ESP32", ESP_TYPES)):
+    for name, cls, group in GROUPS:
         n = sum(counts[p] for p in group)
         bad = sum(flagged[p] for p in group)
         first = max(group, key=lambda p: (counts[p], p in used, -p))
-        target = ptype if fam == cur else first
-        fams.append(f"<a href='/?tab={tab}&type={target}' class='famtab {fam.lower()}{' on' if fam == cur else ''}'>"
-                    f"<b>{fam}</b><span>{n} station{'s' if n != 1 else ''}"
+        target = ptype if group is cur[2] else first
+        fams.append(f"<a href='/?tab={tab}&type={target}' class='famtab {cls}{' on' if group is cur[2] else ''}'>"
+                    f"<b>{name}</b><span>{n} station{'s' if n != 1 else ''}"
                     + (f" · <b class='badt'>{bad} need a look</b>" if bad else "") + "</span></a>")
-    group = LPC_TYPES if cur == "LPC1768" else ESP_TYPES
     items = []
-    for p, t in group.items():
-        if cur == "ESP32" and p not in used and p != ptype:
-            continue    # an ESP32 type shows once it has a station or a build
+    for p in cur[2]:
+        if cur[2] is AIO9_TYPES and p not in used and p != ptype:
+            continue    # an AIO9 type shows once it has a station or a build
         warn = f" <b class='badt'>· {flagged[p]}</b>" if flagged[p] else ""
-        items.append(f"<a href='/?tab={tab}&type={p}' class='{'on' if p == ptype else ''}'>{esc(t.split(' · ', 1)[1])} "
+        items.append(f"<a href='/?tab={tab}&type={p}' class='{'on' if p == ptype else ''}'>{esc(type_label(p))} "
                      f"<span>{counts[p]}</span>{warn}</a>")
-    here = (f"<div class='here'><span class='fam {cur.lower()}'>{cur}</span> {esc(TYPES[ptype].split(' · ', 1)[1])}"
+    here = (f"<div class='here'><span class='fam {cur[1]}'>{cur[0]}</span> {esc(type_label(ptype))}"
             f" <span class='mute'>· {counts[ptype]} station{'s' if counts[ptype] != 1 else ''}</span></div>")
     return (f"<div class='famtabs'>{''.join(fams)}</div>"
             f"<div class='seg types'>{''.join(items)}</div>{here}")
@@ -1312,7 +1328,7 @@ def station_page(key, message=""):
     pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a) or "<span class='pill ok'>No problem reported</span>"
     fw = (f"<b class='js-ver'>{esc(s['version']) or '—'}</b>" if s["profile"] in ESP_TYPES else fw_text(s, hl))
     h.append(f"<div class='card'><div class='hero'><h1>"
-             f"{esc(sid(s))} <span class='fam {family(s['profile']).lower()}'>{family(s['profile'])}</span> "
+             f"{esc(sid(s))} <span class='fam {group_of(s['profile'])[1]}'>{group_of(s['profile'])[0]}</span> "
              f"<span class='mute' style='font-size:15px;font-weight:500'>{esc(TYPES.get(s['profile'], '?').split(' · ', 1)[-1])}</span></h1>"
              f"<div>{pills}</div></div>"
              f"<div class='kv' style='margin-top:16px'>"

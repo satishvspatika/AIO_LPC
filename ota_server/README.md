@@ -20,7 +20,9 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
 
 ## Use (office page)
 
-- **Unit type switch** (top of Stations, Firmware files and History): KSNDMC TRG, BIHAR TRG, KSNDMC TWS,
+- **Groups** (top of Stations, Firmware files and History): LPC1768, ESP32 AIO9, ESP32 DWLR, each with its
+  station count; under it the group's types (on a phone the type row scrolls sideways).
+- **Unit type switch**: KSNDMC TRG, BIHAR TRG, KSNDMC TWS,
   each with its station count and how many need a look. Everything below it is that type only.
 - **Live**: the Stations tab and each station's page redraw themselves (every 3 s while a station is updating,
   every 20 s otherwise): progress bar, KB done, speed and time left, and the update steps Sent, Downloading,
