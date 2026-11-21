@@ -1807,7 +1807,13 @@ class Handler(BaseHTTPRequestHandler):
             if target in ("type", "hold") or target.isdigit():
                 with _db_lock, db() as con:
                     st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
-                    if st:
+                    b = con.execute("SELECT profile, version FROM builds WHERE id=?", (int(target),)).fetchone() if target.isdigit() else None
+                    if st and target.isdigit() and (b is None or b["profile"] != st["profile"]):
+                        # only a build of the station's own type (the page lists no other; this stops a stale page or a typed form)
+                        message = (f"Not set: build #{target} is " + (f"for {TYPES.get(b['profile'], 'CTRL')}" if b else "gone") +
+                                   f", and {sid(st)} is {TYPES.get(st['profile'], '?')}.")
+                        add_event(con, st["shown_id"], f"office refused: build #{target} is for another station type")
+                    elif st:
                         con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL, progress=0 WHERE key=?", (target, st["key"]))
                         add_event(con, st["shown_id"], f"office set: {'updates resumed (follows its type)' if target == 'type' else 'updates stopped' if target == 'hold' else 'gets build #' + target}")
                         message = (f"Updates stopped for {sid(st)}." if target == "hold" else
@@ -1827,6 +1833,10 @@ class Handler(BaseHTTPRequestHandler):
             if target == "" or target.isdigit():
                 with _db_lock, db() as con:
                     st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
+                    b = con.execute("SELECT profile FROM builds WHERE id=?", (int(target),)).fetchone() if target else None
+                    if st and (st["profile"] not in LPC_TYPES or (target and (b is None or b["profile"] != CTRL_PROFILE))):
+                        message = f"Not set: {sid(st)} takes only a CTRL file, and only on an LPC1768 station."
+                        st = None
                     if st:
                         con.execute("UPDATE stations SET ctrl_target=?, ctrl_result='', ctrl_offered='' WHERE key=?", (target, st["key"]))
                         add_event(con, st["shown_id"], "office set: " + (f"CTRL gets build #{target}" if target else "no CTRL update"))
@@ -1842,14 +1852,20 @@ class Handler(BaseHTTPRequestHandler):
                 message = f"Station {stn} added."
         elif url.path == "/type":
             if f.get("profile", "") in TYPE_KEYS and (f.get("build", "") == "" or f.get("build", "").isdigit()):
+                profile = int(f["profile"])
+                build = int(f["build"]) if f.get("build") else None
                 with _db_lock, db() as con:
-                    build = int(f["build"]) if f.get("build") else None
-                    con.execute("INSERT INTO type_targets (profile, build_id) VALUES (?,?) "
-                                "ON CONFLICT(profile) DO UPDATE SET build_id=excluded.build_id", (int(f["profile"]), build))
-                    add_event(con, "", f"office set: all {TYPES[int(f['profile'])]} stations get "
-                                       f"{'build #' + str(build) if build else 'nothing'}", int(f["profile"]))
-                    message = (f"Every {TYPES[int(f['profile'])]} station set to get build #{build}." if build else
-                               f"Whole-type update stopped for {TYPES[int(f['profile'])]}.")
+                    b = con.execute("SELECT profile FROM builds WHERE id=?", (build,)).fetchone() if build else None
+                    if build and (b is None or b["profile"] != profile):
+                        # only a build of this type (the page offers no other)
+                        message = f"Not set: build #{build} is not {TYPES[profile]} firmware."
+                    else:
+                        con.execute("INSERT INTO type_targets (profile, build_id) VALUES (?,?) "
+                                    "ON CONFLICT(profile) DO UPDATE SET build_id=excluded.build_id", (profile, build))
+                        add_event(con, "", f"office set: all {TYPES[profile]} stations get "
+                                           f"{'build #' + str(build) if build else 'nothing'}", profile)
+                        message = (f"Every {TYPES[profile]} station set to get build #{build}." if build else
+                                   f"Whole-type update stopped for {TYPES[profile]}.")
         elif url.path == "/build/delete":
             tab = "firmware"
             if f.get("id", "").isdigit():
