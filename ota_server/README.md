@@ -30,6 +30,10 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
 - **Stations**: the type's totals at the top (stations, need a look, updating now, updated), then "Needs attention" for the type, then one row per station: firmware, battery, signal, records
   sent the last day (and how many by backlog), last check, update state. Click a station for its page:
   latest health report, firmware update control, health history, events.
+- **Stopping an update**: the Stop button on a station's row (while it is waiting or downloading), "Stop updates
+  for ticked stations" in Send an update, or "Stop update" on the station's page. A whole-type update shows as a
+  banner at the top of the type's Stations tab with "Stop for the whole type"; stations set one by one keep theirs.
+- **Theme**: Auto (follows the device), Light or Dark, top right; remembered per browser.
 - **Send an update** (on each type's tab): choose the firmware, tick the stations, Send. "Every station of this
   type" also covers stations that check in later. Try one station first.
 - **CTRL firmware** (v6.9.63): upload `ctrl.hex` on Firmware files (listed as "CTRL, every type"), then choose

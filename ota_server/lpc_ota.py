@@ -605,12 +605,15 @@ def password_ok(user, pw):
 # ---------------------------------------------------------------- office pages
 
 PAGE_CSS = """
-:root{--bg:#f3f5f9;--card:#fff;--ink:#141b26;--mute:#5f6b7d;--line:#e3e8ef;--soft:#f7f9fc;--acc:#2563eb;--acc-ink:#fff;--acc-soft:#e8efff;
+:root{color-scheme:light;--bg:#f3f5f9;--card:#fff;--ink:#141b26;--mute:#5f6b7d;--line:#e3e8ef;--soft:#f7f9fc;--acc:#2563eb;--acc-ink:#fff;--acc-soft:#e8efff;
 --ok:#137a4b;--ok-bg:#e3f5ea;--bad:#b42318;--bad-bg:#fdeceb;--wait:#975a00;--wait-bg:#fff3dc;--busy:#1d5fd1;--busy-bg:#e6efff;--off-bg:#eef1f5;
 --esp:#16725d;--lpc:#3b4a85;--dwlr:#9a5b13;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06)}
-@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--card:#161c25;--ink:#e7ebf1;--mute:#9aa5b5;--line:#273141;--soft:#1b2330;--acc:#5b9cff;--acc-ink:#0b1220;--acc-soft:#16294a;
+@media (prefers-color-scheme: dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1117;--card:#161c25;--ink:#e7ebf1;--mute:#9aa5b5;--line:#273141;--soft:#1b2330;--acc:#5b9cff;--acc-ink:#0b1220;--acc-soft:#16294a;
 --ok:#4cc68d;--ok-bg:#11301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#222a35;
---esp:#2f9c82;--lpc:#6d7fc4;--dwlr:#d08a3a;--shadow:none}}
+--esp:#1f8a71;--lpc:#4f62ad;--dwlr:#a8641c;--shadow:none}}
+:root[data-theme=dark]{color-scheme:dark;--bg:#0d1117;--card:#161c25;--ink:#e7ebf1;--mute:#9aa5b5;--line:#273141;--soft:#1b2330;--acc:#5b9cff;--acc-ink:#0b1220;--acc-soft:#16294a;
+--ok:#4cc68d;--ok-bg:#11301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#222a35;
+--esp:#1f8a71;--lpc:#4f62ad;--dwlr:#a8641c;--shadow:none}
 *{box-sizing:border-box}[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
 header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
@@ -636,6 +639,15 @@ button:hover{filter:brightness(1.07)}
 button.plain{background:var(--card);color:var(--ink);border-color:var(--line);font-weight:500}
 button.del{background:transparent;color:var(--bad);border-color:var(--line);font-weight:500}
 button.small{padding:4px 10px;font-size:13px}
+.upd{display:flex;align-items:center;gap:8px}.rowact{margin:0}
+.banner{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:14px 18px;margin:0 0 14px;
+border:1px solid var(--line);border-left:4px solid var(--wait);background:var(--wait-bg);border-radius:14px}
+.banner>div{flex:1 1 380px;min-width:0}.banner b{display:block;font-size:15px}.banner span{color:var(--mute);font-size:14px}.banner span b{display:inline;color:var(--ink)}
+.banner form{margin:0}
+.theme{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.theme button{background:var(--card);color:var(--mute);border:0;border-radius:0;padding:6px 10px;font-size:13px;font-weight:500}
+.theme button+button{border-left:1px solid var(--line)}.theme button.on{background:var(--acc-soft);color:var(--acc);font-weight:600}
+.topr{display:flex;align-items:center;gap:10px}
 label.f{display:block;font-weight:600;margin:14px 0 6px;font-size:14px}label.f:first-child{margin-top:0}
 .stack{display:flex;flex-direction:column;gap:14px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;font-size:13px;font-weight:600;white-space:nowrap}
@@ -706,7 +718,7 @@ td .pill{margin:1px 2px}
 .hero{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
 .hero h1{margin:0;font-size:24px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .back{display:inline-block;margin:0 0 12px;text-decoration:none;font-weight:600;font-size:14px}
-@media (max-width:700px){.tiles{grid-template-columns:repeat(2,1fr)}.famtabs{gap:6px;margin-bottom:10px}.famtab{padding:9px 10px;border-radius:11px}.famtab b{font-size:14px}.famtab span{font-size:12px}.seg.types{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:4px}.seg.types a{white-space:nowrap;flex:none}.here{font-size:18px}main{padding:14px}.top,nav{padding-left:14px;padding-right:14px}
+@media (max-width:700px){.brand small{display:none}.topr{gap:6px}.theme button{padding:5px 7px;font-size:12px}.top .out{white-space:nowrap;padding:5px 9px;font-size:13px}.tiles{grid-template-columns:repeat(2,1fr)}.famtabs{gap:6px;margin-bottom:10px}.famtab{padding:9px 10px;border-radius:11px}.famtab b{font-size:14px}.famtab span{font-size:12px}.seg.types{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:4px}.seg.types a{white-space:nowrap;flex:none}.here{font-size:18px}main{padding:14px}.top,nav{padding-left:14px;padding-right:14px}
 .steps-bar .lbl{font-size:11px}}
 """
 
@@ -768,10 +780,19 @@ def type_bar(tab, ptype):
             f"<div class='seg types'>{''.join(items)}</div>{here}")
 
 
+# Theme: Auto (follows the device), Light or Dark; kept per browser in localStorage
+THEME_HEAD_JS = ("<script>try{var t=localStorage.getItem('theme');if(t==='light'||t==='dark')"
+                 "document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>")
+THEME_SWITCH_JS = ("<script>(function(){var r=document.documentElement,bs=document.querySelectorAll('.theme button');"
+                   "function mark(){var t=r.getAttribute('data-theme')||'auto';bs.forEach(function(b){b.classList.toggle('on',b.dataset.t===t)})}"
+                   "bs.forEach(function(b){b.onclick=function(){var t=b.dataset.t;try{localStorage.setItem('theme',t)}catch(e){}"
+                   "if(t==='auto')r.removeAttribute('data-theme');else r.setAttribute('data-theme',t);mark()}});mark()})()</script>")
+
+
 def page(title, body, tab=None, message="", script="", ptype=None, type_bar_shown=True):
     head = (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title>"
-            f"<style>{PAGE_CSS}</style></head><body>")
+            f"<style>{PAGE_CSS}</style>{THEME_HEAD_JS}</head><body>")
     if tab is None:
         return (head + f"<main>{body}</main></body></html>").encode()
     tq = f"&type={ptype}" if ptype in TYPES else ""
@@ -784,7 +805,10 @@ def page(title, body, tab=None, message="", script="", ptype=None, type_bar_show
         msg = f"<div class='{cls}'>{esc(message)}</div>"
     return (head + "<header><div class='top'><a class='brand' href='/'><span class='mark'>AIO</span>"
             "<span><b>AIO stations</b><small>Firmware updates &amp; health</small></span></a>"
-            "<a class='out' href='/logout'>Log out</a></div>"
+            "<span class='topr'><span class='theme' role='group' aria-label='Theme'>"
+            "<button type='button' data-t='auto' title='Follow this computer or phone'>Auto</button>"
+            "<button type='button' data-t='light'>Light</button><button type='button' data-t='dark'>Dark</button></span>"
+            f"<a class='out' href='/logout'>Log out</a></span></div>{THEME_SWITCH_JS}"
             f"<nav>{nav}</nav></header><main>{bar}{msg}{body}</main>{script}</body></html>").encode()
 
 
@@ -1186,6 +1210,16 @@ def stations_tab(ptype, search):
     by_id = {b["id"]: b for b in builds}
     h = []
 
+    # A whole-type update is easy to miss at the bottom of the page: say so first, with its Stop button
+    wb_type = by_id.get(targets.get(ptype))
+    if wb_type:
+        h.append(f"<div class='banner'><div><b>Whole-type update is on</b><span>Every {esc(TYPES[ptype])} station, "
+                 f"including ones that check in later, gets <b>{esc(wb_type['version'])}</b> (#{wb_type['id']}). Stations "
+                 "set one by one keep their own setting.</span></div>"
+                 f"<form method='post' action='/type'><input type='hidden' name='profile' value='{ptype}'>"
+                 f"<input type='hidden' name='build' value=''><input type='hidden' name='back' value='/?tab=stations&type={ptype}'>"
+                 "<button class='del'>Stop for the whole type</button></form></div>")
+
     # At a glance, kept up to date by the page's script
     tiles = tile_counts([live_row(s, st_builds[s["key"]], st_ctrl[s["key"]]) for s in stations if s["profile"] == ptype])
     h.append("<div class='tiles'>"
@@ -1227,8 +1261,8 @@ def stations_tab(ptype, search):
              f"<input type='hidden' name='type' value='{ptype}'><input name='q' value='{esc(search)}' "
              f"placeholder='Find a station ID' size='16'><button class='plain'>Find</button></form></div>"
              "<div class='scroll'><table class='list'><tr><th>Station</th><th>Firmware</th>"
-             "<th>Sent (last day)</th><th>Battery day / night</th><th>Carrier</th>"
-             "<th>Last check</th><th>Update</th></tr>")
+             + ("" if ptype in DWLR_TYPES else "<th>Sent (last day)</th><th>Battery day / night</th><th>Carrier</th>")
+             + "<th>Last check</th><th>Update</th></tr>")
     for s in rows:
         hl = health_of(s)
         cls, label, _, pct = station_state(s, st_builds[s["key"]])
@@ -1245,18 +1279,24 @@ def stations_tab(ptype, search):
         else:
             bat = "<span class='mute'>—</span>"
         carrier = esc(hl.get("op") or "") + (f" <span class='mute'>{esc(hl['net'])}G</span>" if hl.get("net") in ("2", "4") else "")
-        middle = (f"<td class='nw'>{sent_text(hl)}</td><td class='nw'>{bat}</td>"
+        middle = ("" if ptype in DWLR_TYPES else
+                  f"<td class='nw'>{sent_text(hl)}</td><td class='nw'>{bat}</td>"
                   f"<td class='nw'>{carrier or '<span class=mute>—</span>'}</td>")
+        # Stop, while the update has not reached the unit yet (once downloaded it installs anyway)
+        stop = (f"<form method='post' action='/station' class='rowact'><input type='hidden' name='key' value='{esc(s['key'])}'>"
+                f"<input type='hidden' name='target' value='hold'><input type='hidden' name='back' value='/?tab=stations&type={ptype}'>"
+                "<button class='del small' title='Cancel this station&#39;s update'>Stop</button></form>"
+                if label.startswith(("Waiting for next check", "Starting download", "Downloading")) else "")
         fw = (f"<b class='js-ver'>{esc(s['version']) or '—'}</b><div class='sub crc js-crc'>{esc(s['running_crc'])}</div>"
               if esp else fw_text(s, hl))
         h.append(f"<tr data-k='{esc(s['key'])}'><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
                  f"<td class='nw'>{fw}</td>{middle}"
                  f"<td class='nw js-seen'>{esc(when(s['last_seen']))}</td>"
-                 f"<td class='nw'><span class='pill js-pill {cls}'>{esc(label)}</span>{bar}"
+                 f"<td class='nw'><div class='upd'><span class='pill js-pill {cls}'>{esc(label)}</span>{stop}</div>{bar}"
                  + (f"<div style='margin-top:4px'><span class='pill {st_ctrl[s['key']][0]}'>{esc(st_ctrl[s['key']][1])}</span></div>"
                     if st_ctrl[s["key"]] else "") + "</td></tr>")
     if not rows:
-        h.append(f"<tr><td colspan='7' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
+        h.append(f"<tr><td colspan='{4 if ptype in DWLR_TYPES else 7}' class='mute'>{'No station matches.' if search else 'No station of this type has checked in yet.'}</td></tr>")
     h.append("</table></div>")
     if not any(health_of(s) for s in rows) and rows and ptype not in DWLR_TYPES:
         h.append("<p class='hint' style='margin:10px 0 0'>Battery, signal and slot counts come in the daily health "
@@ -1286,13 +1326,8 @@ def stations_tab(ptype, search):
                  f"<div><label class='f'>2. Stations</label><div class='ticks'>{ticks or '<span class=mute>None yet.</span>'}</div></div>"
                  "<label class='tick' style='align-self:flex-start'><input type='checkbox' name='all' value='1'>"
                  f"<span>Every station of this type, including ones that check in later</span></label>"
-                 "<div><button>Send update</button></div></form>")
-        wb = by_id.get(targets.get(ptype))
-        if wb:
-            h.append(f"<form method='post' action='/type' class='row' style='margin-top:14px'><input type='hidden' name='profile' value='{ptype}'>"
-                     f"<input type='hidden' name='build' value=''><input type='hidden' name='back' value='/?tab=stations&type={ptype}'>"
-                     f"<span>Whole type: every {esc(TYPES[ptype])} station gets <b>{esc(wb['version'])}</b> (#{wb['id']})</span>"
-                     "<button class='del small'>Stop for the type</button></form>")
+                 "<div class='row'><button>Send update</button>"
+                 "<button class='del' name='act' value='stop' formnovalidate>Stop updates for ticked stations</button></div></form>")
         h.append("</div>")
     h.append("<details><summary>Add a station that hasn't checked in yet</summary>"
              "<form method='post' action='/station/add' class='row' style='margin-top:10px'>"
@@ -1352,7 +1387,7 @@ def station_page(key, message=""):
         h.append("</div></div>")
 
     # Update
-    opts = [("type", "Same as its type"), ("hold", "Nothing (updates stopped)")] + [
+    opts = [("type", "Follow the type's update"), ("hold", "No update (stopped)")] + [
         (str(b["id"]), build_name(b)) for b in builds]
     sel = "".join(f"<option value='{esc(v)}'{' selected' if v == s['target'] else ''}>{esc(t)}</option>" for v, t in opts)
     live = pct is not None and pct < 100
@@ -1366,8 +1401,10 @@ def station_page(key, message=""):
              f"<span class='pill js-pill {cls}'>{esc(label)}</span></div>{target_txt}{steps}{bar}"
              f"<p class='hint js-detail'{'' if detail else ' hidden'}>{esc(detail)}</p>"
              f"<form method='post' action='/station' class='row' style='margin-top:10px'><input type='hidden' name='key' value='{esc(s['key'])}'>"
-             f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='tsel'>Gets</label>"
-             f"<select id='tsel' name='target'>{sel}</select><button>Set</button></form>")
+             f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='tsel'>Update target</label>"
+             f"<select id='tsel' name='target'>{sel}</select><button>Set</button>"
+             + ("<button class='del' name='target' value='hold' formnovalidate>Stop update</button>"
+                if s["target"] != "hold" and label.startswith(("Waiting for next check", "Starting download", "Downloading")) else "") + "</form>")
     # v6.9.63: CTRL (LPC1768 stations only: ESP32 stations have no CTRL board)
     if s["profile"] in ESP_TYPES:
         h.append("</div>")
@@ -1562,6 +1599,20 @@ def do_upload(parts):
 
 
 def do_send(f, stn_keys):
+    if f.get("act") == "stop":                       # "Stop updates for ticked stations"
+        stopped = []
+        with _db_lock, db() as con:
+            for key in dict.fromkeys(stn_keys):
+                st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
+                if st is None:
+                    continue
+                con.execute("UPDATE stations SET target='hold', result='', offered_crc=NULL WHERE key=?", (key,))
+                add_event(con, st["shown_id"], "office set: updates stopped")
+                stopped.append(sid(st))
+        if not stopped:
+            return "Nothing stopped: tick at least one station."
+        return (f"Updates stopped for {', '.join(stopped)}. A station already on trial or installing keeps that firmware; "
+                "choose a build on its page to update it again.")
     if not f.get("build", "").isdigit():
         return "No firmware chosen."
     build_id = int(f["build"])
