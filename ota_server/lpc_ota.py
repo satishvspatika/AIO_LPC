@@ -1455,7 +1455,8 @@ def station_page(key, message=""):
              "If the unit checks in again, it comes back as a new station.</p></div>"
              + f"<form method='post' action='/station/delete' class='rowact' onsubmit=\"return confirm('Remove station {esc(sid(s))} from the office page? Its health history goes too; the History tab keeps its events. If the unit checks in again it comes back as a new station.')\">"
                      f"<input type='hidden' name='key' value='{esc(s['key'])}'><input type='hidden' name='back' value='/?tab=stations&type={s['profile']}'>"
-             "<button class='del'>Remove station</button></form></div></div>")
+             + ("<span class='pill busy'>Update under way: stop it first</span></form></div></div>" if cls == "busy" else
+                "<button class='del'>Remove station</button></form></div></div>"))
     h.append("</div>")
     return page(f"Station {sid(s)}", "".join(h), "stations", message, live_script(f"/live?k={s['key']}"),
                 ptype=s["profile"], type_bar_shown=False)
@@ -1806,6 +1807,11 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/station/delete":
             with _db_lock, db() as con:
                 st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
+                if st and station_state(st, target_build(con, st))[0] == "busy":
+                    message = (f"Not removed: {sid(st)} is in the middle of an update. Press Stop update first "
+                               "(or wait until it shows Updated), then remove it.")
+                    f = {"back": f"/s?k={st['key']}"}
+                    st = None
                 if st:
                     con.execute("DELETE FROM health WHERE key=?", (st["key"],))
                     con.execute("DELETE FROM stations WHERE key=?", (st["key"],))
