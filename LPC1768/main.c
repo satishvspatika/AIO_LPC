@@ -21,6 +21,30 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* v6.9.65: the C library's sscanf and snprintf name malloc, realloc and free for cases this firmware
+ * never reaches: sscanf pushing back a character it did not read, and asprintf's growing buffer
+ * (snprintf writes into a fixed buffer). That pulled in the C library's heap and sbrk: about 650 bytes of
+ * flash, and a heap nothing should use (FreeRTOS has its own). Answering "no memory" makes either
+ * case fail cleanly: sscanf returns what it matched so far, the print stops. Nothing is ever
+ * handed out, so free has nothing to do. */
+struct _reent;
+void *_malloc_r(struct _reent *r, size_t n)
+{
+    (void)r; (void)n;
+    return NULL;
+}
+
+void *_realloc_r(struct _reent *r, void *p, size_t n)
+{
+    (void)r; (void)p; (void)n;
+    return NULL;
+}
+
+void _free_r(struct _reent *r, void *p)
+{
+    (void)r; (void)p;
+}
+
 /* --- Crash Recovery ---
  * A fault must never leave the unit frozen: that would lose every later 15-minute slot. Save
  * where it happened in the RTC registers (they survive a reset), restart, and log it at boot. */
@@ -1752,6 +1776,9 @@ static void run_slot(telemetry_data_t *telem, int min, int sec, int32_t slot_id)
         }
         return;
     }
+#if ENABLE_OTA
+    ota_slot_begin();   /* v6.9.64: new firmware that delivers nothing for 2 h goes back */
+#endif
 
     /* With the LPC845 silent (hung, or on a failed firmware trial) there's no rain, battery or
      * total to report, and a record of zeros would pull CUM_RF down. So nothing is sent or stored.

@@ -352,12 +352,14 @@ static bool expect(const char *want, uint32_t timeout_ms)
 /* PLL0 output / (CCLKCFG + 1). Normal speed is what the startup code set; slow is a quarter of it,
  * for the time the LPC1768 may be on hold-up power. UART3 follows the clock, so it is set again. */
 static uint32_t s_cclk_normal;
+static uint32_t s_pll0_hz;          /* PLL0 output: SystemCoreClock x (CCLKCFG + 1) at the start */
 
 static void set_cclk_cfg(uint32_t cfg)
 {
     (void)hal_ms();                 /* Count the cycles so far at the old speed */
     LPC_SC->CCLKCFG = cfg;
-    SystemCoreClockUpdate();
+    /* v6.9.65: was SystemCoreClockUpdate(), 554 bytes that read the PLL back. Only the divider changes. */
+    SystemCoreClock = s_pll0_hz / (cfg + 1U);
     uart3_open(115200);
 }
 
@@ -665,7 +667,8 @@ void ctrl_isp_boot_check(void)
 
     __disable_irq();        /* Everything here is polled */
     NVIC_DisableIRQ(UART3_IRQn);
-    s_cclk_normal = LPC_SC->CCLKCFG;
+    s_cclk_normal = LPC_SC->CCLKCFG & 0xFFU;
+    s_pll0_hz = SystemCoreClock * (s_cclk_normal + 1U);
     timer_start();
     lcd_init();
     lcd_show("CTRL BOOTLOADER", "STARTING");

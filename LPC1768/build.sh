@@ -126,7 +126,7 @@ ${CC} ${CFLAGS} "${LPC_DIR}/fat_sd/diskio.c" -o "${OUT_DIR}/fat_sd/diskio.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fat_sd/spi_sd_lpc17xx.c" -o "${OUT_DIR}/fat_sd/spi_sd_lpc17xx.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fat_sd/ff.c" -o "${OUT_DIR}/fat_sd/ff.o"
 ${CC} ${CFLAGS} "${LPC_DIR}/fat_sd/fattime.c" -o "${OUT_DIR}/fat_sd/fattime.o"
-${CC} ${CFLAGS} "${LPC_DIR}/fat_sd/option/ccsbcs.c" -o "${OUT_DIR}/fat_sd/option/ccsbcs.o"
+${CC} ${CFLAGS} "${LPC_DIR}/fat_sd/option/ascii.c" -o "${OUT_DIR}/fat_sd/option/ascii.o"
 
 # Compile NXP Peripheral Drivers
 mkdir -p "${OUT_DIR}/NXP/Drivers/source"
@@ -189,7 +189,7 @@ ${CC} \
   "${OUT_DIR}/fat_sd/spi_sd_lpc17xx.o" \
   "${OUT_DIR}/fat_sd/ff.o" \
   "${OUT_DIR}/fat_sd/fattime.o" \
-  "${OUT_DIR}/fat_sd/option/ccsbcs.o" \
+  "${OUT_DIR}/fat_sd/option/ascii.o" \
   "${OUT_DIR}/USBHostLite/rtc_cal.o" \
   "${OUT_DIR}/USBHostLite/usbhost_lpc17xx.o" \
   "${OUT_DIR}/USBHostLite/usbhost_ms.o" \

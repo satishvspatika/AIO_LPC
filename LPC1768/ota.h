@@ -18,4 +18,7 @@ void ota_install_step(void);
  * health report) is asked at the next delivered slot that day instead */
 void ota_slot_not_sent(int slot, const char *time14);
 
+/* v6.9.64: at the start of every slot: new firmware that delivers no record for 2 h goes back */
+void ota_slot_begin(void);
+
 #endif /* OTA_H */

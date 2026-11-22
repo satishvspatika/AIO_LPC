@@ -76,6 +76,13 @@ void hal_power_heartbeat(void) {}
 static jmp_buf s_reset;
 static int s_resets = 0;
 void NVIC_SystemReset(void) { s_resets++; longjmp(s_reset, 1); }
+static int s_revert_reqs = 0;
+bool fw_journal_append(fw_j_type_t type, fw_op_t op, uint8_t arg)
+{
+    (void)op; (void)arg;
+    if (type == FW_J_REVERT_REQ) s_revert_reqs++;
+    return true;
+}
 
 /* ---- card ---- */
 #define FILES 6
@@ -310,7 +317,7 @@ int main(void)
     /* 1. When it asks at all */
     fresh(); CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 0);
     fresh(); CHECK(!step(DAILY)); CHECK(s_check_calls == 1 && s_piece_calls == 0 && s_closes >= 1);
-    CHECK(strstr(s_last_check, "id=001922&p=") && strstr(s_last_check, "&v=" FIRMWARE_VERSION "&c=11111111&s=0&t=00000000"));
+    CHECK(strstr(s_last_check, "id=001922&p=") && strstr(s_last_check, "&v=" FIRMWARE_VERSION "&c=11111111&s=0&t=00000000&w=0"));
     CHECK(file_find(OTA_FILE_FILENAME) < 0);
     fresh(); file_set(OTA_NOW_FILENAME, "", 0); CHECK(!step(3)); CHECK(s_check_calls == 1);
     fresh(); s_battery = 10.8f; CHECK(!step(DAILY + 1)); CHECK(s_get_calls == 0);  /* Ordinary slot, low battery: nothing */
@@ -405,6 +412,39 @@ int main(void)
     CHECK(!step(DAILY)); CHECK(s_staged == 0 && phase() == 'F' && file_find(OTA_FILE_FILENAME) < 0);
     pieces = s_piece_calls; s_tick += 900000; set_clock(1, 10);
     CHECK(!step(DAILY)); CHECK(s_piece_calls == pieces);
+    CHECK(strstr(s_last_check, "&s=3&t=22220001") && strstr(s_last_check, "&e=T"));   /* v6.9.64: why */
+    /* v6.9.64: a damaged file is fetched again, at most 3 times, then given up as damaged (e=D) */
+    fresh(); s_server = SRV_OFFER; s_check_result = FW_E_BAD_LINE;
+    CHECK(!step(DAILY)); CHECK(phase() == 'D' && file_find(OTA_FILE_FILENAME) < 0 && strstr(s_log, "fetched again"));
+    pieces = s_piece_calls; s_tick += 900000; set_clock(16, 10);
+    CHECK(!step(DAILY + 1)); CHECK(s_piece_calls > pieces && phase() == 'D');     /* Fetched again (phase D: every slot) */
+    s_tick += 900000; set_clock(31, 10);
+    CHECK(!step(DAILY + 2)); CHECK(phase() == 'F');
+    pieces = s_piece_calls; s_tick += 900000; set_clock(46, 10);
+    CHECK(!step(DAILY + 3)); CHECK(s_piece_calls == pieces);                    /* Not daily: no check */
+    s_tick += 900000; set_clock(1, 10);
+    CHECK(!step(DAILY)); CHECK(s_piece_calls == pieces && strstr(s_last_check, "&e=D"));
+    /* v6.9.64: installed but delivers nothing: back to the previous firmware after 8 slots (e=N) */
+    fresh(); s_server = SRV_OFFER;
+    CHECK(step(DAILY)); CHECK(phase() == 'I');
+    s_running = s_fw_image_crc; s_trial = true;
+    ota_slot_begin(); CHECK(s_revert_reqs == 0);                                /* On its boot trial: not counted */
+    s_trial = false;
+    for (int k = 0; k < 8; k++) ota_slot_begin();
+    CHECK(s_revert_reqs == 0 && phase() == 'I');
+    if (!setjmp(s_reset)) { ota_slot_begin(); CHECK(0); }
+    CHECK(s_revert_reqs == 1 && phase() == 'F' && strstr(s_log, "delivered no record"));
+    s_running = 0x11111111UL; s_tick += 900000; set_clock(1, 10);              /* The old firmware is back */
+    CHECK(!step(DAILY)); CHECK(strstr(s_last_check, "&s=3&t=22220001") && strstr(s_last_check, "&e=N"));
+    /* ... and one that delivers is kept: the first sent slot ends the count */
+    fresh(); s_server = SRV_OFFER; s_revert_reqs = 0;
+    CHECK(step(DAILY));
+    s_running = s_fw_image_crc;
+    for (int k = 0; k < 5; k++) ota_slot_begin();
+    s_server = SRV_NONE; s_tick += 900000; set_clock(16, 10);
+    CHECK(!step(DAILY + 1)); CHECK(phase() == '-');
+    for (int k = 0; k < 20; k++) ota_slot_begin();
+    CHECK(s_revert_reqs == 0);
     /* The image inside is not the one offered */
     fresh(); s_server = SRV_OFFER; s_check_crc_xor = 0x10;
     CHECK(!step(DAILY)); CHECK(s_checked == 1 && s_staged == 0 && phase() == 'F' && file_find(OTA_FILE_FILENAME) < 0);
@@ -467,6 +507,7 @@ int main(void)
     fresh(); s_backlog = 3; s_server = SRV_OFFER;
     CHECK(!step(DAILY)); CHECK(s_check_calls == 1 && s_piece_calls == 0 && s_health_pending == 3 && s_health_sent == 1);
     CHECK(strstr(s_log, "download put off: 3 record(s)") && phase() == '?');
+    CHECK(strstr(s_last_check, "&w=q3"));                       /* v6.9.64: the office is told why */
     s_backlog = 0; s_tick += 900000; set_clock(1, 10);
     CHECK(step(OTA_NIGHT_FIRST_SLOT + 1922 % OTA_DAILY_SPREAD_SLOTS)); CHECK(s_staged == 1);   /* Queue empty: taken */
     /* The install report goes with records waiting, too */
@@ -477,7 +518,7 @@ int main(void)
     /* 13. v6.9.60 health report: at the night and day check slots (and their retries), not on others */
     const int NIGHT = OTA_NIGHT_FIRST_SLOT + 1922 % OTA_DAILY_SPREAD_SLOTS;
     fresh(); CHECK(!step(NIGHT)); CHECK(s_check_calls == 1 && s_health_built == 1 && s_health_sent == 1);
-    CHECK(strstr(s_last_check, "&t=00000000&hs=OK&bv=12.60&ok=95") && strstr(s_log, "health report sent"));
+    CHECK(strstr(s_last_check, "&t=00000000&w=0&hs=OK&bv=12.60&ok=95") && strstr(s_log, "health report sent"));
     fresh(); CHECK(!step(DAILY)); CHECK(s_health_built == 1 && s_health_sent == 1);
     fresh(); CHECK(!step(NIGHT + 1)); CHECK(s_get_calls == 0 && s_health_built == 0);
     fresh(); file_set(OTA_NOW_FILENAME, "", 0); CHECK(!step(DAILY + 5)); CHECK(s_check_calls == 1 && s_health_built == 1);
@@ -493,6 +534,7 @@ int main(void)
     fresh(); s_battery = 10.8f; s_server = SRV_OFFER;
     CHECK(!step(DAILY)); CHECK(s_check_calls == 1 && s_piece_calls == 0 && s_health_sent == 1 && phase() == '?');
     CHECK(strstr(s_log, "download put off: battery low") && strstr(s_log, "health report sent"));
+    CHECK(strstr(s_last_check, "&w=b10.80"));                   /* v6.9.64: the office is told why */
     s_battery = 12.4f; s_tick += 900000; set_clock(1, 10);
     CHECK(step(NIGHT)); CHECK(s_staged == 1);                    /* Good battery at the next check: taken */
     /* ... a download under way stops on a low battery at an ordinary slot, goes on at the next good one */

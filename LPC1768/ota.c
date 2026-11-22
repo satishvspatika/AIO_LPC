@@ -13,6 +13,9 @@
  * OTA.DAT on the card: "<file crc> <image crc> <file bytes> <phase>", phase being
  *   D  downloading that file            I  install started for that image
  *   F  that image did not stay (rolled back), or its file was refused: not taken again
+ * v6.9.64: then "<why> <n>": why phase F (sent as e=: N no record for 2 h after the install so the
+ * unit went back, T another station type, K not a good image, D arrived damaged 3 times), and the
+ * damaged downloads (phase D) or slots since the install (phase I) so far.
  * and the same in lower case (d, i, f) for a CTRL file (v6.9.63, "OTA CTRL" answer): it is sent to the
  * CTRL by the code of MENU > FIRMWARE UPDATE > CTRL (fw_ctrl.c), whose bootloader tries it and goes
  * back to the old one if it doesn't run. One download at a time; the server offers the main board's
@@ -47,11 +50,15 @@ typedef struct {
     uint32_t image_crc;
     uint32_t size;
     char phase;
+    char why;       /* v6.9.64: why phase F, '-' none */
+    unsigned n;     /* v6.9.64: phase D: damaged downloads; phase I: slots since the install */
 } ota_state_t;
+#define OTA_MAX_REFETCH     3   /* v6.9.64: a damaged file is fetched again at most this often */
+#define OTA_DELIVER_SLOTS   8   /* v6.9.64: new firmware must deliver a record within 2 h, or it goes back */
 
 /* Static: this runs on the main task's stack, under the slot */
 static char s_text[176];   /* v6.9.57: room for the modem's reason */
-static char s_path[440];   /* v6.9.60: the check carries the health report; v6.9.63: +cc (worst case ~430) */
+static char s_path[460];   /* v6.9.60: the check carries the health report; v6.9.63: +cc (worst case ~430); v6.9.64: +w (~12) */
 static char s_host[44];
 static uint16_t s_port;
 static ota_state_t s_st;
@@ -80,8 +87,8 @@ static void ota_log(const char *tag, const char *msg)
 static void ota_save(void)
 {
     /* Fixed length: the file is overwritten in place */
-    snprintf(s_text, sizeof(s_text), "%08lX %08lX %07lu %c\r\n", (unsigned long)s_st.file_crc,
-             (unsigned long)s_st.image_crc, (unsigned long)s_st.size, s_st.phase);
+    snprintf(s_text, sizeof(s_text), "%08lX %08lX %07lu %c %c %02u\r\n", (unsigned long)s_st.file_crc,
+             (unsigned long)s_st.image_crc, (unsigned long)s_st.size, s_st.phase, s_st.why, s_st.n % 100U);
     if (!storage_state_save(OTA_STATE_FILENAME, s_text)) {
         ota_log("ERROR", "OTA: could not write OTA.DAT");
     }
@@ -90,16 +97,20 @@ static void ota_save(void)
 static void ota_load(void)
 {
     unsigned long file_crc = 0, image_crc = 0, size = 0;
-    char phase = '-';
+    char phase = '-', why = '-';
+    unsigned n = 0;
     memset(&s_st, 0, sizeof(s_st));
     s_st.phase = '-';
+    s_st.why = '-';
     if (storage_state_load(OTA_STATE_FILENAME, s_text, sizeof(s_text)) &&
-        sscanf(s_text, "%8lx %8lx %lu %c", &file_crc, &image_crc, &size, &phase) == 4 &&
+        sscanf(s_text, "%8lx %8lx %lu %c %c %u", &file_crc, &image_crc, &size, &phase, &why, &n) >= 4 &&
         strchr("DIFdif", phase) && phase != '\0') {
         s_st.file_crc = file_crc;
         s_st.image_crc = image_crc;
         s_st.size = size;
         s_st.phase = phase;
+        s_st.why = why;
+        s_st.n = n;
     }
 }
 
@@ -108,6 +119,13 @@ static void ota_forget_file(char phase)
     storage_state_delete(OTA_FILE_FILENAME);
     s_st.phase = phase;
     ota_save();
+}
+
+/* v6.9.64: given up, and why (sent with s=3 as e=) */
+static void ota_give_up(char phase, char why)
+{
+    s_st.why = why;
+    ota_forget_file(phase);
 }
 
 static long seconds_to_slot(void)
@@ -200,8 +218,20 @@ static void ota_install(void)
         return;
     }
     fw_result_t r = fw_update_check(OTA_FILE_FILENAME, UNIT_CFG, &s_info, ota_progress);
+    char why = '-';
     if (r == FW_OK && s_info.crc32 != s_st.image_crc) {
-        r = FW_E_BAD_CRC;
+        r = FW_E_NOT_AN_IMAGE;  /* A good image, but not the one the server named */
+    }
+    /* v6.9.64: a file damaged on the way or on the card (every line has a checksum, the image a CRC) is
+     * fetched again, up to OTA_MAX_REFETCH times, instead of the firmware being refused for good */
+    if (r == FW_E_READ || r == FW_E_BAD_LINE || r == FW_E_GAP || r == FW_E_NO_END || r == FW_E_BAD_CRC) {
+        if (++s_st.n < OTA_MAX_REFETCH) {
+            snprintf(s_text, sizeof(s_text), "OTA: file damaged (%s): fetched again", fw_update_error_text(r));
+            ota_log("ERROR", s_text);
+            ota_forget_file('D');
+            return;
+        }
+        why = 'D';
     }
     if (r == FW_OK) {
         r = fw_update_stage(OTA_FILE_FILENAME, &s_info, ota_progress);
@@ -219,7 +249,10 @@ static void ota_install(void)
     }
     snprintf(s_text, sizeof(s_text), "OTA: file not installed: %s. Not taken again", fw_update_error_text(r));
     ota_log("ERROR", s_text);
-    ota_forget_file('F');
+    if (why != 'D') {
+        why = (r == FW_E_WRONG_PROFILE) ? 'T' : (r == FW_E_FLASH || r == FW_E_JOURNAL) ? 'X' : 'K';
+    }
+    ota_give_up('F', why);
 }
 
 static void ota_download(const char *stn_id)
@@ -376,7 +409,7 @@ void ota_slot_step(int slot)
             ota_forget_file('-');
         } else {
             ota_log("ERROR", "OTA: the new firmware did not stay (went back to the old one). Not taken again");
-            ota_forget_file('F');
+            ota_give_up('F', 'B');
         }
         due = true;     /* Tell the server now */
     }
@@ -421,9 +454,26 @@ void ota_slot_step(int slot)
     /* v6.9.63: cc = the CTRL's running image (0 not known), so the server can offer a CTRL file. s and t
      * cover a CTRL file too: the server tells them apart by the CRC. */
     const bool failed = (s_st.phase == 'F' || s_st.phase == 'f');
-    snprintf(s_path, sizeof(s_path), "/lpc/check?id=%.12s&p=%d&cc=%08lX&v=%s&c=%08lX&s=%c&t=%08lX", stn_id, (int)UNIT_CFG,
+    /* v6.9.64: w = can it download now, the same test as after an offer below, so the office page can say
+     * why an offered file is not coming instead of "Starting download": 0 ready, b<volts> battery low,
+     * q<n> records still to send */
+    char wait[16];
+    if (battery_low) {
+        const int bv = (int)(telem->bat1_volt * 100.0f + 0.5f);
+        snprintf(wait, sizeof(wait), "b%d.%02d", bv / 100, bv % 100);
+    } else if (pending != 0) {
+        snprintf(wait, sizeof(wait), "q%lu", (unsigned long)pending);
+    } else {
+        snprintf(wait, sizeof(wait), "0");
+    }
+    snprintf(s_path, sizeof(s_path), "/lpc/check?id=%.12s&p=%d&cc=%08lX&v=%s&c=%08lX&s=%c&t=%08lX&w=%s", stn_id, (int)UNIT_CFG,
              (unsigned long)ctrl_crc, FIRMWARE_VERSION, (unsigned long)running,
-             (s_st.phase == 'D' || s_st.phase == 'd') ? '1' : failed ? '3' : '0', (unsigned long)(failed ? s_st.image_crc : 0UL));
+             (s_st.phase == 'D' || s_st.phase == 'd') ? '1' : failed ? '3' : '0', (unsigned long)(failed ? s_st.image_crc : 0UL),
+             wait);
+    if (failed && s_st.why != '-') {    /* v6.9.64: why it was given up */
+        const size_t used = strlen(s_path);
+        snprintf(s_path + used, sizeof(s_path) - used, "&e=%c", s_st.why);
+    }
     if (report) {
         const size_t used = strlen(s_path);
         snprintf(s_path + used, sizeof(s_path) - used, "%s", health_query(telem, pending));
@@ -478,10 +528,41 @@ void ota_slot_step(int slot)
             s_st.image_crc = image_crc;
             s_st.size = size;
             s_st.phase = want;
+            s_st.why = '-';
+            s_st.n = 0;
             ota_save();
         }
         ota_download(stn_id);
     }
 done:
     sim7600_http_get_close();
+}
+
+/* v6.9.64: at the start of every slot. New firmware from OTA (phase I, running, past its boot trial)
+ * must deliver a record within OTA_DELIVER_SLOTS slots: the bootloader's trial only proves that it
+ * runs and talks to the CTRL, not that it still reaches the server. Otherwise the previous firmware
+ * is put back (the bootloader keeps it), so a unit can't be left silent by an update. The first
+ * delivered slot ends this (ota_slot_step, phase I -> -). */
+void ota_slot_begin(void)
+{
+    if (!storage_sd_is_ok() || fw_app_trial_unconfirmed()) {
+        return;
+    }
+    ota_load();
+    if (s_st.phase != 'I' || s_st.image_crc != fw_app_running_crc()) {
+        return;
+    }
+    if (++s_st.n <= OTA_DELIVER_SLOTS) {
+        ota_save();
+        return;
+    }
+    ota_log("ERROR", "OTA: the new firmware delivered no record in 2 h: going back to the previous one");
+    s_st.why = 'N';
+    s_st.phase = 'F';
+    ota_save();
+    if (fw_journal_append(FW_J_REVERT_REQ, FW_OP_NONE, 0)) {
+        storage_log_flush();
+        vTaskDelay(1500 / portTICK_RATE_MS);
+        NVIC_SystemReset();
+    }
 }
