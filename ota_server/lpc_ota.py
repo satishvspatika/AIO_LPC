@@ -4,7 +4,7 @@
 same two requests.)
 
 Units (port 80, through nginx, paths under /lpc/):
-  GET /lpc/check?id=&p=&cc=&v=&c=&s=&t= -> "OTA NONE", "OTA FW <file bytes> <file crc> <image crc>" or
+  GET /lpc/check?id=&p=&cc=&v=&c=&s=&t=[&w=] -> "OTA NONE", "OTA FW <file bytes> <file crc> <image crc>" or
                                          (v6.9.63, cc = the CTRL's running image) "OTA CTRL <same three>"
   GET /lpc/fw?id=&c=<file crc>&o=<offset>&n=<bytes>
                                       -> "@<crc32 of the piece>\n" + the piece of the .hex file
@@ -103,6 +103,21 @@ def type_label(profile):
 ESP_MAX_IMAGE = 0x1B0000        # the 8 MB layout's app slot (the unit checks its own slot size too)
 MAX_UPLOAD = 2 * 1024 * 1024
 MAX_PIECE = 4096                # LPC units ask for 1 KB; ESP32 units for up to 4 KB
+# Why a unit gave an image up (e= with s=3; DWLR-D15-S.26, AIO9 6.61, LPC v6.9.64). {old}: what it runs now.
+FAIL_WHY = {
+    "C": "it crashed again and again on trial, so the unit went back to {old}",
+    "N": "it delivered no record in the 2 hours after it was installed, so the unit went back to {old}",
+    "B": "it did not start (the unit's boot check refused it), so the unit stayed on {old}",
+    "T": "the file is for another station type, so the unit did not install it",
+    "K": "the file failed the unit's image check, so it was not installed",
+    "D": "the file arrived damaged 3 times (SD card or flash fault?), so the unit stopped fetching it",
+    "X": "the unit could not write it to its flash, so it was not installed",
+    "": "it did not run, so the unit went back to {old}",
+}
+
+# The unit's own status changes worth an event (the rest are told by the server's events)
+UNIT_EVENT = {"4": "Refused the downloaded file (its check failed): tries again at the next check",
+              "5": "No working SD card: the unit can't update"}
 UNIT_STATUS = {"0": "idle", "1": "downloading", "2": "file ready, installing (ESP32: new firmware on trial)", "3": "install failed, went back",
                "4": "file refused", "5": "no SD card"}
 
@@ -326,6 +341,13 @@ def init_db():
         for col in ("ctrl_target", "ctrl_crc", "ctrl_offered", "ctrl_result"):
             if col not in cols:
                 con.execute(f"ALTER TABLE stations ADD COLUMN {col} TEXT DEFAULT ''")
+        # 22 Nov 2026: whether the unit can download now, as it says in its check (w=, DWLR-D15-S.25,
+        # AIO9 6.60, LPC v6.9.64): '' not said (older firmware), '0' ready, 'b<V>' battery low, 'q<n>' records waiting
+        if "wait" not in cols:
+            con.execute("ALTER TABLE stations ADD COLUMN wait TEXT DEFAULT ''")
+        # Only the newest EVENTS_PER_STATION events of each station are kept (user, 22 Nov 2026)
+        for r in con.execute("SELECT DISTINCT station FROM events WHERE station != ''").fetchall():
+            trim_events(con, r["station"])
 
 
 def add_event(con, station, text, profile=None):
@@ -334,7 +356,84 @@ def add_event(con, station, text, profile=None):
         row = con.execute("SELECT profile FROM stations WHERE shown_id=?", (station,)).fetchone()
         profile = row["profile"] if row else None
     con.execute("INSERT INTO events (at, station, text, profile) VALUES (?,?,?,?)", (int(time.time()), station, text, profile))
-    con.execute("DELETE FROM events WHERE id < (SELECT MAX(id) FROM events) - 2000")
+    if station:
+        trim_events(con, station)
+    else:
+        con.execute("DELETE FROM events WHERE station='' AND id < (SELECT MAX(id) FROM events) - 2000")
+
+
+EVENTS_PER_STATION = 10     # user, 22 Nov 2026: the last 10 events of each station; the health history shows the pattern
+
+
+def trim_events(con, station):
+    con.execute("DELETE FROM events WHERE station=? AND id NOT IN "
+                "(SELECT id FROM events WHERE station=? ORDER BY id DESC LIMIT ?)", (station, station, EVENTS_PER_STATION))
+
+
+def event_class(text):
+    """Colour of an event line: failures red, finished updates green (old and new wordings)."""
+    if text.startswith(("FAILED", "Update failed", "CTRL update failed", "Refused", "No working SD")):
+        return "badt"
+    if text.startswith(("UPDATED", "Updated", "CTRL updated")):
+        return "okt"
+    if text.startswith(("Download waiting", "Not downloading")):
+        return "waitt"
+    return ""
+
+
+# ---------------------------------------------------------------- can the unit download now (w=)
+OTA_MIN_BATTERY = {"ESP32": 3.7, "LPC1768": 11.0}   # as each firmware's OTA_MIN_BATTERY_V
+WAIT_VALUE = re.compile(r"0|b\d{1,2}\.\d{1,2}|q\d{1,6}")
+
+
+def wait_reason(w, profile):
+    """Why the unit won't download now, in words, or '' (ready, or not said)."""
+    if w.startswith("b"):
+        return f"battery {w[1:]} V is below the {OTA_MIN_BATTERY[family(profile)]} V a download needs"
+    if w.startswith("q"):
+        n = int(w[1:])
+        return f"{n} record{'s' if n != 1 else ''} still to send first"
+    return ""
+
+
+def first_check_firmware(profile):
+    """The first firmware of a type that says why it is not downloading (w=)."""
+    return "DWLR-D15-S.25" if profile in DWLR_TYPES else "6.60" if profile in ESP_TYPES else "v6.9.64"
+
+
+def check_times(profile, stn_no):
+    """The unit's two daily checks as (hour, minute): 01:00/13:00 (ESP32) or 00:30/12:30 (LPC1768), later by
+    station number (15 min steps over 4 or 8 slots, as ota_due() / check_slot() in the firmware)."""
+    if profile in ESP_TYPES:
+        base, spread = ((1, 0), (13, 0)), 4
+    else:
+        base, spread = ((0, 30), (12, 30)), 8
+    off = (stn_no % spread) * 15
+    return [((h * 60 + m + off) // 60, (m + off) % 60) for h, m in base]
+
+
+def next_check(s, now=None):
+    """'about 13:15 today' / 'within 15 min': when the unit asks the server next."""
+    if s["unit_status"] in ("1", "2"):
+        return "within 15 minutes (it checks every slot while downloading)"
+    now = now or time.time()
+    digits = re.sub(r"\D", "", sid(s)) or "0"
+    lt = time.localtime(now)
+    best = None
+    for day in (0, 1):
+        for h, m in check_times(s["profile"], int(digits)):
+            t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + day, h, m, 0, 0, 0, -1)) + 5 * 60
+            if t > now and (best is None or t < best):
+                best = t
+    if best is None:
+        return "at its next check"
+    day = "today" if time.localtime(best).tm_mday == lt.tm_mday else "tomorrow"
+    return f"about {time.strftime('%H:%M', time.localtime(best))} {day}"
+
+
+def build_version(con, build_id):
+    b = con.execute("SELECT version FROM builds WHERE id=?", (int(build_id),)).fetchone() if str(build_id).isdigit() else None
+    return f"{b['version']} (file #{build_id})" if b else f"file #{build_id}"
 
 
 def station_key(stn_id):
@@ -382,6 +481,7 @@ HEALTH_FIELDS = [   # (field, label, unit)
     ("sd", "SD card", ""),                          # 1 working, 0 fault
     ("ctrl", "CTRL firmware", ""),
     ("clk", "Clock corrected by", "s"),
+    ("pon", "Power-ons since last report", ""),     # ESP32 (DWLR-D15-S.26, AIO9 6.61): battery changed or ran flat, power cut
     ("sens", "Sensors", ""),                        # TWS: e.g. TH-OK,WS-OK,WD-OK
     ("gps", "Location", ""),                        # lat,lon
     ("ok", "Slots sent on time, 24 h", "of 96"),    # v6.9.60-61 only (shown when sent)
@@ -411,6 +511,7 @@ HEALTH_RULES = [    # (field, needs a look if, class, text)
     ("miss", lambda v: _f(v) >= 4, "wait", lambda v: f"{v} slots missed"),
     ("q", lambda v: _f(v) >= 4, "wait", lambda v: f"{v} records waiting"),
     ("sig", lambda v: _f(v) <= -105, "wait", lambda v: f"Weak signal {v} dBm"),
+    ("pon", lambda v: _f(v) > 0, "wait", lambda v: f"{v} power-on(s): battery changed or ran flat, or power cut"),
 ]
 
 # ESP32 AIO9 stations (firmware 6.57 on) run on a single Li-ion cell (4.2 V full), not the LPC units'
@@ -449,24 +550,31 @@ def unit_check(q, ip):
     status = q.get("s", "0")[:1]
     tried = q.get("t", "").upper()[:8]
     cc = q.get("cc", "").upper()[:8]
+    wait = q.get("w", "")
+    if not WAIT_VALUE.fullmatch(wait):
+        wait = ""
+    why = q.get("e", "")[:1].upper()     # 22 Nov 2026: with s=3, why the unit gave that image up
     key = station_key(stn)
     now = int(time.time())
     with _db_lock, db() as con:
         st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
+        prev_wait = (st["wait"] or "") if st is not None else ""
         if st is None:
             con.execute("INSERT INTO stations (key, shown_id, profile, version, running_crc, unit_status, tried_crc,"
-                        " last_seen, last_ip) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (key, stn, profile, version, crc, status, tried, now, ip))
-            add_event(con, stn, f"first check-in: {TYPES.get(profile, '?')} {version} ({crc})", profile)
+                        " last_seen, last_ip, wait) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (key, stn, profile, version, crc, status, tried, now, ip, wait))
+            add_event(con, stn, f"First check-in: {TYPES.get(profile, '?')}, running {version}", profile)
             st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
         else:
             if st["running_crc"] != crc:
-                add_event(con, stn, f"now running {version} ({crc}), was {st['version']} ({st['running_crc']})")
-            if st["unit_status"] != status:
-                add_event(con, stn, f"unit says: {UNIT_STATUS.get(status, status)}")
+                same = version == st["version"]
+                add_event(con, stn, f"Now running {version}" + (f" (a different build, was {st['running_crc']})" if same
+                                                                 else f" (was {st['version']})"))
+            if st["unit_status"] != status and status in UNIT_EVENT:
+                add_event(con, stn, UNIT_EVENT[status])
             con.execute("UPDATE stations SET shown_id=?, profile=?, version=?, running_crc=?, unit_status=?,"
-                        " tried_crc=?, last_seen=?, last_ip=? WHERE key=?",
-                        (stn, profile, version, crc, status, tried, now, ip, key))
+                        " tried_crc=?, last_seen=?, last_ip=?, wait=? WHERE key=?",
+                        (stn, profile, version, crc, status, tried, now, ip, wait, key))
             st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
         store_health(con, key, q, now)
         build = target_build(con, st)
@@ -480,25 +588,34 @@ def unit_check(q, ip):
         elif build["image_crc"] == crc and status == "2" and profile in ESP_TYPES:
             # ESP32: running the new image but still on trial (kept only once it has sent a record)
             if not result.startswith("on trial"):
-                add_event(con, stn, f"on trial: build {build['id']} {build['version']} ({crc}) started, waiting for its first record")
+                add_event(con, stn, f"Installed {build['version']}: on trial until it sends its first record")
             result = "on trial: running the new firmware, not confirmed yet"
         elif build["image_crc"] == crc:
             if st["offered_crc"] == crc and not result.startswith("updated"):
-                add_event(con, stn, f"UPDATED to build {build['id']} {build['version']} ({crc})")
+                add_event(con, stn, f"Updated to {build['version']}: running and confirmed")
             result = "updated: running the target" if st["offered_crc"] == crc else "running the target"
         elif status == "3" and tried == build["image_crc"]:
+            text = FAIL_WHY.get(why, FAIL_WHY[""]).format(old=version)
             if not result.startswith("FAILED"):
-                add_event(con, stn, f"FAILED: build {build['id']} did not run and the unit went back")
-            result = "FAILED: the unit went back to its old firmware. Upload a new build to try again"
+                add_event(con, stn, f"Update failed: {build['version']}: {text}")
+            result = f"FAILED: {text}"
         else:
             reply = f"OTA FW {build['size']} {build['file_crc']} {build['image_crc']}\n"
             offered = build["image_crc"]
+            hold = wait_reason(wait, profile)
             if st["offered_crc"] != offered:
-                add_event(con, stn, f"offered build {build['id']} {build['version']} ({offered})")
+                add_event(con, stn, f"Offered {build['version']} (file #{build['id']}, {build['size'] // 1024} KB)"
+                          + (f": the unit waits, {hold}" if hold else ""))
                 # a different file than last offered: the unit starts it from 0, so must the page
                 # (the old file's progress was shown against the new file's size)
                 con.execute("UPDATE stations SET progress=0 WHERE key=?", (key,))
-            result = "offered, waiting for the unit"
+            elif hold and wait != prev_wait:
+                add_event(con, stn, f"Download waiting: {hold}")
+            if st["offered_crc"] == offered and status == "1" and (st["progress"] or 0) > 0:
+                # part-way through: still a download (it showed "Starting download" again after every check)
+                result = f"downloading: {100 * st['progress'] // build['size']}%"
+            else:
+                result = "offered, waiting for the unit"
         if offered:
             con.execute("UPDATE stations SET offered_crc=?, result=? WHERE key=?", (offered, result, key))
         else:
@@ -520,11 +637,11 @@ def ctrl_check(con, st, stn, cc, status, tried):
     result, offered, reply = st["ctrl_result"] or "", None, None
     if cc == b["image_crc"]:
         if st["ctrl_offered"] == cc and not result.startswith("updated"):
-            add_event(con, stn, f"UPDATED CTRL to {b['version']} ({cc})")
+            add_event(con, stn, f"CTRL updated to {b['version']}: running")
         result = "updated: running the target" if st["ctrl_offered"] == cc else "running the target"
     elif status == "3" and tried == b["image_crc"]:
         if not result.startswith("FAILED"):
-            add_event(con, stn, f"FAILED: CTRL {b['version']} did not run and the CTRL went back")
+            add_event(con, stn, f"CTRL update failed: {b['version']} did not run, so the CTRL went back")
         result = "FAILED: the CTRL went back to its old firmware. Upload a new CTRL file to try again"
     elif not re.fullmatch(r"[0-9A-F]{8}", cc) or cc == "00000000":
         result = "waiting: the unit needs main firmware v6.9.63 or later first"
@@ -532,7 +649,7 @@ def ctrl_check(con, st, stn, cc, status, tried):
         reply = f"OTA CTRL {b['size']} {b['file_crc']} {b['image_crc']}\n"
         offered = b["image_crc"]
         if st["ctrl_offered"] != offered:
-            add_event(con, stn, f"offered CTRL {b['version']} ({offered})")
+            add_event(con, stn, f"Offered CTRL {b['version']} ({b['size'] // 1024} KB)")
         result = "offered, waiting for the unit"
     con.execute("UPDATE stations SET ctrl_result=?" + (", ctrl_offered=?" if offered else "") + " WHERE key=?",
                 (result, offered, st["key"]) if offered else (result, st["key"]))
@@ -563,8 +680,15 @@ def unit_piece(q):
         return 416, b"OTA END\n"
     with _db_lock, db() as con:
         col = "ctrl_result" if build["profile"] == CTRL_PROFILE else "result"
+        st = con.execute("SELECT shown_id, progress FROM stations WHERE key=?", (station_key(stn),)).fetchone()
         con.execute(f"UPDATE stations SET progress=?, {col}=? WHERE key=?",
                     (off + len(piece), f"downloading: {100 * (off + len(piece)) // build['size']}%", station_key(stn)))
+        if st is not None:
+            what = ("CTRL " if build["profile"] == CTRL_PROFILE else "") + build["version"]
+            if off == 0 and (st["progress"] or 0) <= len(piece):     # not a first piece fetched again
+                add_event(con, st["shown_id"], f"Download of {what} started")
+            if off + len(piece) >= build["size"] > (st["progress"] or 0):
+                add_event(con, st["shown_id"], f"Downloaded all of {what} ({build['size'] // 1024} KB): installs when the slot ends")
     if build["profile"] != CTRL_PROFILE:
         note_piece(station_key(stn), off + len(piece))
     return 200, b"@%08X\n" % (zlib.crc32(piece) & 0xFFFFFFFF) + piece
@@ -610,13 +734,13 @@ def password_ok(user, pw):
 PAGE_CSS = """
 :root{color-scheme:light;--bg:#f3f5f9;--card:#fff;--ink:#141b26;--mute:#5f6b7d;--line:#e3e8ef;--soft:#f7f9fc;--acc:#2563eb;--acc-ink:#fff;--acc-soft:#e8efff;
 --ok:#137a4b;--ok-bg:#e3f5ea;--bad:#b42318;--bad-bg:#fdeceb;--wait:#975a00;--wait-bg:#fff3dc;--busy:#1d5fd1;--busy-bg:#e6efff;--off-bg:#eef1f5;
---esp:#16725d;--lpc:#3b4a85;--dwlr:#9a5b13;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06)}
+--esp:#16725d;--lpc:#3b4a85;--dwlr:#9a5b13;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06)}
 @media (prefers-color-scheme: dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1117;--card:#161c25;--ink:#e7ebf1;--mute:#9aa5b5;--line:#273141;--soft:#1b2330;--acc:#5b9cff;--acc-ink:#0b1220;--acc-soft:#16294a;
 --ok:#4cc68d;--ok-bg:#11301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#222a35;
---esp:#1f8a71;--lpc:#4f62ad;--dwlr:#a8641c;--shadow:none}}
+--esp:#1f8a71;--lpc:#4f62ad;--dwlr:#a8641c;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--shadow:none}}
 :root[data-theme=dark]{color-scheme:dark;--bg:#0d1117;--card:#161c25;--ink:#e7ebf1;--mute:#9aa5b5;--line:#273141;--soft:#1b2330;--acc:#5b9cff;--acc-ink:#0b1220;--acc-soft:#16294a;
 --ok:#4cc68d;--ok-bg:#11301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#222a35;
---esp:#1f8a71;--lpc:#4f62ad;--dwlr:#a8641c;--shadow:none}
+--esp:#1f8a71;--lpc:#4f62ad;--dwlr:#a8641c;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--shadow:none}
 *{box-sizing:border-box}[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
 header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
@@ -677,7 +801,7 @@ tr:last-child td{border-bottom:0}table.list tbody tr:hover td,table.list tr:hove
 table.list td{vertical-align:middle}td.nw{white-space:nowrap}
 code,.crc{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--mute)}
 a{color:var(--acc)}td a{text-decoration:none}td a:hover{text-decoration:underline}
-.mute{color:var(--mute)}.okt{color:var(--ok)}.badt{color:var(--bad)}
+.mute{color:var(--mute)}.okt{color:var(--ok)}.badt{color:var(--bad)}.waitt{color:var(--wait)}
 .steps{margin:0 0 14px;padding-left:20px;color:var(--mute);font-size:14px}.steps li{margin:3px 0}
 details summary{cursor:pointer;color:var(--acc);font-size:14px;font-weight:600}
 .login{max-width:380px;margin:12vh auto}.login input{width:100%;margin-bottom:10px}.login button{width:100%;padding:10px}
@@ -796,7 +920,7 @@ THEME_SWITCH_JS = ("<script>(function(){var r=document.documentElement,bs=docume
 def page(title, body, tab=None, message="", script="", ptype=None, type_bar_shown=True):
     head = (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title>"
-            f"<style>{PAGE_CSS}</style>{THEME_HEAD_JS}</head><body>")
+            f"<style>{PAGE_CSS}{HEALTH_CHART_CSS}</style>{THEME_HEAD_JS}</head><body>")
     if tab is None:
         return (head + f"<main>{body}</main></body></html>").encode()
     tq = f"&type={ptype}" if ptype in TYPES else ""
@@ -839,6 +963,11 @@ def ctrl_state(s, b):
     if res.startswith("waiting: the unit needs"):
         return "wait", "CTRL: needs v6.9.63 first"
     if res.startswith("offered"):
+        why = wait_reason(s["wait"] or "", s["profile"])
+        if why:
+            return "wait", f"CTRL waiting: {why}"
+        if time.time() - (s["last_seen"] or 0) >= OFFER_START_S:
+            return "wait", f"CTRL offered, not started: asks again {next_check(s)}"
         return "busy", "CTRL: starting download"
     return "wait", f"CTRL {b['version']} at next check"
 
@@ -853,7 +982,8 @@ def station_state(s, build):
     res = s["result"] or ""
     us = s["unit_status"]
     if res.startswith("FAILED"):
-        return "bad", "Update failed", "The new firmware did not run, so the unit went back to its old one. Upload a new build to try again.", None
+        text = res.split(": ", 1)[-1] if ": " in res else "the unit went back to its old firmware"
+        return "bad", "Update failed", text[:1].upper() + text[1:].rstrip(".") + ". It won't take this file again: upload a new build to try again.", None
     if res.startswith("target is for another"):
         return "bad", "Wrong type", "The chosen firmware is for a different station type. Choose another.", None
     if us == "4":
@@ -876,18 +1006,67 @@ def station_state(s, build):
         pct = s["progress"] * 100 // build["size"] if build["size"] else 0
         pct = max(0, min(100, pct))
         if pct >= 100:
+            if s["profile"] in DWLR_TYPES:
+                return ("busy", "Downloaded", "Checked; it installs when this slot ends and reports the new version "
+                        "in the next slot.", 100)
             if s["profile"] in ESP_TYPES:
                 return ("busy", "Downloaded", "Checked; it installs when this slot ends. From firmware 6.56c the unit "
                         "reports the new version in the next slot; older firmware reports it at its next "
                         "twice-a-day check (13:00 or 01:00, up to 45 min later by station number).", 100)
             return ("busy", "Downloaded", "Installs when this slot ends, then reports the new version at its next "
                     "check (12:30-14:15 or 00:30-02:15).", 100)
-        return "busy", f"Downloading {pct}%", dl_text(s, build), pct
+        why = wait_reason(s["wait"] or "", s["profile"])
+        text = dl_text(s, build)
+        if why and "KB/s" not in text:
+            return ("wait", f"Download paused {pct}%", f"{text}. The unit goes on once nothing holds it back: {why}. "
+                    f"Next check {next_check(s)}.", pct)
+        return "busy", f"Downloading {pct}%", text, pct
     if us == "2":
         return "busy", "Installing", "", None
     if res.startswith("offered"):
-        return "busy", "Starting download", "", None
-    return "wait", "Waiting for next check", f"It will get {build['version']} at its next check.", None
+        return offered_state(s, build)
+    return "wait", "Waiting for next check", f"It gets {build['version']} at its next check, {next_check(s)}.", None
+
+
+OFFER_START_S = 10 * 60     # a unit that is ready asks for the first piece within seconds of the offer
+
+
+def offered_state(s, build):
+    """The unit was offered the file at its last check and has not asked for any of it: why, in words.
+    From DWLR-D15-S.25 / AIO9 6.60 / LPC v6.9.64 the unit says in the check whether it can download (w=)."""
+    w = s["wait"] or ""
+    at = time.strftime("%H:%M", time.localtime(s["last_seen"])) if s["last_seen"] else "?"
+    nxt = next_check(s)
+    if w.startswith("b"):
+        return ("wait", "Waiting: battery low",
+                f"Offered {build['version']} at {at}. The unit won't download yet: {wait_reason(w, s['profile'])}. "
+                f"It asks again at its next check, {nxt}.", None)
+    if w.startswith("q"):
+        return ("wait", "Waiting: records to send",
+                f"Offered {build['version']} at {at}. The unit won't download yet: {wait_reason(w, s['profile'])}. "
+                f"It asks again at its next check, {nxt}.", None)
+    if time.time() - (s["last_seen"] or 0) < OFFER_START_S:
+        return "busy", "Starting download", f"Offered {build['version']} at {at}: the unit is starting the download.", None
+    if w == "0":
+        return ("wait", "Download not started",
+                f"Offered {build['version']} at {at}. The unit was ready but asked for none of the file, so the "
+                f"answer most likely did not reach it on a weak network. It asks again at its next check, {nxt}.", None)
+    return ("wait", "Offered, not started",
+            f"Offered {build['version']} at {at}, but the unit asked for none of the file. Its firmware "
+            f"({s['version'] or '?'}) doesn't say why: most often a low battery or records still to send, sometimes "
+            f"a lost answer on a weak network. From {first_check_firmware(s['profile'])} on it says which. "
+            f"It asks again at its next check, {nxt}.", None)
+
+
+def short_text(s, label, build):
+    """The line under the pill in the stations list: download progress, or why it waits and until when."""
+    if label.startswith(("Downloading", "Download paused")):
+        return dl_text(s, build)
+    if label.startswith(("Waiting", "Download not started", "Offered, not started")):
+        w = s["wait"] or ""
+        why = f"Battery {w[1:]} V · " if w.startswith("b") else f"{w[1:]} records waiting · " if w.startswith("q") else ""
+        return why + "next check " + next_check(s).replace("about ", "~").replace(" (it checks every slot while downloading)", "")
+    return ""
 
 
 def dl_text(s, build):
@@ -906,13 +1085,17 @@ def dl_text(s, build):
 UPDATE_STEPS = ("Sent", "Downloading", "Installing", "Updated")
 
 
+DOWNLOAD_LABELS = ("Downloading", "Download paused", "Starting download", "Waiting: ", "Download not started", "Offered, not started")
+STOPPABLE_LABELS = ("Waiting for next check",) + DOWNLOAD_LABELS
+
+
 def update_step(label):
     """Where the update is, for the stepper: 1-4 the step it is at (5 all done), -n failed at step n, 0 none."""
     if label.startswith(("Updated", "Up to date")):
         return 5
     if label.startswith(("On trial", "Downloaded", "Installing")):
         return 3
-    if label.startswith(("Downloading", "Starting download")):
+    if label.startswith(DOWNLOAD_LABELS):
         return 2
     if label.startswith("Waiting for next check"):
         return 1
@@ -937,7 +1120,7 @@ def live_row(s, build, ctrl):
     cls, label, detail, pct = station_state(s, build)
     a = attention(s, health_of(s))
     return {"k": s["key"], "cls": cls, "label": label, "detail": detail, "pct": pct,
-            "short": dl_text(s, build) if label.startswith("Downloading") else "",
+            "short": short_text(s, label, build),
             "step": update_step(label), "seen": when(s["last_seen"]), "ver": s["version"] or "—",
             "crc": s["running_crc"] or "", "dot": a[0][0] if a else "ok",
             "dot_t": ", ".join(t for _, t in a), "ctrl": list(ctrl) if ctrl else None, "busy": cls == "busy"}
@@ -970,7 +1153,7 @@ function each(el,sel,f){el.querySelectorAll(sel).forEach(f);}
 function apply(d){
   d.rows.forEach(function(r){
     document.querySelectorAll('[data-k="'+r.k+'"]').forEach(function(el){
-      each(el,'.js-pill',function(p){p.className='pill js-pill '+r.cls;p.textContent=r.label;});
+      each(el,'.js-pill',function(p){p.className='pill js-pill '+r.cls;p.textContent=r.label;p.title=r.detail||'';});
       each(el,'.js-bar',function(b){b.hidden=(r.pct===null);b.firstElementChild.style.width=(r.pct||0)+'%%';
         b.classList.toggle('live',r.cls==='busy'&&r.pct!==null&&r.pct<100);});
       each(el,'.js-pct',function(p){p.textContent=r.pct===null?'':r.pct+'%%';});
@@ -1056,6 +1239,56 @@ def attention(s, h):
     return out
 
 
+def silent_text(s, h):
+    """For a station not heard from for over STALE_AFTER_S: what its last check and report said, so the
+    likely reason is on the page rather than unknown (user, 22 Nov 2026). '' while it checks in."""
+    now = int(time.time())
+    if not s["last_seen"] or now - s["last_seen"] <= STALE_AFTER_S:
+        return ""
+    esp = s["profile"] in ESP_TYPES
+    low, flat = (3.6, 3.4) if esp else (11.5, 11.0)
+    seen = []
+    clues = []
+    bat = [(_num(h, k), n) for k, n in (("bmin", "lowest"), ("bn", "night average"), ("bv", "at the check"))]
+    bat = [(v, n) for v, n in bat if v is not None]
+    if bat:
+        seen.append("battery " + ", ".join(f"{v:g} V {n}" for v, n in bat))
+        if min(v for v, _ in bat) < low:
+            clues.append("the battery was low: it may have run flat (the modem stays off below "
+                         f"{flat:g} V, so the unit can't send even while it still logs)")
+    w = s["wait"] or ""
+    if w.startswith("b"):
+        clues.append(f"at its last check the battery was {w[1:]} V")
+    sig = _num(h, "sig")
+    if sig is not None:
+        seen.append(f"signal {sig:g} dBm")
+        if sig <= -105:
+            clues.append("the signal was weak: the network may have dropped it")
+    q = _num(h, "q")
+    if q:
+        seen.append(f"{q:g} records waiting")
+    for k, n in (("rst", "fault restarts"), ("wdt", "watchdog restarts"), ("pon", "power-ons")):
+        v = _num(h, k)
+        if v:
+            seen.append(f"{v:g} {n}")
+            clues.append(f"it had {v:g} {n} before")
+    if h.get("sd") == "0":
+        clues.append("its SD card had a fault")
+    res = s["result"] or ""
+    if s["unit_status"] == "2" or res.startswith("on trial"):
+        clues.append("it had just installed new firmware: if that firmware can't send, the unit goes back to the old "
+                     "one by itself within about 2 hours and is heard again")
+    elif res.startswith("downloading") or s["unit_status"] == "1":
+        clues.append("it was downloading firmware (that never stops it sending its records)")
+    hours = (now - s["last_seen"]) // 3600
+    text = f"Not heard from for {hours} h (last check {when(s['last_seen'])})."
+    if seen:
+        text += f" Its last report ({when(s['health_at'])}): " + ", ".join(seen) + "."
+    text += (" Likely: " + "; ".join(clues) + "." if clues else
+             " Nothing in its last report points to a cause: check power, antenna and SIM on site.")
+    return text
+
+
 def fmt_health(key, v):
     if v is None or v == "":
         return "<span class='mute'>—</span>"
@@ -1132,6 +1365,11 @@ def status_text(h):
         pass
     if h.get("sd") == "0":
         bad.append("SD card fault")
+    try:
+        if int(h.get("pon") or 0):
+            bad.append(f"{h['pon']} power-on(s)")
+    except ValueError:
+        pass
     if not bad and h.get("hs") not in (None, "", "OK"):
         bad.append(h["hs"].replace(".", ", "))
     if not h:
@@ -1166,6 +1404,8 @@ def health_rows(s, h):
         ("Time on per slot", _v(h, "dur", "s")),
         ("Clock corrected by", _v(h, "clk", "s")),
     ]
+    if h.get("pon") not in (None, ""):
+        rows.append(("Power-ons since last report", _v(h, "pon")))
     if h.get("sv"):
         rows.append(("Solar", _v(h, "sv", "V")))
     if h.get("sens"):
@@ -1185,6 +1425,227 @@ HISTORY_COLS = [
     ("Carrier", lambda d: _v(d, "op")),
     ("Status", status_text),
 ]
+
+
+# ---------------------------------------------------------------- health history charts (user, 22 Nov 2026)
+# Server-drawn SVG, one small chart per measure (one axis each), a point per reported day. Hover shows
+# the day's values. Colours: categorical slots 1-3 (validated palette, light and dark), text stays ink.
+CHART_DAYS = 30
+
+
+def _num(d, k):
+    try:
+        return float(d[k])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _day_of(r, d):
+    """(sort key, axis label, tooltip title) of a report: the MET day it covers, or the day it came."""
+    v = d.get("day") or ""
+    if re.fullmatch(r"\d{8}", v):
+        try:
+            t = time.mktime(time.strptime(v, "%Y%m%d")) - 86400
+            return v, time.strftime("%d %b", time.localtime(t)), fmt_health_plain_day(v)
+        except ValueError:
+            pass
+    t = time.localtime(r["at"])
+    return time.strftime("%Y%m%d", t), time.strftime("%d %b", t), "Report of " + time.strftime("%d %b %H:%M", t)
+
+
+def fmt_health_plain_day(v):
+    t = time.mktime(time.strptime(v, "%Y%m%d"))
+    return (time.strftime("%d %b", time.localtime(t - 86400)) + " 08:45 to "
+            + time.strftime("%d %b", time.localtime(t)) + " 08:30")
+
+
+def _ticks(lo, hi, n=3):
+    """About n round tick values covering lo..hi, and the range they span."""
+    if hi <= lo:
+        hi = lo + 1
+    raw = (hi - lo) / n
+    mag = 10 ** int(f"{raw:e}".split("e")[1])
+    step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
+    start = step * int(lo // step)
+    ticks = []
+    v = start
+    while v < hi + step * 0.999:
+        ticks.append(round(v, 6))
+        v += step
+    return ticks, ticks[0], ticks[-1]
+
+
+def _fmt(v):
+    return f"{v:g}"
+
+
+def health_chart(title, unit, days, series, kind="line", ref=None, y_min=None, y_max=None):
+    """One chart. days: [(label, tip title, {key: value})]; series: [(key, name, css var)].
+    kind 'line' or 'bar' (bars stack in series order). ref: (value, label) dashed guide line."""
+    W, H, L, R, T, B = 560, 190, 44, 92, 12, 26
+    pw, ph = W - L - R, H - T - B
+    n = len(days)
+    vals = [d[2].get(k) for d in days for k, _, _ in series if d[2].get(k) is not None]
+    if not vals:
+        return ""
+    if kind == "bar":
+        tops = [sum(d[2].get(k) or 0 for k, _, _ in series) for d in days]
+        lo, hi = 0, max(tops + [ref[0] if ref else 0, 1])
+    else:
+        lo, hi = min(vals + ([ref[0]] if ref else [])), max(vals + ([ref[0]] if ref else []))
+        pad = (hi - lo) * 0.15 or abs(hi) * 0.02 or 1
+        lo, hi = lo - pad, hi + pad
+    if y_min is not None:
+        lo = y_min
+    if y_max is not None:
+        hi = max(hi, y_max)
+    ticks, lo, hi = _ticks(lo, hi)
+    step = pw / n
+
+    def x(i):
+        return L + step * (i + 0.5)
+
+    def y(v):
+        return T + ph - (v - lo) / (hi - lo) * ph
+
+    o = [f"<figure class='hc'><figcaption><b>{esc(title)}</b>" + (f" <span class='mute'>{esc(unit)}</span>" if unit else "")]
+    side = []       # labels right of the plot: [y, text, css class], spread apart below
+    if len(series) > 1:
+        o.append("<span class='hc-leg'>" + "".join(
+            f"<span><i style='background:var({c})'></i>{esc(nm)}</span>" for _, nm, c in series) + "</span>")
+    o.append(f"</figcaption><svg viewBox='0 0 {W} {H}' role='img' aria-label='{esc(title)}, last {n} days'>")
+    for t in ticks:
+        o.append(f"<line class='hc-grid' x1='{L}' x2='{L + pw}' y1='{y(t):.1f}' y2='{y(t):.1f}'/>"
+                 f"<text class='hc-ax' x='{L - 6}' y='{y(t) + 4:.1f}' text-anchor='end'>{_fmt(t)}</text>")
+    every = max(1, -(-n // 7))
+    for i, (lab, _, _) in enumerate(days):
+        if (n - 1 - i) % every == 0:
+            o.append(f"<text class='hc-ax' x='{x(i):.1f}' y='{H - 8}' text-anchor='middle'>{esc(lab)}</text>")
+    if ref is not None and lo <= ref[0] <= hi:
+        o.append(f"<line class='hc-ref' x1='{L}' x2='{L + pw}' y1='{y(ref[0]):.1f}' y2='{y(ref[0]):.1f}'/>"
+                 )
+        side.append([y(ref[0]) + 4, ref[1], "hc-ax"])
+    if kind == "bar":
+        bw = max(3.0, min(22.0, step - 4))
+        for i, (_, _, d) in enumerate(days):
+            base = 0.0
+            parts = [(k, c, d.get(k)) for k, _, c in series if d.get(k)]
+            for j, (k, c, v) in enumerate(parts):
+                y0, y1 = y(base), y(base + v)
+                top = j == len(parts) - 1
+                hgt = max(0.0, y0 - y1 - (0 if j == 0 else 2))
+                r_ = min(4.0, bw / 2, hgt) if top else 0
+                xl = x(i) - bw / 2
+                if r_:
+                    o.append(f"<path fill='var({c})' d='M{xl:.1f},{y1 + hgt:.1f}V{y1 + r_:.1f}q0,-{r_:.1f} {r_:.1f},-{r_:.1f}"
+                             f"H{xl + bw - r_:.1f}q{r_:.1f},0 {r_:.1f},{r_:.1f}V{y1 + hgt:.1f}Z'/>")
+                else:
+                    o.append(f"<rect fill='var({c})' x='{xl:.1f}' y='{y1:.1f}' width='{bw:.1f}' height='{hgt:.1f}'/>")
+                base += v
+    else:
+        for k, nm, c in series:
+            pts = [(x(i), y(d.get(k))) if d.get(k) is not None else None for i, (_, _, d) in enumerate(days)]
+            seg, segs = [], []
+            for p in pts:
+                if p is None:
+                    if seg:
+                        segs.append(seg)
+                    seg = []
+                else:
+                    seg.append(p)
+            if seg:
+                segs.append(seg)
+            for sg in segs:
+                if len(sg) > 1:
+                    o.append(f"<polyline class='hc-line' style='stroke:var({c})' points='"
+                             + " ".join(f"{a:.1f},{b:.1f}" for a, b in sg) + "'/>")
+            for p in pts:
+                if p:
+                    o.append(f"<circle class='hc-dot' cx='{p[0]:.1f}' cy='{p[1]:.1f}' r='4' style='fill:var({c})'/>")
+            last = next((p for p in reversed(pts) if p), None)
+            if last and len(series) > 1:     # direct label at the newest point
+                side.append([last[1] + 4, nm, "hc-lab"])
+    side.sort()
+    for a in range(1, len(side)):           # at least 14 px between labels, pushed down
+        side[a][0] = max(side[a][0], side[a - 1][0] + 14)
+    over = side[-1][0] - (T + ph + 4) if side else 0
+    for lab in side:                        # and back up if the last one fell off the plot
+        lab[0] -= max(0, over)
+    o += [f"<text class='{c}' x='{L + pw + 6}' y='{yy:.1f}'>{esc(t)}</text>" for yy, t, c in side]
+    for i, (lab, tip, d) in enumerate(days):
+        lines = [tip] + [f"{nm}: " + (_fmt(d[k]) + (f" {unit}" if unit else "") if d.get(k) is not None else "—")
+                         for k, nm, _ in series]
+        o.append(f"<rect class='hc-hit' x='{L + step * i:.1f}' y='{T}' width='{step:.1f}' height='{ph}' "
+                 f"data-tip='{esc(chr(10).join(lines))}'/>")
+    o.append("</svg></figure>")
+    return "".join(o)
+
+
+def health_charts(reports, profile):
+    """The charts of a station's last CHART_DAYS daily reports (newest report of each day), oldest first."""
+    by_day = {}
+    for r in reports:
+        try:
+            d = json.loads(r["data"])
+        except ValueError:
+            continue
+        key, lab, tip = _day_of(r, d)
+        if key not in by_day or r["at"] > by_day[key][0]:
+            vals = {k: _num(d, k) for k in ("bd", "bn", "bmin", "bv", "sent", "sig", "ne", "q")}
+            vals["restarts"] = (_num(d, "wdt") or 0) + (_num(d, "rst") or 0) if (d.get("wdt") or d.get("rst")) else None
+            vals["pon"] = _num(d, "pon")
+            vals["notsent"] = 96 - vals["sent"] if vals["sent"] is not None else None
+            by_day[key] = (r["at"], lab, tip, vals)
+    days = [(lab, tip, v) for _, (_, lab, tip, v) in sorted(by_day.items())][-CHART_DAYS:]
+    if not days:
+        return ""
+    vmin = OTA_MIN_BATTERY[family(profile)]
+    bat = [("bd", "Day average", "--s1"), ("bn", "Night average", "--s2"), ("bmin", "Lowest", "--s3")]
+    if not any(d[2].get(k) is not None for d in days for k, _, _ in bat):
+        bat = [("bv", "At the check", "--s1")]
+    charts = [
+        health_chart("Battery", "V", days, bat, ref=(vmin, f"download {vmin:g} V")),
+        health_chart("Records sent of 96", "", days, [("sent", "Sent", "--s1")], kind="bar",
+                     ref=(92, "needs a look"), y_max=96),
+        health_chart("Signal", "dBm", days, [("sig", "Signal", "--s1")], ref=(-105, "weak")),
+        health_chart("Errors, restarts and power-ons", "", days,
+                     [("ne", "Errors", "--s1"), ("restarts", "Fault restarts", "--s2"), ("pon", "Power-ons", "--s3")],
+                     kind="bar"),
+    ]
+    charts = [c for c in charts if c]
+    if not charts:
+        return ""
+    span = f"{len(days)} day{'s' if len(days) != 1 else ''}"
+    return (f"<p class='hint'>One point per reported day, the newest on the right ({span}). "
+            "Point at a day to see its values.</p><div class='hc-grid-wrap'>" + "".join(charts) + "</div>")
+
+
+HEALTH_CHART_CSS = """
+.hc-grid-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px 22px}
+.hc{margin:0;min-width:0;position:relative}.hc figcaption{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:baseline;font-size:14px;margin-bottom:4px}
+.hc-leg{display:flex;gap:12px;flex-wrap:wrap;color:var(--mute);font-size:12px}.hc-leg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.hc svg{width:100%;height:auto;display:block;overflow:visible}
+.hc-grid{stroke:var(--line);stroke-width:1}.hc-ref{stroke:var(--mute);stroke-width:1;stroke-dasharray:4 4;opacity:.8}
+.hc-ax{fill:var(--mute);font-size:11px}.hc-lab{fill:var(--ink);font-size:11px}
+.hc-line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.hc-dot{stroke:var(--card);stroke-width:2}
+.hc-hit{fill:transparent;cursor:crosshair}.hc-hit:hover{fill:var(--ink);fill-opacity:.06}
+.hc-tip{position:fixed;z-index:20;pointer-events:none;background:var(--card);color:var(--ink);border:1px solid var(--line);
+border-radius:8px;padding:6px 10px;font-size:12px;line-height:1.5;white-space:pre;box-shadow:0 4px 14px rgba(0,0,0,.15)}
+.hc-tip b{display:block}
+details.tbl summary{cursor:pointer;color:var(--acc);font-weight:600;font-size:14px;margin-top:14px}
+"""
+
+HEALTH_CHART_JS = """<script>
+(function(){var tip=null;
+document.addEventListener('mouseover',function(e){var t=e.target;if(!t.classList||!t.classList.contains('hc-hit'))return;
+ if(!tip){tip=document.createElement('div');tip.className='hc-tip';document.body.appendChild(tip);}
+ var l=t.getAttribute('data-tip').split('\\n');tip.innerHTML='';var b=document.createElement('b');b.textContent=l[0];tip.appendChild(b);
+ tip.appendChild(document.createTextNode(l.slice(1).join('\\n')));tip.hidden=false;});
+document.addEventListener('mousemove',function(e){if(tip&&!tip.hidden){var x=e.clientX+14,y=e.clientY+14;
+ if(x+tip.offsetWidth>innerWidth-8)x=e.clientX-tip.offsetWidth-14;tip.style.left=x+'px';tip.style.top=y+'px';}});
+document.addEventListener('mouseout',function(e){if(tip&&e.target.classList&&e.target.classList.contains('hc-hit'))tip.hidden=true;});
+})();
+</script>"""
 
 
 def type_counts(stations):
@@ -1273,14 +1734,14 @@ def stations_tab(ptype, search):
              + "<th>Last check</th><th>Update</th></tr>")
     for s in rows:
         hl = health_of(s)
-        cls, label, _, pct = station_state(s, st_builds[s["key"]])
+        cls, label, detail, pct = station_state(s, st_builds[s["key"]])
         a = attention(s, hl)
         dot = (f"<span class='dot js-dot {a[0][0]}' title='{esc(', '.join(t for _, t in a))}'></span>" if a
                else "<span class='dot js-dot'></span>")
         live = pct is not None and pct < 100
         bar = (f"<div class='bar js-bar{' live' if live else ''}'{'' if pct is not None else ' hidden'}>"
                f"<i style='width:{pct or 0}%'></i></div>")
-        short = dl_text(s, st_builds[s["key"]]) if label.startswith("Downloading") else ""
+        short = short_text(s, label, st_builds[s["key"]])
         bar += f"<div class='sub js-short'{'' if short else ' hidden'}>{esc(short)}</div>"
         if hl.get("bd") or hl.get("bn"):
             bat = f"{esc(hl.get('bd') or '—')} / {esc(hl.get('bn') or '—')} <span class='mute'>V</span>"
@@ -1293,13 +1754,13 @@ def stations_tab(ptype, search):
         stop = (f"<form method='post' action='/station' class='rowact'><input type='hidden' name='key' value='{esc(s['key'])}'>"
                 f"<input type='hidden' name='target' value='hold'><input type='hidden' name='back' value='/?tab=stations&type={ptype}'>"
                 "<button class='del small' title='Cancel this station&#39;s update'>Stop</button></form>"
-                if label.startswith(("Waiting for next check", "Starting download", "Downloading")) else "")
+                if label.startswith(STOPPABLE_LABELS) else "")
         fw = (f"<b class='js-ver'>{esc(s['version']) or '—'}</b><div class='sub crc js-crc'>{esc(s['running_crc'])}</div>"
               if esp else fw_text(s, hl))
         h.append(f"<tr data-k='{esc(s['key'])}'><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
                  f"<td class='nw'>{fw}</td>{middle}"
                  f"<td class='nw js-seen'>{esc(when(s['last_seen']))}</td>"
-                 f"<td class='nw'><div class='upd'><span class='pill js-pill {cls}'>{esc(label)}</span>{stop}</div>{bar}"
+                 f"<td class='nw'><div class='upd'><span class='pill js-pill {cls}' title='{esc(detail)}'>{esc(label)}</span>{stop}</div>{bar}"
                  + (f"<div style='margin-top:4px'><span class='pill {st_ctrl[s['key']][0]}'>{esc(st_ctrl[s['key']][1])}</span></div>"
                     if st_ctrl[s["key"]] else "") + "</td></tr>")
     if not rows:
@@ -1359,8 +1820,9 @@ def station_page(key, message=""):
         builds = con.execute("SELECT * FROM builds WHERE profile=? ORDER BY id DESC", (s["profile"],)).fetchall()
         cbuild = ctrl_build(con, s)
         cbuilds = con.execute("SELECT * FROM builds WHERE profile=? ORDER BY id DESC", (CTRL_PROFILE,)).fetchall()
-        reports = con.execute("SELECT * FROM health WHERE key=? ORDER BY id DESC LIMIT 60", (key,)).fetchall()
-        events = con.execute("SELECT * FROM events WHERE station=? ORDER BY id DESC LIMIT 100", (s["shown_id"],)).fetchall()
+        reports = con.execute("SELECT * FROM health WHERE key=? ORDER BY id DESC LIMIT 90", (key,)).fetchall()
+        events = con.execute("SELECT * FROM events WHERE station=? ORDER BY id DESC LIMIT ?",
+                             (s["shown_id"], EVENTS_PER_STATION)).fetchall()
     hl = health_of(s)
     cls, label, detail, pct = station_state(s, build)
     a = attention(s, hl)
@@ -1374,7 +1836,8 @@ def station_page(key, message=""):
              f"{esc(sid(s))} <span class='fam {group_of(s['profile'])[1]}'>{group_of(s['profile'])[0]}</span> "
              f"<span class='mute' style='font-size:15px;font-weight:500'>{esc(TYPES.get(s['profile'], '?').split(' · ', 1)[-1])}</span></h1>"
              f"<div>{pills}</div></div>"
-             f"<div class='kv' style='margin-top:16px'>"
+             + (f"<p class='msg bad' style='margin:14px 0 0'>{esc(silent_text(s, hl))}</p>" if silent_text(s, hl) else "")
+             + f"<div class='kv' style='margin-top:16px'>"
              f"<div><span>Firmware</span><span>{fw} <span class='crc js-crc'>{esc(s['running_crc'])}</span></span></div>"
              f"<div><span>Last check</span><span class='js-seen'>{esc(when(s['last_seen']))}</span></div>"
              + (f"<div><span>Board</span>{board_name(s['profile'])}</div>" if s["profile"] in ESP_TYPES else "")
@@ -1400,6 +1863,23 @@ def station_page(key, message=""):
             h.append(f"<div><span>{esc(label_)}</span><span>{value}</span></div>")
         h.append("</div></div>")
 
+    # Health history: the pattern over the last days first (user, 22 Nov 2026), the table under it
+    charts = health_charts(reports, s["profile"])
+    h.append("<div class='card'><h2>Health history</h2>" + (charts or "<p class='hint' style='margin:0'>No health report yet: "
+             "the charts start with the first daily report.</p>"))
+    if reports:
+        h.append(f"<details class='tbl'><summary>Table of the reports ({len(reports)})</summary><div class='scroll'>"
+                 "<table><tr><th>Received</th>" + "".join(f"<th>{esc(t)}</th>" for t, _ in HISTORY_COLS) + "</tr>")
+        for r in reports:
+            try:
+                d = json.loads(r["data"])
+            except ValueError:
+                d = {}
+            h.append(f"<tr><td class='nw'>{esc(when(r['at']))}</td>" +
+                     "".join(f"<td class='nw'>{fn(d)}</td>" for _, fn in HISTORY_COLS) + "</tr>")
+        h.append("</table></div></details>")
+    h.append("</div>")
+
     # Update
     opts = [("type", "Follow the type's update"), ("hold", "No update (stopped)")] + [
         (str(b["id"]), build_name(b)) for b in builds]
@@ -1418,7 +1898,7 @@ def station_page(key, message=""):
              f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='tsel'>Update target</label>"
              f"<select id='tsel' name='target'>{sel}</select><button>Set</button>"
              + ("<button class='del' name='target' value='hold' formnovalidate>Stop update</button>"
-                if s["target"] != "hold" and label.startswith(("Waiting for next check", "Starting download", "Downloading")) else "") + "</form>")
+                if s["target"] != "hold" and label.startswith(STOPPABLE_LABELS) else "") + "</form>")
     # v6.9.63: CTRL (LPC1768 stations only: ESP32 stations have no CTRL board)
     if s["profile"] in ESP_TYPES:
         h.append("</div>")
@@ -1433,27 +1913,12 @@ def station_page(key, message=""):
                  f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='csel'>Gets</label>"
                  f"<select id='csel' name='target'>{csel}</select><button>Set</button></form></div>")
 
-    # Health history (ESP32 stations once they report, from firmware 6.57)
-    if True:   # every station (ESP32 too, before its first report)
-        h.append("<div class='card'><h2>Health history</h2><div class='scroll'><table><tr><th>Received</th>" +
-                 "".join(f"<th>{esc(t)}</th>" for t, _ in HISTORY_COLS) + "</tr>")
-        for r in reports:
-            try:
-                d = json.loads(r["data"])
-            except ValueError:
-                d = {}
-            h.append(f"<tr><td class='nw'>{esc(when(r['at']))}</td>" +
-                     "".join(f"<td class='nw'>{fn(d)}</td>" for _, fn in HISTORY_COLS) + "</tr>")
-        if not reports:
-            h.append(f"<tr><td colspan='{len(HISTORY_COLS) + 1}' class='mute'>No health report yet.</td></tr>")
-        h.append("</table></div></div>")
-
     # Events (every station: an ESP32 station's update steps show here too)
-    h.append("<div class='card'><h2>Events</h2><div class='scroll'><table><tr><th>When</th><th>What happened</th></tr>")
+    h.append(f"<div class='card'><h2>Events</h2><p class='hint'>The last {EVENTS_PER_STATION}, newest first.</p>"
+             "<div class='scroll'><table><tr><th>When</th><th>What happened</th></tr>")
     for e in events:
         t = e["text"]
-        c = "badt" if t.startswith("FAILED") else "okt" if t.startswith("UPDATED") else ""
-        h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='{c}'>{esc(t)}</td></tr>")
+        h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='{event_class(t)}'>{esc(t)}</td></tr>")
     if not events:
         h.append("<tr><td colspan='2' class='mute'>Nothing yet.</td></tr>")
     h.append("</table></div></div>")
@@ -1467,7 +1932,7 @@ def station_page(key, message=""):
                      f"<input type='hidden' name='key' value='{esc(s['key'])}'><input type='hidden' name='back' value='/?tab=stations&type={s['profile']}'>"
              "<button class='del'>Remove station</button></form></div></div>")
     h.append("</div>")
-    return page(f"Station {sid(s)}", "".join(h), "stations", message, live_script(f"/live?k={s['key']}"),
+    return page(f"Station {sid(s)}", "".join(h), "stations", message, live_script(f"/live?k={s['key']}") + HEALTH_CHART_JS,
                 ptype=s["profile"], type_bar_shown=False)
 
 
@@ -1520,12 +1985,12 @@ def history_tab(ptype):
     with db() as con:
         events = con.execute("SELECT * FROM events WHERE profile=? OR profile IS NULL ORDER BY id DESC LIMIT 300",
                              (ptype,)).fetchall()
-    h = [f"<div class='card'><h2>History</h2><p class='hint'>The newest first. Office events "
-         "that belong to no type (password) show under every type.</p><div class='scroll'><table>"
+    h = [f"<div class='card'><h2>History</h2><p class='hint'>The newest first, the last {EVENTS_PER_STATION} of each station. "
+         "Office events that belong to no type (password) show under every type.</p><div class='scroll'><table>"
          "<tr><th>When</th><th>Station</th><th>What happened</th></tr>"]
     for e in events:
         t = e["text"]
-        cls = "badt" if t.startswith("FAILED") else "okt" if t.startswith("UPDATED") else ""
+        cls = event_class(t)
         h.append(f"<tr><td class='nw'>{esc(when(e['at']))}</td><td class='nw'>{esc(e['station'][1:] if e['profile'] in ESP_TYPES and (e['station'] or '')[:1] == 'E' else e['station']) or '<span class=mute>office</span>'}</td>"
                  f"<td class='{cls}'>{esc(t)}</td></tr>")
     if not events:
@@ -1630,7 +2095,7 @@ def do_send(f, stn_keys):
                 if st is None:
                     continue
                 con.execute("UPDATE stations SET target='hold', result='', offered_crc=NULL, progress=0 WHERE key=?", (key,))
-                add_event(con, st["shown_id"], "office set: updates stopped")
+                add_event(con, st["shown_id"], "Office: updates stopped")
                 stopped.append(sid(st))
         if not stopped:
             return "Nothing stopped: tick at least one station."
@@ -1656,7 +2121,7 @@ def do_send(f, stn_keys):
                 if st is None:
                     continue
                 con.execute("UPDATE stations SET ctrl_target=?, ctrl_result='', ctrl_offered='' WHERE key=?", (str(build_id), key))
-                add_event(con, st["shown_id"], f"office set: CTRL gets build #{build_id} {b['version']}")
+                add_event(con, st["shown_id"], f"Office: CTRL to get {b['version']}")
                 sent.append(sid(st))
             if not sent:
                 return "Not sent: tick at least one station."
@@ -1670,7 +2135,7 @@ def do_send(f, stn_keys):
                 skipped.append(sid(st))
                 continue
             con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL, progress=0 WHERE key=?", (str(build_id), key))
-            add_event(con, st["shown_id"], f"office set: gets build #{build_id} {b['version']}")
+            add_event(con, st["shown_id"], f"Office: to get {b['version']}")
             sent.append(sid(st))
         if all_type:
             con.execute("INSERT INTO type_targets (profile, build_id) VALUES (?,?) "
@@ -1809,7 +2274,8 @@ class Handler(BaseHTTPRequestHandler):
                     st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
                     if st:
                         con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL, progress=0 WHERE key=?", (target, st["key"]))
-                        add_event(con, st["shown_id"], f"office set: {'updates resumed (follows its type)' if target == 'type' else 'updates stopped' if target == 'hold' else 'gets build #' + target}")
+                        add_event(con, st["shown_id"], "Office: " + ("updates resumed (follows its type)" if target == "type" else "updates stopped"
+                                                                     if target == "hold" else f"to get {build_version(con, target)}"))
                         message = (f"Updates stopped for {sid(st)}." if target == "hold" else
                                    f"Updates resumed for {sid(st)}." if target == "type" else
                                    f"Station {sid(st)} set. It acts on this at its next check.")
@@ -1819,7 +2285,7 @@ class Handler(BaseHTTPRequestHandler):
                 if st:
                     con.execute("DELETE FROM health WHERE key=?", (st["key"],))
                     con.execute("DELETE FROM stations WHERE key=?", (st["key"],))
-                    add_event(con, st["shown_id"], "office: station removed from the office page", st["profile"])
+                    add_event(con, st["shown_id"], "Office: station removed from the office page", st["profile"])
                     message = f"Station {sid(st)} removed. If it checks in again it comes back as a new station."
                     f = {"back": f"/?tab=stations&type={st['profile']}"}
         elif url.path == "/station/ctrl":
@@ -1829,7 +2295,7 @@ class Handler(BaseHTTPRequestHandler):
                     st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
                     if st:
                         con.execute("UPDATE stations SET ctrl_target=?, ctrl_result='', ctrl_offered='' WHERE key=?", (target, st["key"]))
-                        add_event(con, st["shown_id"], "office set: " + (f"CTRL gets build #{target}" if target else "no CTRL update"))
+                        add_event(con, st["shown_id"], "Office: " + (f"CTRL to get {build_version(con, target)}" if target else "no CTRL update"))
                         message = (f"Station {sid(st)}: CTRL set. It acts on this at its next check." if target else
                                    f"Station {sid(st)}: no CTRL update.")
         elif url.path == "/station/add":

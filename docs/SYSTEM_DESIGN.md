@@ -474,8 +474,12 @@ waits, and only below 11.0 V (`OTA_MIN_BATTERY_V`). The keypad SD update uses th
 
 | Request | Answer |
 |---|---|
-| `/lpc/check?id=<station>&p=<type 0-2>&v=<version>&c=<running image CRC>&s=<0 idle, 1 downloading, 3 failed>&t=<image CRC that failed>` | `OTA NONE` or `OTA FW <file bytes> <file CRC> <image CRC>` |
+| `/lpc/check?id=<station>&p=<type 0-2>&v=<version>&c=<running image CRC>&s=<0 idle, 1 downloading, 3 failed>&t=<image CRC that failed>&w=<can it download now>` | `OTA NONE` or `OTA FW <file bytes> <file CRC> <image CRC>` |
 | `/lpc/fw?id=<station>&c=<file CRC>&o=<offset>&n=<bytes, up to 1024>` | `@<CRC-32 of the piece>` + newline + the piece. 404 `OTA GONE` if the file was withdrawn |
+
+`w=` (v6.9.64; ESP32 AIO9 6.60+, DWLR-D15-S.25+): `0` ready to download, `b<volts>` battery below the download limit, `q<n>` records still to send. The unit uses the same test after an offer, so the office page shows why an offered file is not coming ("Waiting: battery low", "Waiting: records to send") and when the next check is. Older units send no `w=`; the page then says the firmware doesn't tell why.
+
+`e=` (v6.9.64; AIO9 6.61, DWLR-D15-S.26), with `s=3`: why the unit gave that image up. `C` crashed again and again on trial, `N` delivered no record within 2 h of the install (the unit went back), `B` did not start / did not stay, `T` another station type, `K` not a good image, `D` arrived damaged 3 times, `X` flash write failed. New firmware from OTA must deliver a record within 8 slots on every unit type (LPC: OTA.DAT phase I, then FW_J_REVERT_REQ), so an update can't leave a unit running but silent.
 
 An image is known by its CRC (builds share a version string), so the office can also send an older build.
 
