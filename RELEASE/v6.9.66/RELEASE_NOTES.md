@@ -37,6 +37,9 @@
 - It is kept apart from the daily health report (it does not replace that card) and never starts a firmware
   download: downloads still happen only in the unit's own slots.
 - A first SEND STATUS from a unit the office has not seen before adds the station to the page.
+- SEND STATUS can be pressed while the unit installs a downloaded firmware after a slot. The office check reads
+  the saved update state and the office address into its own memory, so it cannot spoil the update state the
+  install is writing.
 
 ### More flash room
 - The firmware is now built with link-time optimisation: the same code, about 4.7 KB smaller. Free space in the
