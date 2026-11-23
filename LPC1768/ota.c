@@ -148,20 +148,27 @@ static void ota_progress(const char *stage, unsigned percent)
     wd_checkin();
 }
 
-/* The server's address: this build's, unless the card says otherwise ("host port") */
-static void ota_server(void)
+/* The server's address: this build's, unless the card says otherwise ("host port").
+ * v6.9.66: into the caller's buffers, so the keypad check (another task) never writes s_text, s_host or
+ * s_port while the main task uses them (ota_save formats the state in s_text, then saves it) */
+static void ota_server_into(char *host_out, size_t host_size, uint16_t *port_out, char *text, size_t text_size)
 {
     unsigned port = OTA_SERVER_PORT;
-    snprintf(s_host, sizeof(s_host), "%s", OTA_SERVER_HOST);
-    if (storage_state_load(OTA_SERVER_FILENAME, s_text, sizeof(s_text))) {
+    snprintf(host_out, host_size, "%s", OTA_SERVER_HOST);
+    if (storage_state_load(OTA_SERVER_FILENAME, text, text_size)) {
         char host[sizeof(s_host)] = "";
-        if (sscanf(s_text, "%43s %u", host, &port) >= 1 && strchr(host, '.') && port > 0 && port < 65536) {
-            snprintf(s_host, sizeof(s_host), "%s", host);
+        if (sscanf(text, "%43s %u", host, &port) >= 1 && strchr(host, '.') && port > 0 && port < 65536) {
+            snprintf(host_out, host_size, "%s", host);
         } else {
             port = OTA_SERVER_PORT;
         }
     }
-    s_port = (uint16_t)port;
+    *port_out = (uint16_t)port;
+}
+
+static void ota_server(void)
+{
+    ota_server_into(s_host, sizeof(s_host), &s_port, s_text, sizeof(s_text));
 }
 
 /* v6.9.63: a CTRL file. Only with no rain in this slot so far: the CTRL counts nothing while it
@@ -386,11 +393,14 @@ bool ota_keypad_status(const telemetry_data_t *telem, int csq_dbm, int net, cons
         }
     }
     op[n] = '\0';
-    ota_server();
-    /* The saved state, read into a copy: s_st and s_text belong to the main task (it may be installing) */
+    /* The server and the saved state, read into our own copies: s_st, s_text, s_host and s_port belong to
+     * the main task (it may be installing a downloaded file after its slot) */
+    static char host[sizeof(s_host)];
+    static char kp_text[64];
+    uint16_t port = 0;
+    ota_server_into(host, sizeof(host), &port, kp_text, sizeof(kp_text));
     static ota_state_t now_st;
-    static char st_text[48];
-    ota_read_state(&now_st, st_text, sizeof(st_text));
+    ota_read_state(&now_st, kp_text, sizeof(kp_text));
     const bool failed = (now_st.phase == 'F' || now_st.phase == 'f');
     const uint32_t pending = storage_backlog_get_pending_count();
     const int bv = (int)(telem->bat1_volt * 100.0f + 0.5f);
@@ -402,14 +412,14 @@ bool ota_keypad_status(const telemetry_data_t *telem, int csq_dbm, int net, cons
              (unsigned long)pending, storage_sd_is_ok() ? 1 : 0);
     int len = 0, status = 0;
     hal_power_heartbeat();
-    const char *body = sim7600_http_get(s_host, s_port, s_path, &len, &status);
+    const char *body = sim7600_http_get(host, port, s_path, &len, &status);
     const bool ok = body && status == 200 && strstr(body, "OTA ") != NULL;
     sim7600_http_get_close();
     if (ok) {
         ota_log("OTA", "OTA: SEND STATUS: the office answered");
     } else {
         static char text[176];   /* not s_text: the main task may be writing it (install) */
-        snprintf(text, sizeof(text), "OTA: SEND STATUS: no answer from %.40s (HTTP %d) %.88s", s_host, status,
+        snprintf(text, sizeof(text), "OTA: SEND STATUS: no answer from %.40s (HTTP %d) %.88s", host, status,
                  sim7600_http_get_fail_text());
         ota_log("OTA", text);
     }
