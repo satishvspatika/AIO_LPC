@@ -345,6 +345,11 @@ def init_db():
         # AIO9 6.60, LPC v6.9.64): '' not said (older firmware), '0' ready, 'b<V>' battery low, 'q<n>' records waiting
         if "wait" not in cols:
             con.execute("ALTER TABLE stations ADD COLUMN wait TEXT DEFAULT ''")
+        # 23 Nov 2026: the last SEND STATUS pressed on the unit (k=1: DWLR-D15-S.28, AIO9 6.63, LPC v6.9.66)
+        if "kp" not in cols:
+            con.execute("ALTER TABLE stations ADD COLUMN kp TEXT DEFAULT ''")
+        if "kp_at" not in cols:
+            con.execute("ALTER TABLE stations ADD COLUMN kp_at INTEGER DEFAULT 0")
         # Only the newest EVENTS_PER_STATION events of each station are kept (user, 22 Nov 2026)
         for r in con.execute("SELECT DISTINCT station FROM events WHERE station != ''").fetchall():
             trim_events(con, r["station"])
@@ -535,6 +540,31 @@ def store_health(con, key, q, now):
     con.execute("DELETE FROM health WHERE key=? AND at < ?", (key, now - 400 * 86400))
 
 
+# ---------------------------------------------------------------- SEND STATUS on the unit (k=1)
+# 23 Nov 2026 (user): SEND STATUS on a unit's keypad also reaches this page. The unit sends its usual check
+# marked k=1, with what it sees now. Kept apart from the daily health report (it has no day figures, and
+# must not replace that card). Answered "OTA NONE": no offer, no CTRL offer, no result change: the
+# button never starts a download; the slot checks do that.
+KEYPAD_FIELDS = ("bv", "sig", "net", "op", "q", "sd")
+
+
+def keypad_text(kp):
+    parts = []
+    if "bv" in kp:
+        parts.append(f"battery {kp['bv']} V")
+    if "sig" in kp:
+        parts.append(f"signal {kp['sig']} dBm")
+    if kp.get("net") in ("2", "4"):
+        parts.append(f"{kp['net']}G")
+    if kp.get("op") and kp["op"] != "NA":
+        parts.append(kp["op"])
+    if "q" in kp:
+        parts.append(f"{kp['q']} record{'' if kp['q'] == '1' else 's'} waiting")
+    if "sd" in kp:
+        parts.append("SD card OK" if kp["sd"] == "1" else "SD card FAULT")
+    return ", ".join(parts)
+
+
 # ---------------------------------------------------------------- unit requests
 
 def unit_check(q, ip):
@@ -559,6 +589,9 @@ def unit_check(q, ip):
     with _db_lock, db() as con:
         st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
         prev_wait = (st["wait"] or "") if st is not None else ""
+        keypad = q.get("k") == "1"
+        if keypad and "w" not in q:
+            wait = prev_wait            # the keypad check does not say: keep what the slot check said
         if st is None:
             con.execute("INSERT INTO stations (key, shown_id, profile, version, running_crc, unit_status, tried_crc,"
                         " last_seen, last_ip, wait) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -576,6 +609,11 @@ def unit_check(q, ip):
                         " tried_crc=?, last_seen=?, last_ip=?, wait=? WHERE key=?",
                         (stn, profile, version, crc, status, tried, now, ip, wait, key))
             st = con.execute("SELECT * FROM stations WHERE key=?", (key,)).fetchone()
+        if keypad:
+            kp = {k: q[k] for k in KEYPAD_FIELDS if k in q and HEALTH_VALUE.fullmatch(q[k])}
+            con.execute("UPDATE stations SET kp=?, kp_at=? WHERE key=?", (json.dumps(kp, separators=(",", ":")), now, key))
+            add_event(con, stn, f"SEND STATUS on the unit: running {version}" + (f", {keypad_text(kp)}" if kp else ""))
+            return "OTA NONE\n"
         store_health(con, key, q, now)
         build = target_build(con, st)
         reply = "OTA NONE\n"
@@ -1842,7 +1880,10 @@ def station_page(key, message=""):
              f"<div><span>Last check</span><span class='js-seen'>{esc(when(s['last_seen']))}</span></div>"
              + (f"<div><span>Board</span>{board_name(s['profile'])}</div>" if s["profile"] in ESP_TYPES else "")
              + f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware ' + ('DWLR-D15-S.22' if s['profile'] in DWLR_TYPES else '6.57' if s['profile'] in ESP_TYPES else 'v6.9.60') + ' on)</span>'}</div>" +
-             f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
+             (f"<div><span>Last SEND STATUS on the unit</span><span>{esc(when(s['kp_at']))}"
+                + (f"<br><span class='mute'>{esc(keypad_text(json.loads(s['kp'] or '{}')))}</span>" if s["kp"] else "")
+                + "</span></div>" if s["kp_at"] else "")
+             + f"<div><span>From address</span><span class='crc'>{esc(s['last_ip'])}</span></div></div></div>")
 
     # Health: the daily report comes with the check (LPC1768; ESP32 from firmware 6.57)
     # Health: shown for every station; an ESP32 station without a report yet says which firmware sends it
