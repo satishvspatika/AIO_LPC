@@ -1,13 +1,18 @@
-# RELEASE: bundles for the test team
+# RELEASE: the LPC release tools
 
-One folder per release, named after the main firmware version, plus the zip that is emailed.
+Releases are no longer kept in this repo (23 Nov 2026). `make_release.sh` writes each one to the common release
+folder next to the projects, `Antigravity/RELEASE/LPC/` (set `RELEASE_DIR` to use another folder). Older releases
+are in this repo's git history.
 
 ```
-RELEASE/
+RELEASE/                 (in this repo: the tools)
   make_release.sh        builds everything from source, tests it, packages one release
   notes_to_pdf.py        RELEASE_NOTES.md -> .html and .pdf (used by make_release.sh)
-  v6.9.38/
+
+Antigravity/RELEASE/LPC/ (the releases)
+  v6.9.66/
     RELEASE_NOTES.md     written by hand for each release (.html and .pdf are generated)
+    OTA/                 upload to the office page (copied from SD_CARD by hand: the main files and ctrl.hex)
     SD_CARD/             copy to the root of a unit's SD card
       fw_ksn_trg.hex       main firmware, KSNDMC rain gauge
       fw_bihar.hex         main firmware, Bihar rain gauge
@@ -17,7 +22,7 @@ RELEASE/
     FACTORY_MCU-LINK/    full chip images for programming with the MCU-Link
     SHA256SUMS.txt       checksums of every image
     BUILD_INFO.txt       when it was built and from which git commit
-  LPC-AIO_v6.9.38_CTRL_v1.12_MIG-1.7.zip   the bundle to email: SD_CARD/ + RELEASE_NOTES.pdf only
+  LPC-AIO_v6.9.66_CTRL_v1.17_MIG-1.10.zip   the bundle to email: SD_CARD/ + RELEASE_NOTES.pdf only
 ```
 
 ## Making a release
@@ -27,7 +32,7 @@ RELEASE/
    migration or the CTRL changed).
 2. `PRODUCTION_BUILD` must be 1 in `LPC1768/user_config.h` (the script refuses otherwise). Test units get the debug
    log by putting an empty `DEBUGLOG.ON` file on their cards; nothing is rebuilt for that.
-3. Write `RELEASE/<version>/RELEASE_NOTES.md`: what changed, how to install, what to test, known limits.
+3. Write `Antigravity/RELEASE/LPC/<version>/RELEASE_NOTES.md`: what changed, how to install, what to test, known limits.
 4. Commit the source, then run `RELEASE/make_release.sh`. It stops if the notes are missing or any host test
    fails. `BUILD_INFO.txt` records the commit, and says so if there were uncommitted changes.
 5. Email the zip (it already holds the release notes PDF). Nothing else goes in the email.

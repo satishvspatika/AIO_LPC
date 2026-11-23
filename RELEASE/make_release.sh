@@ -4,23 +4,27 @@
 #   RELEASE/make_release.sh
 #
 # Versions are read from the source (LPC1768/user_config.h, LPC845/boot/fw845_app.h,
-# TEST_JIG/migrate/main.c). Write RELEASE/<main version>/RELEASE_NOTES.md first: the script
+# TEST_JIG/migrate/main.c). Write Antigravity/RELEASE/LPC/<main version>/RELEASE_NOTES.md first: the script
 # stops without it, so no bundle goes out without its notes. It then:
 #   1. builds the CTRL (LPC845) firmware and the old-unit migration image
 #   2. builds the main firmware for KSNDMC_TRG, BIHAR_TRG and KSNDMC_TWS (copies of the tree, so
 #      user_config.h in the repo is never edited)
 #   3. runs the host tests against the new images
-#   4. copies the files into RELEASE/<version>/, writes SHA256SUMS.txt, and zips the email bundle:
+#   4. copies the files into the common release folder, Antigravity/RELEASE/LPC/<version>/ (23 Nov 2026),, writes SHA256SUMS.txt, and zips the email bundle:
 #      SD_CARD/ and RELEASE_NOTES.pdf only
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REL="${ROOT}/RELEASE"
+REL="${ROOT}/RELEASE"                       # this script and notes_to_pdf.py
+# 23 Nov 2026: releases go to the common release folder next to the projects (Antigravity/RELEASE/LPC),
+# not into this repo. RELEASE_DIR overrides it.
+DEST="${RELEASE_DIR:-$(cd "${ROOT}/.." && pwd)/RELEASE}/LPC"
+mkdir -p "${DEST}"
 
 MAIN_VER=$(awk '$1=="#define" && $2=="FIRMWARE_VERSION" {gsub(/"/,"",$3); print $3}' "${ROOT}/LPC1768/user_config.h")
 CTRL_VER=$(awk '$1=="#define" && $2=="FW845_VERSION" {gsub(/"/,"",$3); print $3}' "${ROOT}/LPC845/boot/fw845_app.h")
 MIG_VER=$(awk '$1=="#define" && $2=="MIG_VERSION" {gsub(/"/,"",$3); print $3}' "${ROOT}/TEST_JIG/migrate/main.c")
 PROD=$(awk '$1=="#define" && $2=="PRODUCTION_BUILD" {print $3}' "${ROOT}/LPC1768/user_config.h")
-OUT="${REL}/${MAIN_VER}"
+OUT="${DEST}/${MAIN_VER}"
 NAME="LPC-AIO_${MAIN_VER}_CTRL_${CTRL_VER}_${MIG_VER}"
 
 if [ "${PROD}" != "1" ]; then
@@ -54,7 +58,7 @@ echo "--- 3. Host tests"
 OUT="${WORK}/ht" KSN_TRG_HEX="${WORK}/tree_KSNDMC_TRG/LPC1768/Debug/fw_ksn_trg.hex" \
     KSN_TWS_HEX="${WORK}/tree_KSNDMC_TWS/LPC1768/Debug/fw_ksn_tws.hex" \
     bash "${ROOT}/bench/host_tests.sh" > "${LOGS}/host_tests.log" 2>&1 || true
-OUT="${REL}/${MAIN_VER}"
+OUT="${DEST}/${MAIN_VER}"
 if grep -qvE "ALL PASS" "${LOGS}/host_tests.log"; then
     cat "${LOGS}/host_tests.log"; echo "[ERROR] Host tests did not all pass: no release"; exit 1
 fi
@@ -79,7 +83,7 @@ GIT_DESC="$(cd "${ROOT}" && git rev-parse --short HEAD)$(cd "${ROOT}" && git dif
 echo "Built $(date '+%Y-%m-%d %H:%M') from ${GIT_DESC}" > "${OUT}/BUILD_INFO.txt"
 
 # The email bundle: only the SD card files and the release notes (user, 2026-11-13). The MCU-Link
-# images, checksums and build info stay in RELEASE/<version>/ for us.
-rm -f "${REL}/${NAME}.zip"
-(cd "${OUT}" && zip -qr "${REL}/${NAME}.zip" SD_CARD RELEASE_NOTES.pdf -x "*.DS_Store")
-echo "=== Done: ${REL}/${NAME}.zip ($(du -h "${REL}/${NAME}.zip" | cut -f1)) ==="
+# images, checksums and build info stay in Antigravity/RELEASE/LPC/<version>/ for us.
+rm -f "${DEST}/${NAME}.zip"
+(cd "${OUT}" && zip -qr "${DEST}/${NAME}.zip" SD_CARD RELEASE_NOTES.pdf -x "*.DS_Store")
+echo "=== Done: ${DEST}/${NAME}.zip ($(du -h "${DEST}/${NAME}.zip" | cut -f1)) ==="
