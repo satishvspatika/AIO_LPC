@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "net_policy.h"
+#include "ota.h"
 
 #define NET_VOICE_ONLY_WAIT_SEC 8   /* CREG registered: this long for data registration before going on */
 
@@ -3250,6 +3251,13 @@ static bool status_sms(const telemetry_data_t *telem, int csq_dbm, char kind, co
     report_progress("SENDING SMS...  ");
     storage_log_debug("SMS", status_msg);
     bool ok = sim7600_send_sms(dest_phone, status_msg);
+#if ENABLE_OTA
+    if (kind == 'F' && !sim7600_is_cancel_requested()) {
+        /* v6.9.66: SEND STATUS from the keypad also goes to the office page (ota.c) */
+        report_progress("OFFICE CHECK... ");
+        ota_keypad_status(telem, csq_dbm, sim7600_slot_network(), s_modem_status.carrier);
+    }
+#endif
 
     if (we_powered) {
         delay_ms(1500);

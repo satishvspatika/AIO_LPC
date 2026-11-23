@@ -10,6 +10,7 @@
 #include "fw_ctrl.h"
 #include "fw_app.h"
 #include "ctrl_isp.h"
+#include "ota.h"
 #include "boot/fw_journal.h"
 #include "user_config.h"
 #include "lpc17xx_gpio.h"
@@ -351,7 +352,9 @@ static void vStatusSms_Task(void *pvParameters)
     modem_status_t m;
     sim7600_get_status(&m);
 
+    (void)ota_keypad_result();   /* v6.9.66: forget an earlier answer */
     bool ok = sim7600_transmit_status_sms(&t, m.csq_dbm);
+    const int office = ota_keypad_result();   /* 1 answered, 0 not, -1 not asked */
 
     sim7600_release();
 
@@ -361,10 +364,15 @@ static void vStatusSms_Task(void *pvParameters)
         s_status_sms_timer = 20;
     } else {
         s_status_sms_state = ok ? STATUS_UI_SUCCESS : STATUS_UI_FAILED;
-        if (ok) {
+        /* v6.9.66: and whether the office page got it */
+        if (office >= 0) {
+            strncpy(s_status_sms_substep, ok ? (office ? "SMS+OFFICE OK   " : "SMS OK,OFFICE NO")
+                                              : (office ? "SMS NO,OFFICE OK" : "SMS+OFFICE FAIL "),
+                    sizeof(s_status_sms_substep) - 1);
+        } else if (ok) {
             strncpy(s_status_sms_substep, "STATUS SENT OK  ", sizeof(s_status_sms_substep) - 1);
         }
-        s_status_sms_timer = 60; /* 3 seconds display */
+        s_status_sms_timer = office >= 0 ? 100 : 60; /* 3 seconds display (5 with the office result) */
     }
 
     log_job_stack();

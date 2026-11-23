@@ -21,4 +21,14 @@ void ota_slot_not_sent(int slot, const char *time14);
 /* v6.9.64: at the start of every slot: new firmware that delivers no record for 2 h goes back */
 void ota_slot_begin(void);
 
+/* v6.9.66: SEND STATUS on the keypad also reaches the office page (the unit's check with k=1 and what it
+ * sees now). The modem must be on, registered and held by the caller. net: 2 or 4 (G); carrier: the
+ * operator's name. Returns true when the office server answered. Never starts a download. */
+#include "intermcu_protocol.h"
+#include <stdbool.h>
+bool ota_keypad_status(const telemetry_data_t *telem, int csq_dbm, int net, const char *carrier);
+
+/* 1 the office answered the last SEND STATUS, 0 it did not, -1 not asked; reading it resets it to -1 */
+int ota_keypad_result(void);
+
 #endif /* OTA_H */

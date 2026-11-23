@@ -114,7 +114,8 @@ extern WEAK void main(void);
 //
 //*****************************************************************************
 extern void _vStackTop;
-extern const char g_fw_image_info[]; /* fw_app.c: what this image is */
+#include "boot/fw_layout.h"
+extern const fw_image_info_t g_fw_image_info;   /* fw_app.c: what this image is (its own type: LTO checks it) */
 
 //*****************************************************************************
 //
@@ -122,7 +123,7 @@ extern const char g_fw_image_info[]; /* fw_app.c: what this image is */
 // This relies on the linker script to place at correct location in memory.
 //
 //*****************************************************************************
-__attribute__ ((section(".isr_vector")))
+__attribute__ ((used, section(".isr_vector")))   /* used: only the linker script names it (LTO) */
 void (* const g_pfnVectors[])(void) =
 {
 	// Core Level - CM3
@@ -134,7 +135,7 @@ void (* const g_pfnVectors[])(void) =
 	BusFault_Handler,						// The bus fault handler
 	UsageFault_Handler,						// The usage fault handler
 	0,										// Reserved
-	(void (*)(void))g_fw_image_info,		// Reserved: vector 8 points to the image info
+	(void (*)(void))&g_fw_image_info,		// Reserved: vector 8 points to the image info
 	0,										// Reserved
 	0,										// Reserved
 	vPortSVCHandler,                        // SVCall handler

@@ -50,7 +50,9 @@ elif [ "${PRODUCTION_BUILD}" = "0" ]; then
 else
     echo "[ERROR] PRODUCTION_BUILD line not found in user_config.h"; exit 1
 fi
-CFLAGS="-c -mcpu=cortex-m3 -mthumb -Os -g -fcommon -ffunction-sections -fdata-sections \
+# v6.9.66: -flto (link-time optimisation, also on the link line): about 4.7 KB smaller with the same
+# code. Task stack needs checked against the non-LTO build (bench/stack_callgraph.py): within 16 bytes.
+CFLAGS="-c -mcpu=cortex-m3 -mthumb -Os -flto -g -fcommon -ffunction-sections -fdata-sections \
   ${DEBUG_FLAG} -D__USE_CMSIS=CMSISv1p30_LPC17xx \
   -I${LPC_DIR} \
   -I${PROJECT_ROOT}/CMSISv1p30_LPC17xx/inc \
@@ -155,7 +157,7 @@ ${CC} \
   -L"${PROJECT_ROOT}/CMSISv1p30_LPC17xx/Debug" \
   -L"${PROJECT_ROOT}/FreeRTOS_Library/Debug" \
   -L"${OUT_DIR}" \
-  -Xlinker --gc-sections \
+  -flto -Os -Xlinker --gc-sections \
   -Xlinker -Map="${OUT_DIR}/LPC1768_AIO.map" \
   -T "${LPC_DIR}/Debug/example01_gnu.ld" \
   -o "${OUT_DIR}/LPC1768_AIO.axf" \

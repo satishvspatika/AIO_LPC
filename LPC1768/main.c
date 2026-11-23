@@ -28,19 +28,19 @@
  * case fail cleanly: sscanf returns what it matched so far, the print stops. Nothing is ever
  * handed out, so free has nothing to do. */
 struct _reent;
-void *_malloc_r(struct _reent *r, size_t n)
+__attribute__((used)) void *_malloc_r(struct _reent *r, size_t n)   /* used: only the C library calls these (LTO) */
 {
     (void)r; (void)n;
     return NULL;
 }
 
-void *_realloc_r(struct _reent *r, void *p, size_t n)
+__attribute__((used)) void *_realloc_r(struct _reent *r, void *p, size_t n)
 {
     (void)r; (void)p; (void)n;
     return NULL;
 }
 
-void _free_r(struct _reent *r, void *p)
+__attribute__((used)) void _free_r(struct _reent *r, void *p)
 {
     (void)r; (void)p;
 }

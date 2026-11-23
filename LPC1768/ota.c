@@ -355,6 +355,57 @@ void ota_slot_not_sent(int slot, const char *time14)
     ota_log("OTA", "OTA: check slot not sent: will ask after the next slot that goes");
 }
 
+/* v6.9.66: SEND STATUS on the keypad also reaches the office page: this unit's usual check, marked k=1,
+ * with what it sees now (battery, signal, network, operator, records waiting, SD card). The office keeps
+ * it apart from the daily health report. Only "did the office answer" is used: a firmware offer is left
+ * to the slot checks, so the button never starts a download. A technician on site sees at once whether
+ * the unit reaches the office server (1958 and 1962 on 23 Nov: running 2 days, never on the page). */
+static int s_keypad_result = -1;
+
+int ota_keypad_result(void)
+{
+    const int r = s_keypad_result;
+    s_keypad_result = -1;
+    return r;
+}
+
+bool ota_keypad_status(const telemetry_data_t *telem, int csq_dbm, int net, const char *carrier)
+{
+    char op[17];
+    size_t n = 0;
+    for (const char *p = carrier ? carrier : ""; *p && n < sizeof(op) - 1; p++) {
+        if ((*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) {
+            op[n++] = *p;   /* letters and digits only: it goes in a URL */
+        }
+    }
+    op[n] = '\0';
+    ota_server();
+    ota_load();
+    const bool failed = (s_st.phase == 'F' || s_st.phase == 'f');
+    const uint32_t pending = storage_backlog_get_pending_count();
+    const int bv = (int)(telem->bat1_volt * 100.0f + 0.5f);
+    snprintf(s_path, sizeof(s_path),
+             "/lpc/check?id=%.12s&p=%d&cc=%08lX&v=%s&c=%08lX&s=%c&t=%08lX&k=1&bv=%d.%02d&sig=%d&net=%d&op=%s&q=%lu&sd=%d",
+             flash_nvram_get_station_id(), (int)UNIT_CFG, (unsigned long)fw_app_ctrl_crc(), FIRMWARE_VERSION,
+             (unsigned long)fw_app_running_crc(), (s_st.phase == 'D' || s_st.phase == 'd') ? '1' : failed ? '3' : '0',
+             (unsigned long)(failed ? s_st.image_crc : 0UL), bv / 100, bv % 100, csq_dbm, net, op[0] ? op : "NA",
+             (unsigned long)pending, storage_sd_is_ok() ? 1 : 0);
+    int len = 0, status = 0;
+    hal_power_heartbeat();
+    const char *body = sim7600_http_get(s_host, s_port, s_path, &len, &status);
+    const bool ok = body && status == 200 && strstr(body, "OTA ") != NULL;
+    sim7600_http_get_close();
+    if (ok) {
+        ota_log("OTA", "OTA: SEND STATUS: the office answered");
+    } else {
+        snprintf(s_text, sizeof(s_text), "OTA: SEND STATUS: no answer from %.40s (HTTP %d) %.88s", s_host, status,
+                 sim7600_http_get_fail_text());
+        ota_log("OTA", s_text);
+    }
+    s_keypad_result = ok ? 1 : 0;
+    return ok;
+}
+
 void ota_slot_step(int slot)
 {
     /* Taken now: the slot's own copy is from its start, and this needs the time left to the next slot */
