@@ -94,24 +94,31 @@ static void ota_save(void)
     }
 }
 
-static void ota_load(void)
+/* v6.9.66: into *o with its own text buffer, so the keypad check (another task) can read the saved
+ * state without touching s_st or s_text, which the main task uses */
+static void ota_read_state(ota_state_t *o, char *text, size_t text_size)
 {
     unsigned long file_crc = 0, image_crc = 0, size = 0;
     char phase = '-', why = '-';
     unsigned n = 0;
-    memset(&s_st, 0, sizeof(s_st));
-    s_st.phase = '-';
-    s_st.why = '-';
-    if (storage_state_load(OTA_STATE_FILENAME, s_text, sizeof(s_text)) &&
-        sscanf(s_text, "%8lx %8lx %lu %c %c %u", &file_crc, &image_crc, &size, &phase, &why, &n) >= 4 &&
+    memset(o, 0, sizeof(*o));
+    o->phase = '-';
+    o->why = '-';
+    if (storage_state_load(OTA_STATE_FILENAME, text, text_size) &&
+        sscanf(text, "%8lx %8lx %lu %c %c %u", &file_crc, &image_crc, &size, &phase, &why, &n) >= 4 &&
         strchr("DIFdif", phase) && phase != '\0') {
-        s_st.file_crc = file_crc;
-        s_st.image_crc = image_crc;
-        s_st.size = size;
-        s_st.phase = phase;
-        s_st.why = why;
-        s_st.n = n;
+        o->file_crc = file_crc;
+        o->image_crc = image_crc;
+        o->size = size;
+        o->phase = phase;
+        o->why = why;
+        o->n = n;
     }
+}
+
+static void ota_load(void)
+{
+    ota_read_state(&s_st, s_text, sizeof(s_text));
 }
 
 static void ota_forget_file(char phase)
@@ -380,15 +387,18 @@ bool ota_keypad_status(const telemetry_data_t *telem, int csq_dbm, int net, cons
     }
     op[n] = '\0';
     ota_server();
-    ota_load();
-    const bool failed = (s_st.phase == 'F' || s_st.phase == 'f');
+    /* The saved state, read into a copy: s_st and s_text belong to the main task (it may be installing) */
+    static ota_state_t now_st;
+    static char st_text[48];
+    ota_read_state(&now_st, st_text, sizeof(st_text));
+    const bool failed = (now_st.phase == 'F' || now_st.phase == 'f');
     const uint32_t pending = storage_backlog_get_pending_count();
     const int bv = (int)(telem->bat1_volt * 100.0f + 0.5f);
     snprintf(s_path, sizeof(s_path),
              "/lpc/check?id=%.12s&p=%d&cc=%08lX&v=%s&c=%08lX&s=%c&t=%08lX&k=1&bv=%d.%02d&sig=%d&net=%d&op=%s&q=%lu&sd=%d",
              flash_nvram_get_station_id(), (int)UNIT_CFG, (unsigned long)fw_app_ctrl_crc(), FIRMWARE_VERSION,
-             (unsigned long)fw_app_running_crc(), (s_st.phase == 'D' || s_st.phase == 'd') ? '1' : failed ? '3' : '0',
-             (unsigned long)(failed ? s_st.image_crc : 0UL), bv / 100, bv % 100, csq_dbm, net, op[0] ? op : "NA",
+             (unsigned long)fw_app_running_crc(), (now_st.phase == 'D' || now_st.phase == 'd') ? '1' : failed ? '3' : '0',
+             (unsigned long)(failed ? now_st.image_crc : 0UL), bv / 100, bv % 100, csq_dbm, net, op[0] ? op : "NA",
              (unsigned long)pending, storage_sd_is_ok() ? 1 : 0);
     int len = 0, status = 0;
     hal_power_heartbeat();
@@ -398,9 +408,10 @@ bool ota_keypad_status(const telemetry_data_t *telem, int csq_dbm, int net, cons
     if (ok) {
         ota_log("OTA", "OTA: SEND STATUS: the office answered");
     } else {
-        snprintf(s_text, sizeof(s_text), "OTA: SEND STATUS: no answer from %.40s (HTTP %d) %.88s", s_host, status,
+        static char text[176];   /* not s_text: the main task may be writing it (install) */
+        snprintf(text, sizeof(text), "OTA: SEND STATUS: no answer from %.40s (HTTP %d) %.88s", s_host, status,
                  sim7600_http_get_fail_text());
-        ota_log("OTA", s_text);
+        ota_log("OTA", text);
     }
     s_keypad_result = ok ? 1 : 0;
     return ok;
