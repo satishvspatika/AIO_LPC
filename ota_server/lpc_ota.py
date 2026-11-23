@@ -784,16 +784,20 @@ PAGE_CSS = """
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased;font-feature-settings:"tnum" 1}
 /* App bar: brand, tabs and account on one line */
 header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
-.top{max-width:1200px;margin:0 auto;padding:0 24px;height:56px;display:flex;align-items:center;gap:28px}
+.top{max-width:1200px;margin:0 auto;padding:0 24px;height:56px;display:flex;align-items:center;gap:20px}
 .brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink);flex:none}
 .brand .mark{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--acc),var(--esp));color:#fff;display:grid;place-items:center;font-weight:800;font-size:11px;letter-spacing:.04em}
 .brand b{font-size:15px;display:block;line-height:1.15;letter-spacing:-.01em}.brand small{color:var(--mute);font-size:12px;display:block;line-height:1.2}
-nav{display:flex;gap:4px;align-self:stretch;overflow-x:auto;scrollbar-width:none;flex:1;min-width:0}nav::-webkit-scrollbar{display:none}
-nav a{display:flex;align-items:center;padding:0 12px;color:var(--mute);text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;font-weight:600;font-size:14px}
-nav a:hover{color:var(--ink)}nav a.on{color:var(--ink);border-bottom-color:var(--acc)}
+/* Top menu: the station groups */
+nav.groups{display:flex;gap:2px;align-self:stretch;overflow-x:auto;scrollbar-width:none;flex:1;min-width:0}nav.groups::-webkit-scrollbar{display:none}
+.gtab{display:flex;align-items:center;gap:7px;padding:0 12px;color:var(--mute);text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;font-weight:600;font-size:14px}
+.gtab:hover{color:var(--ink);background:var(--soft)}.gtab.on{color:var(--ink)}
+.gtab .sw{width:9px;height:9px;border-radius:3px;background:var(--mute);flex:none}
+.gtab.lpc1768 .sw{background:var(--lpc)}.gtab.esp32 .sw{background:var(--esp)}.gtab.dwlr .sw{background:var(--dwlr)}
+.gtab.on.lpc1768{border-bottom-color:var(--lpc)}.gtab.on.esp32{border-bottom-color:var(--esp)}.gtab.on.dwlr{border-bottom-color:var(--dwlr)}
 .topr{display:flex;align-items:center;gap:10px;flex:none}
 .top .out{color:var(--ink2);text-decoration:none;font-size:13px;font-weight:600;padding:6px 12px;border:1px solid var(--line2);border-radius:8px;white-space:nowrap}
-.top .out:hover{background:var(--soft)}
+.top .out:hover{background:var(--soft)}.top .out.on{background:var(--acc-soft);border-color:var(--acc);color:var(--acc)}
 .theme{display:inline-flex;border:1px solid var(--line2);border-radius:8px;overflow:hidden}
 .theme button{background:var(--card);color:var(--mute);border:0;border-radius:0;padding:5px 10px;font-size:12px;font-weight:600;height:auto}
 .theme button+button{border-left:1px solid var(--line2)}.theme button.on{background:var(--acc-soft);color:var(--acc)}
@@ -858,23 +862,19 @@ td a{text-decoration:none;font-weight:600}td a:hover{text-decoration:underline}
 .login{max-width:380px;margin:14vh auto;padding:28px}.login input{width:100%;margin-bottom:10px}.login button{width:100%;height:40px}
 .login .brand{margin-bottom:18px}
 /* Board and station type switch (type_bar) */
-.ctx{display:flex;flex-direction:column;gap:10px;margin:0 0 18px}
-.fsegs{display:inline-flex;align-self:flex-start;max-width:100%;overflow-x:auto;scrollbar-width:none;background:var(--card);border:1px solid var(--line2);border-radius:10px;padding:3px;gap:2px;box-shadow:var(--shadow)}
-.fsegs::-webkit-scrollbar{display:none}
-.fseg{display:flex;align-items:center;gap:8px;padding:6px 14px;border-radius:7px;color:var(--ink2);text-decoration:none;font-weight:600;font-size:13.5px;white-space:nowrap;flex:none}
-.fseg:hover{background:var(--soft)}
-.fseg .sw{width:8px;height:8px;border-radius:2px;background:var(--mute)}.fseg.lpc1768 .sw{background:var(--lpc)}.fseg.esp32 .sw{background:var(--esp)}.fseg.dwlr .sw{background:var(--dwlr)}
-.fseg.on{color:#fff}.fseg.on .sw{background:#fff;opacity:.85}
-.fseg.on.lpc1768{background:var(--lpc)}.fseg.on.esp32{background:var(--esp)}.fseg.on.dwlr{background:var(--dwlr)}
 .ct{display:inline-block;min-width:20px;padding:0 6px;border-radius:999px;background:var(--off-bg);color:var(--ink2);font-size:12px;font-weight:600;line-height:19px;text-align:center}
-.on>.ct{background:rgba(255,255,255,.22);color:inherit}
+.topt.on>.ct{background:rgba(255,255,255,.22);color:inherit}.gtab.on>.ct{background:var(--acc-soft);color:var(--acc)}
 .flag{display:inline-block;min-width:19px;padding:0 5px;border-radius:999px;background:var(--bad);color:#fff;font-size:11.5px;font-weight:700;line-height:19px;text-align:center;margin-left:-3px}
-.types{display:flex;gap:10px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin;padding-bottom:2px}
+.types{display:flex;gap:10px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin;padding-bottom:2px;margin:0 0 18px}
 .tgrp{display:flex;align-items:center;flex:none;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px}
 .tbase{padding:0 8px 0 9px;font-size:11.5px;font-weight:700;color:var(--mute);text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
 .topt{display:flex;align-items:center;gap:7px;padding:5px 11px;border-radius:7px;color:var(--ink2);text-decoration:none;font-weight:600;font-size:13px;white-space:nowrap}
 .topt:hover{background:var(--soft)}.topt.on{background:var(--acc);color:var(--acc-ink)}.topt.on .flag{box-shadow:0 0 0 2px var(--acc)}
-.here{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 16px}
+.here{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 6px}
+/* A type's sections: Stations, Firmware files, History */
+nav.sect{display:flex;gap:4px;border-bottom:1px solid var(--line2);margin:0 0 18px;overflow-x:auto;scrollbar-width:none}nav.sect::-webkit-scrollbar{display:none}
+nav.sect a{display:flex;align-items:center;gap:7px;padding:10px 14px;color:var(--mute);text-decoration:none;font-weight:600;font-size:14px;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap}
+nav.sect a:hover{color:var(--ink)}nav.sect a.on{color:var(--acc);border-bottom-color:var(--acc)}nav.sect a.on .ct{background:var(--acc-soft);color:var(--acc)}
 .here h1{margin:0;font-size:22px;font-weight:700;letter-spacing:-.015em}.here .mute{font-size:14px}
 .fam{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.05em;background:var(--line);color:var(--ink);vertical-align:middle;white-space:nowrap}
 .fam.esp32{background:var(--esp);color:#fff}.fam.dwlr{background:var(--dwlr);color:#fff}.fam.lpc1768{background:var(--lpc);color:#fff}
@@ -908,18 +908,19 @@ td a{text-decoration:none;font-weight:600}td a:hover{text-decoration:underline}
 .hero{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
 .hero h1{margin:0;font-size:24px;letter-spacing:-.015em;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .back{display:inline-flex;align-items:center;gap:4px;margin:0 0 14px;text-decoration:none;font-weight:600;font-size:13.5px;color:var(--mute)}.back:hover{color:var(--acc)}
-@media (max-width:900px){.brand small{display:none}.top{gap:16px}}
+@media (max-width:1360px){.brand small{display:none}}@media (max-width:1060px){.top{height:auto;flex-wrap:wrap;padding:10px 20px 0;gap:8px 12px}.brand{flex:1}nav.groups{order:3;flex-basis:100%;margin:0 -20px;padding:0 8px;border-top:1px solid var(--line)}.gtab{padding:11px 12px}}
 @media (max-width:760px){
 .top{height:auto;flex-wrap:wrap;padding:10px 14px 0;gap:8px 10px}.brand{flex:1}.topr{gap:6px}
-nav{order:3;flex-basis:100%;margin:0 -14px;padding:0 6px;border-top:1px solid var(--line)}nav a{padding:10px 10px}
+nav.groups{order:3;flex-basis:100%;margin:0 -14px;padding:0 6px;border-top:1px solid var(--line)}
 .theme button{padding:4px 7px;font-size:11.5px}.top .out{padding:5px 9px;font-size:12.5px}
 main{padding:14px}.card{padding:16px}.scroll{margin:0 -16px;padding:0 16px}
 .tiles{grid-template-columns:repeat(2,1fr);gap:10px}.tile{padding:12px 14px}.tile b{font-size:22px}
-.fsegs{align-self:stretch}.fseg{padding:6px 10px;font-size:13px}.here h1{font-size:19px}
+.gtab{padding:10px 10px}.here h1{font-size:19px}
 .steps-bar .lbl{font-size:11px}}
 """
 
-TABS = [("stations", "Stations"), ("firmware", "Firmware files"), ("history", "History"), ("password", "Password")]
+# 23 Nov 2026 (user): the top menu is the three station groups; inside a group, the type and then its sections
+SECTIONS = [("stations", "Stations"), ("firmware", "Firmware files"), ("history", "History")]
 
 
 def esc(v):
@@ -943,43 +944,63 @@ def when(ts):
 TYPED_TABS = ("stations", "firmware", "history")
 
 
-def type_bar(tab, ptype):
-    """Where you are: first the board family (LPC (TRG/TWS), ESP32 (TRG/TWS), ESP32 (DWLR)), then the station type within it.
-    Each shows its station count and, in red, how many need a look, so nothing is missed.
-    23 Nov 2026 (user: the AIO9 types spilled onto a second line): the types are grouped by station type with
-    their display variants side by side ("KSNDMC TRG  Nuvoton 2  Matrix 1"), on one line that scrolls sideways
-    when it is too narrow."""
+def nav_counts():
+    """Per type: stations, stations that need a look, firmware files; and the types with a station or a file."""
     with db() as con:
         stations = con.execute("SELECT * FROM stations").fetchall()
-        used = {r["profile"] for r in con.execute("SELECT profile FROM builds UNION SELECT profile FROM stations")}
+        builds = con.execute("SELECT profile FROM builds").fetchall()
     counts = type_counts(stations)
     flagged = {p: 0 for p in TYPES}
     for st in stations:
         if st["profile"] in flagged and attention(st, health_of(st)):
             flagged[st["profile"]] += 1
+    files = {p: 0 for p in TYPES}
+    files[CTRL_PROFILE] = 0
+    for b in builds:
+        if b["profile"] in files:
+            files[b["profile"]] += 1
+    used = {st["profile"] for st in stations} | {b["profile"] for b in builds}
+    return {"counts": counts, "flagged": flagged, "files": files, "used": used}
 
-    def plural(n, word):
-        return f"{n} {word}{'' if n == 1 else 's'}"
 
-    def flag(n):
-        return f"<span class='flag' title='{plural(n, 'station')} need{'s' if n == 1 else ''} a look'>{n}</span>" if n else ""
+def _plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
-    cur = group_of(ptype)
-    fams = []
+
+def _flag(n):
+    return (f"<span class='flag' title='{_plural(n, 'station')} need{'s' if n == 1 else ''} a look'>{n}</span>"
+            if n else "")
+
+
+def group_nav(tab, ptype, nc):
+    """The top menu: the three station groups, each with its station count and (red) how many need a look.
+    A group keeps the section (Stations, Firmware files, History) that is open."""
+    counts, flagged, used = nc["counts"], nc["flagged"], nc["used"]
+    sect = tab if tab in TYPED_TABS else "stations"
+    out = []
     for name, cls, group in GROUPS:
         n = sum(counts[p] for p in group)
         bad = sum(flagged[p] for p in group)
+        on = ptype in group
         first = max(group, key=lambda p: (counts[p], p in used, -p))
-        on = group is cur[2]
-        fams.append(f"<a href='/?tab={tab}&type={ptype if on else first}' class='fseg {cls}{' on' if on else ''}'"
-                    f" title='{esc(name)}: {plural(n, 'station')}" + (f", {bad} need a look" if bad else "") + "'>"
-                    f"<i class='sw'></i><span>{esc(name)}</span><span class='ct'>{n}</span>{flag(bad)}</a>")
+        out.append(f"<a href='/?tab={sect}&type={ptype if on else first}' class='gtab {cls}{' on' if on else ''}'"
+                   f" title='{esc(name)}: {_plural(n, 'station')}" + (f", {bad} need a look" if bad else "") + "'>"
+                   f"<i class='sw'></i>{esc(name)}<span class='ct'>{n}</span>{_flag(bad)}</a>")
+    return "".join(out)
+
+
+def type_bar(tab, ptype, nc):
+    """Inside a group: which station type (one line; ESP32 types grouped by station type with the display
+    variants side by side, "KSNDMC TRG  Nuvoton 2  Matrix 1"; it scrolls sideways when narrow), then the
+    chosen type's sections: Stations, Firmware files, History."""
+    counts, flagged, used, files = nc["counts"], nc["flagged"], nc["used"], nc["files"]
+    cur = group_of(ptype)
 
     def opt(text, p):
         return (f"<a href='/?tab={tab}&type={p}' class='topt{' on' if p == ptype else ''}'"
-                f" title='{esc(TYPES[p])}: {plural(counts[p], 'station')}"
+                f" title='{esc(TYPES[p])}: {_plural(counts[p], 'station')}"
                 + (f", {flagged[p]} need a look" if flagged[p] else "") + f"'>{esc(text)}"
-                f"<span class='ct'>{counts[p]}</span>{flag(flagged[p])}</a>")
+                f"<span class='ct'>{counts[p]}</span>{_flag(flagged[p])}</a>")
 
     bases = {}      # station type -> [(display variant or "", type number)], in GROUPS order
     for p in cur[2]:
@@ -994,11 +1015,13 @@ def type_bar(tab, ptype):
         else:
             tgroups.append(f"<div class='tgrp'><span class='tbase'>{esc(base)}</span>"
                            + "".join(opt(v or base, p) for v, p in items) + "</div>")
-    n = counts[ptype]
-    here = (f"<div class='here'><span class='fam {cur[1]}'>{cur[0]}</span><h1>{esc(type_label(ptype))}</h1>"
-            f"<span class='mute'>{plural(n, 'station')}</span></div>")
-    return (f"<div class='ctx'><div class='fsegs' role='tablist' aria-label='Board'>{''.join(fams)}</div>"
-            f"<div class='types' role='tablist' aria-label='Station type'>{''.join(tgroups)}</div></div>{here}")
+    nfiles = files.get(ptype, 0) + (files.get(CTRL_PROFILE, 0) if ptype in LPC_TYPES else 0)
+    extra = {"stations": counts[ptype], "firmware": nfiles}
+    sects = "".join(f"<a href='/?tab={k}&type={ptype}' class='{'on' if k == tab else ''}'>{t}"
+                    + (f"<span class='ct'>{extra[k]}</span>" if k in extra else "") + "</a>" for k, t in SECTIONS)
+    return (f"<div class='types' role='tablist' aria-label='Station type'>{''.join(tgroups)}</div>"
+            f"<div class='here'><span class='fam {cur[1]}'>{esc(cur[0])}</span><h1>{esc(type_label(ptype))}</h1></div>"
+            f"<nav class='sect' aria-label='Section'>{sects}</nav>")
 
 
 # Theme: Auto (follows the device), Light or Dark; kept per browser in localStorage
@@ -1016,20 +1039,20 @@ def page(title, body, tab=None, message="", script="", ptype=None, type_bar_show
             f"<style>{PAGE_CSS}{HEALTH_CHART_CSS}</style>{THEME_HEAD_JS}</head><body>")
     if tab is None:
         return (head + f"<main>{body}</main></body></html>").encode()
-    tq = f"&type={ptype}" if ptype in TYPES else ""
-    nav = "".join(f"<a href='/?tab={k}{tq if k in TYPED_TABS else ''}' class='{'on' if k == tab else ''}'>{t}</a>"
-                  for k, t in TABS)
-    bar = type_bar(tab, ptype) if type_bar_shown and tab in TYPED_TABS and ptype in TYPES else ""
+    nc = nav_counts()
+    nav = group_nav(tab, ptype, nc)
+    bar = type_bar(tab, ptype, nc) if type_bar_shown and tab in TYPED_TABS and ptype in TYPES else ""
     msg = ""
     if message:
         cls = "msg bad" if message.lower().startswith(("file refused", "wrong", "not ", "no ", "the new", "build #")) and "deleted" not in message else "msg"
         msg = f"<div class='{cls}'>{esc(message)}</div>"
     return (head + "<header><div class='top'><a class='brand' href='/'><span class='mark'>AIO</span>"
             "<span><b>AIO Stations</b><small>Firmware updates &amp; health</small></span></a>"
-            f"<nav>{nav}</nav>"
+            f"<nav class='groups' aria-label='Station groups'>{nav}</nav>"
             "<span class='topr'><span class='theme' role='group' aria-label='Theme'>"
             "<button type='button' data-t='auto' title='Follow this computer or phone'>Auto</button>"
             "<button type='button' data-t='light'>Light</button><button type='button' data-t='dark'>Dark</button></span>"
+            f"<a class='out{' on' if tab == 'password' else ''}' href='/?tab=password'>Password</a>"
             f"<a class='out' href='/logout'>Log out</a></span></div>{THEME_SWITCH_JS}"
             f"</header><main>{bar}{msg}{body}</main>{script}</body></html>").encode()
 
@@ -1872,7 +1895,7 @@ def stations_tab(ptype, search):
     h.append("<div class='card'><h2>Send an update</h2>")
     if not tb:
         h.append(f"<p class='hint' style='margin:0'>No firmware of this type uploaded yet: see "
-                 "<a href='/?tab=firmware'>Firmware files</a>.</p></div>")
+                 f"<a href='/?tab=firmware&type={ptype}'>Firmware files</a>.</p></div>")
     else:
         opts = "".join(f"<option value='{b['id']}'>{esc(build_name(b))}{' · ' + esc(b['note']) if b['note'] else ''}</option>"
                        for b in tb)
@@ -2044,18 +2067,26 @@ def firmware_tab(ptype):
         for s in con.execute("SELECT shown_id, profile, ctrl_target FROM stations WHERE ctrl_target != ''"):
             if s["ctrl_target"].isdigit():
                 used_by.setdefault(int(s["ctrl_target"]), []).append(sid(s) + " (CTRL)")
+    # 23 Nov 2026: Firmware files sits inside its station group, so it explains that group's files only
+    if ptype in LPC_TYPES:
+        what = ("The file that goes on the SD card: <code>fw_ksn_trg.hex</code>, <code>fw_bihar.hex</code> or "
+                "<code>fw_ksn_tws.hex</code>, or <code>ctrl.hex</code> for the CTRL board (one file for every LPC type).")
+        accept = ".hex"
+    elif ptype in DWLR_TYPES:
+        what = "The DWLR build's <code>.bin</code> (DWLR-D15-S.13 or later)."
+        accept = ".bin"
+    else:
+        what = ("The build's <code>.bin</code> (AIO9 v6.56 or later). Its station type and display (Nuvoton or Matrix) "
+                "are read from the file. For 4 MB units upload the 4 MB build.")
+        accept = ".bin"
     h = ["<div class='card'><h2>Upload firmware</h2>"
-         "<ol class='steps'><li><b>LPC (TRG/TWS) stations:</b> the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
-         "<code>fw_bihar.hex</code>, <code>fw_ksn_tws.hex</code>, or <code>ctrl.hex</code> for the CTRL board "
-         "(one file for every type).</li><li><b>ESP32 stations:</b> the build's <code>.bin</code> (AIO9 v6.56 or later; "
-         "DWLR from DWLR-D15-S.13). "
-         "Its station type (unit, Nuvoton or Matrix) is read from the file. For 4 MB units upload the 4 MB build.</li>"
+         f"<ol class='steps'><li>{what}</li>"
          "<li>The station type and version are read from the file. A damaged or wrong file is refused.</li>"
-         "<li>It is filed under its own type, whichever type is chosen above.</li>"
-         f"<li>Uploading sends it to nobody. Choose stations on the <a href='/?tab=stations&type={ptype}'>Stations</a> tab.</li></ol>"
+         "<li>It is filed under its own type: a file of another type shows under that type.</li>"
+         f"<li>Uploading sends it to nobody. Choose stations under <a href='/?tab=stations&type={ptype}'>Stations</a>.</li></ol>"
          "<form method='post' action='/upload' enctype='multipart/form-data' class='stack'>"
          f"<input type='hidden' name='back' value='/?tab=firmware&type={ptype}'>"
-         "<div><label class='f'>File</label><input type='file' name='file' accept='.hex,.bin' required></div>"
+         f"<div><label class='f'>File</label><input type='file' name='file' accept='{accept}' required></div>"
          "<div><label class='f'>Note (optional)</label><input name='note' placeholder='e.g. SMS fix, for test team' size='34' maxlength='60'></div>"
          "<div><button>Upload</button></div></form></div>"]
     h.append(f"<div class='card'><h2>Firmware files{' (and CTRL board files)' if ptype in LPC_TYPES else ''}</h2><div class='scroll'><table>"
@@ -2080,10 +2111,12 @@ def firmware_tab(ptype):
 
 def history_tab(ptype):
     with db() as con:
-        events = con.execute("SELECT * FROM events WHERE profile=? OR profile IS NULL ORDER BY id DESC LIMIT 300",
-                             (ptype,)).fetchall()
+        # Office events of no type show under every type, except CTRL files: only LPC stations have a CTRL board
+        ctrl_ok = 1 if ptype in LPC_TYPES else 0
+        events = con.execute("SELECT * FROM events WHERE profile=? OR (profile IS NULL AND (? OR text NOT LIKE '%CTRL%'))"
+                             " ORDER BY id DESC LIMIT 300", (ptype, ctrl_ok)).fetchall()
     h = [f"<div class='card'><h2>History</h2><p class='hint'>The newest first, the last {EVENTS_PER_STATION} of each station. "
-         "Office events that belong to no type (password) show under every type.</p><div class='scroll'><table>"
+         "Office events of no type (password) show under every type; CTRL file events under the LPC types.</p><div class='scroll'><table>"
          "<tr><th>When</th><th>Station</th><th>What happened</th></tr>"]
     for e in events:
         t = e["text"]
@@ -2129,7 +2162,7 @@ def login_page(error=""):
     err = f"<p class='badt'>{esc(error)}</p>" if error else ""
     return page("Log in", f"<div class='card login'><div class='brand'><span class='mark'>AIO</span><span><b>AIO Stations</b>"
                 "<small>Firmware updates &amp; health</small></span></div>"
-                f"<p class='hint'>LPC (TRG/TWS), ESP32 (TRG/TWS) and ESP32 (DWLR) stations. Log in to continue.</p>{err}"
+                f"<p class='hint'>Log in to continue.</p>{err}"
                 "<form method='post' action='/login'>"
                 "<input name='user' placeholder='User' autocomplete='username' required>"
                 "<input name='password' type='password' placeholder='Password' autocomplete='current-password' required>"

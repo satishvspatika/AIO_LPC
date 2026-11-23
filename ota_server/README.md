@@ -20,11 +20,12 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
 
 ## Use (office page)
 
-- **Groups** (top of Stations, Firmware files and History): LPC (TRG/TWS), ESP32 (TRG/TWS), ESP32 (DWLR), each
-  with its station count and, in a red badge, how many stations need a look.
-- **Station type switch**, under the groups, on one line (it scrolls sideways when the window is narrow): the
-  group's types with their counts. ESP32 types are grouped by station type with the display side by side, e.g.
-  `KSNDMC TRG  Nuvoton 2  Matrix 1`. Everything below it is that type only.
+- **Top menu: the three station groups**, LPC (TRG/TWS), ESP32 (TRG/TWS) and ESP32 (DWLR), each with its station
+  count and, in a red badge, how many stations need a look. Password and Log out are at the top right.
+- **Inside a group**: the station type switch on one line (it scrolls sideways when the window is narrow), with
+  counts; ESP32 types are grouped by station type with the display side by side, e.g. `KSNDMC TRG  Nuvoton 2
+  Matrix 1`. Under the type: its sections **Stations**, **Firmware files** and **History**. Everything below is
+  that type only (the LPC types also list the CTRL files and their events).
 - **Live**: the Stations tab and each station's page redraw themselves (every 3 s while a station is updating,
   every 20 s otherwise): progress bar, KB done, speed and time left, and the update steps Sent, Downloading,
   Installing (ESP32: On trial), Updated. No reload is needed. A download that stops for the slot shows "paused".
@@ -47,7 +48,8 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
   `fw_ksn_tws.hex`). It is refused unless it is a whole main-firmware file with the right header and CRC.
   Uploading sends it to nobody. It is filed under its own type (read from the file) and the page then shows
   that type. The list shows the chosen type's files only.
-- **History**: the chosen type's events (a password change shows under every type).
+- **History**: the chosen type's events (a password change shows under every type; CTRL file events under the
+  LPC types only).
 - A station checks twice a day (00:30 to 02:15 and 12:30 to 14:15, by station number; v6.9.60 and earlier: 01:00 and 13:00), or after every delivered slot with `OTA.NOW`
   on its card. It appears on the page by itself at its first check (firmware v6.9.55 build 23 and later).
 
