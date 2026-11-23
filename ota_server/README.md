@@ -20,10 +20,11 @@ The health app (port 80, 8000) and the BIH dashboard (port 5001) are separate an
 
 ## Use (office page)
 
-- **Groups** (top of Stations, Firmware files and History): LPC1768, ESP32 AIO9, ESP32 DWLR, each with its
-  station count; under it the group's types (on a phone the type row scrolls sideways).
-- **Unit type switch**: KSNDMC TRG, BIHAR TRG, KSNDMC TWS,
-  each with its station count and how many need a look. Everything below it is that type only.
+- **Groups** (top of Stations, Firmware files and History): LPC (TRG/TWS), ESP32 (TRG/TWS), ESP32 (DWLR), each
+  with its station count and, in a red badge, how many stations need a look.
+- **Station type switch**, under the groups, on one line (it scrolls sideways when the window is narrow): the
+  group's types with their counts. ESP32 types are grouped by station type with the display side by side, e.g.
+  `KSNDMC TRG  Nuvoton 2  Matrix 1`. Everything below it is that type only.
 - **Live**: the Stations tab and each station's page redraw themselves (every 3 s while a station is updating,
   every 20 s otherwise): progress bar, KB done, speed and time left, and the update steps Sent, Downloading,
   Installing (ESP32: On trial), Updated. No reload is needed. A download that stops for the slot shows "paused".

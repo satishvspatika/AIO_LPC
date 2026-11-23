@@ -50,7 +50,7 @@ CTRL_SLOT_SIZE = 0x6000
 CTRL_BOARD_ID = 0x845
 CTRL_PROFILE = 9                # builds.profile of a CTRL file: for every station type
 LPC_OLD_NAMES = {0: "KSNDMC TRG", 1: "BIHAR TRG", 2: "KSNDMC TWS"}   # as written in older history events
-LPC_TYPES = {p: f"LPC1768 · {t}" for p, t in LPC_OLD_NAMES.items()}
+LPC_TYPES = {p: f"LPC · {t}" for p, t in LPC_OLD_NAMES.items()}   # 23 Nov 2026: was "LPC1768 · ..." (user)
 TYPES = dict(LPC_TYPES)
 # ESP32 AIO9 stations. The firmware compiles its type number into an "AIOOTA1" block (ota_esp.ino):
 # base + 0 for the Nuvoton UI (-N), + 1 for the Matrix UI (-M). Station ids are sent with an "E" in
@@ -88,7 +88,8 @@ def family(profile):
 # The office page's top-level groups: (name, css class, types). DWLR has its own group so it is not lost
 # at the end of the AIO9 type row.
 AIO9_TYPES = {p: t for p, t in ESP_TYPES.items() if p not in DWLR_TYPES}
-GROUPS = (("LPC1768", "lpc1768", LPC_TYPES), ("ESP32 AIO9", "esp32", AIO9_TYPES), ("ESP32 DWLR", "dwlr", DWLR_TYPES))
+# 23 Nov 2026 (user): shown as LPC (TRG/TWS), ESP32 (TRG/TWS) and ESP32 (DWLR); were LPC1768, ESP32 AIO9, ESP32 DWLR
+GROUPS = (("LPC (TRG/TWS)", "lpc1768", LPC_TYPES), ("ESP32 (TRG/TWS)", "esp32", AIO9_TYPES), ("ESP32 (DWLR)", "dwlr", DWLR_TYPES))
 
 
 def group_of(profile):
@@ -770,121 +771,151 @@ def password_ok(user, pw):
 # ---------------------------------------------------------------- office pages
 
 PAGE_CSS = """
-:root{color-scheme:light;--bg:#f3f5f9;--card:#fff;--ink:#141b26;--mute:#5f6b7d;--line:#e3e8ef;--soft:#f7f9fc;--acc:#2563eb;--acc-ink:#fff;--acc-soft:#e8efff;
---ok:#137a4b;--ok-bg:#e3f5ea;--bad:#b42318;--bad-bg:#fdeceb;--wait:#975a00;--wait-bg:#fff3dc;--busy:#1d5fd1;--busy-bg:#e6efff;--off-bg:#eef1f5;
---esp:#16725d;--lpc:#3b4a85;--dwlr:#9a5b13;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06)}
-@media (prefers-color-scheme: dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1117;--card:#161c25;--ink:#e7ebf1;--mute:#9aa5b5;--line:#273141;--soft:#1b2330;--acc:#5b9cff;--acc-ink:#0b1220;--acc-soft:#16294a;
---ok:#4cc68d;--ok-bg:#11301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#222a35;
---esp:#1f8a71;--lpc:#4f62ad;--dwlr:#a8641c;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--shadow:none}}
-:root[data-theme=dark]{color-scheme:dark;--bg:#0d1117;--card:#161c25;--ink:#e7ebf1;--mute:#9aa5b5;--line:#273141;--soft:#1b2330;--acc:#5b9cff;--acc-ink:#0b1220;--acc-soft:#16294a;
---ok:#4cc68d;--ok-bg:#11301f;--bad:#f97066;--bad-bg:#3a1714;--wait:#f5b544;--wait-bg:#33260c;--busy:#7fb0ff;--busy-bg:#14284a;--off-bg:#222a35;
---esp:#1f8a71;--lpc:#4f62ad;--dwlr:#a8641c;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--shadow:none}
+:root{color-scheme:light;--bg:#f4f6f9;--card:#fff;--ink:#101828;--ink2:#344054;--mute:#667085;--line:#e4e7ec;--line2:#d0d5dd;--soft:#f9fafb;--acc:#2558d6;--acc-ink:#fff;--acc-soft:#eaf0fd;
+--ok:#067647;--ok-bg:#ecfdf3;--bad:#c01e14;--bad-bg:#fef3f2;--wait:#b54708;--wait-bg:#fffaeb;--busy:#175cd3;--busy-bg:#eff8ff;--off-bg:#f2f4f7;
+--esp:#0e7a63;--lpc:#3e4fa3;--dwlr:#a15c12;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--shadow:0 1px 2px rgba(16,24,40,.05);--r:12px}
+@media (prefers-color-scheme: dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0c1016;--card:#141a23;--ink:#eef1f5;--ink2:#c9d0da;--mute:#97a1b0;--line:#252e3b;--line2:#323d4d;--soft:#19212c;--acc:#6aa1ff;--acc-ink:#0b1220;--acc-soft:#17284a;
+--ok:#47cd89;--ok-bg:#0f2c1d;--bad:#f97066;--bad-bg:#371614;--wait:#fdb022;--wait-bg:#33250b;--busy:#84adff;--busy-bg:#14264a;--off-bg:#1f2732;
+--esp:#16967a;--lpc:#5b6cc4;--dwlr:#c07424;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--shadow:none}}
+:root[data-theme=dark]{color-scheme:dark;--bg:#0c1016;--card:#141a23;--ink:#eef1f5;--ink2:#c9d0da;--mute:#97a1b0;--line:#252e3b;--line2:#323d4d;--soft:#19212c;--acc:#6aa1ff;--acc-ink:#0b1220;--acc-soft:#17284a;
+--ok:#47cd89;--ok-bg:#0f2c1d;--bad:#f97066;--bad-bg:#371614;--wait:#fdb022;--wait-bg:#33250b;--busy:#84adff;--busy-bg:#14264a;--off-bg:#1f2732;
+--esp:#16967a;--lpc:#5b6cc4;--dwlr:#c07424;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--shadow:none}
 *{box-sizing:border-box}[hidden]{display:none!important}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased;font-feature-settings:"tnum" 1}
+/* App bar: brand, tabs and account on one line */
 header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
-.top{max-width:1120px;margin:0 auto;padding:12px 20px 0;display:flex;justify-content:space-between;align-items:center;gap:12px}
-.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink)}
-.brand .mark{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--acc),#16725d);color:#fff;display:grid;place-items:center;font-weight:800;font-size:12px;letter-spacing:.04em}
-.brand b{font-size:16px;display:block;line-height:1.2}.brand small{color:var(--mute);font-size:12px}
-.top .out{color:var(--mute);text-decoration:none;font-size:14px;padding:6px 12px;border:1px solid var(--line);border-radius:8px}
-.top .out:hover{color:var(--ink);background:var(--soft)}
-nav{max-width:1120px;margin:0 auto;padding:6px 20px 0;display:flex;gap:2px;overflow-x:auto}
-nav a{padding:10px 14px;color:var(--mute);text-decoration:none;border-bottom:2px solid transparent;white-space:nowrap;font-weight:600;font-size:14px}
-nav a:hover{color:var(--ink)}nav a.on{color:var(--acc);border-bottom-color:var(--acc)}
-main{max-width:1120px;margin:0 auto;padding:20px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px;box-shadow:var(--shadow);min-width:0}
-h2{margin:0 0 4px;font-size:16px;font-weight:700}.hint{margin:0 0 14px;color:var(--mute);font-size:14px}
-.head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}.head h2{margin:0}
-.msg{padding:12px 16px;border-radius:10px;margin-bottom:16px;background:var(--busy-bg);color:var(--ink);border:1px solid var(--line)}
-.msg.bad{background:var(--bad-bg)}
-input,select,button{font:inherit;padding:8px 12px;border:1px solid var(--line);border-radius:9px;background:var(--card);color:var(--ink);max-width:100%}
-input:focus,select:focus{outline:2px solid var(--acc-soft);border-color:var(--acc)}
-button{background:var(--acc);color:var(--acc-ink);border-color:var(--acc);cursor:pointer;font-weight:600}
-button:hover{filter:brightness(1.07)}
-button.plain{background:var(--card);color:var(--ink);border-color:var(--line);font-weight:500}
-button.del{background:transparent;color:var(--bad);border-color:var(--line);font-weight:500}
-button.small{padding:4px 10px;font-size:13px}
-.upd{display:flex;align-items:center;gap:8px}.rowact{margin:0}
-.banner{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:14px 18px;margin:0 0 14px;
-border:1px solid var(--line);border-left:4px solid var(--wait);background:var(--wait-bg);border-radius:14px}
-.banner>div{flex:1 1 380px;min-width:0}.banner b{display:block;font-size:15px}.banner span{color:var(--mute);font-size:14px}.banner span b{display:inline;color:var(--ink)}
+.top{max-width:1200px;margin:0 auto;padding:0 24px;height:56px;display:flex;align-items:center;gap:28px}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink);flex:none}
+.brand .mark{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--acc),var(--esp));color:#fff;display:grid;place-items:center;font-weight:800;font-size:11px;letter-spacing:.04em}
+.brand b{font-size:15px;display:block;line-height:1.15;letter-spacing:-.01em}.brand small{color:var(--mute);font-size:12px;display:block;line-height:1.2}
+nav{display:flex;gap:4px;align-self:stretch;overflow-x:auto;scrollbar-width:none;flex:1;min-width:0}nav::-webkit-scrollbar{display:none}
+nav a{display:flex;align-items:center;padding:0 12px;color:var(--mute);text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;font-weight:600;font-size:14px}
+nav a:hover{color:var(--ink)}nav a.on{color:var(--ink);border-bottom-color:var(--acc)}
+.topr{display:flex;align-items:center;gap:10px;flex:none}
+.top .out{color:var(--ink2);text-decoration:none;font-size:13px;font-weight:600;padding:6px 12px;border:1px solid var(--line2);border-radius:8px;white-space:nowrap}
+.top .out:hover{background:var(--soft)}
+.theme{display:inline-flex;border:1px solid var(--line2);border-radius:8px;overflow:hidden}
+.theme button{background:var(--card);color:var(--mute);border:0;border-radius:0;padding:5px 10px;font-size:12px;font-weight:600;height:auto}
+.theme button+button{border-left:1px solid var(--line2)}.theme button.on{background:var(--acc-soft);color:var(--acc)}
+main{max-width:1200px;margin:0 auto;padding:24px}
+/* Cards and text */
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:20px 22px;margin-bottom:16px;box-shadow:var(--shadow);min-width:0}
+h2{margin:0 0 4px;font-size:15px;font-weight:700;letter-spacing:-.005em}.hint{margin:0 0 14px;color:var(--mute);font-size:13.5px;max-width:860px}
+.head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}.head h2{margin:0}
+.msg{padding:12px 16px;border-radius:10px;margin-bottom:16px;background:var(--busy-bg);color:var(--ink);border:1px solid var(--line);border-left:4px solid var(--busy)}
+.msg.bad{background:var(--bad-bg);border-left-color:var(--bad)}
+.mute{color:var(--mute)}.okt{color:var(--ok)}.badt{color:var(--bad)}.waitt{color:var(--wait)}
+a{color:var(--acc)}code,.crc{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--mute)}
+/* Controls */
+input,select,button{font:inherit;font-size:14px;height:36px;padding:0 12px;border:1px solid var(--line2);border-radius:8px;background:var(--card);color:var(--ink);max-width:100%}
+input[type=checkbox],input[type=radio]{height:auto;padding:0;accent-color:var(--acc)}input[type=file]{height:auto;padding:6px}
+input:focus,select:focus,button:focus-visible{outline:3px solid var(--acc-soft);outline-offset:0;border-color:var(--acc)}
+button{background:var(--acc);color:var(--acc-ink);border-color:var(--acc);cursor:pointer;font-weight:600;white-space:nowrap}
+button:hover{filter:brightness(1.08)}
+button.plain{background:var(--card);color:var(--ink2);border-color:var(--line2)}button.plain:hover{background:var(--soft);filter:none}
+button.del{background:var(--card);color:var(--bad);border-color:var(--line2)}button.del:hover{background:var(--bad-bg);border-color:var(--bad);filter:none}
+button.small{height:28px;padding:0 10px;font-size:12.5px}
+label.f{display:block;font-weight:600;margin:14px 0 6px;font-size:13px;color:var(--ink2)}label.f:first-child{margin-top:0}
+.stack{display:flex;flex-direction:column;gap:16px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.upd{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.rowact{margin:0}
+.pw input{width:100%;max-width:340px}
+details summary{cursor:pointer;color:var(--acc);font-size:13.5px;font-weight:600}
+/* Whole-type banner */
+.banner{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:14px 18px;margin:0 0 16px;
+border:1px solid var(--line);border-left:4px solid var(--wait);background:var(--wait-bg);border-radius:var(--r)}
+.banner>div{flex:1 1 380px;min-width:0}.banner b{display:block;font-size:14px}.banner span{color:var(--ink2);font-size:13.5px}.banner span b{display:inline;color:var(--ink)}
 .banner form{margin:0}
-.card.danger .head{align-items:center;gap:16px;flex-wrap:wrap}.card.danger .head>div{flex:1 1 420px}
-.theme{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
-.theme button{background:var(--card);color:var(--mute);border:0;border-radius:0;padding:6px 10px;font-size:13px;font-weight:500}
-.theme button+button{border-left:1px solid var(--line)}.theme button.on{background:var(--acc-soft);color:var(--acc);font-weight:600}
-.topr{display:flex;align-items:center;gap:10px}
-label.f{display:block;font-weight:600;margin:14px 0 6px;font-size:14px}label.f:first-child{margin-top:0}
-.stack{display:flex;flex-direction:column;gap:14px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;font-size:13px;font-weight:600;white-space:nowrap}
-.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.85}
+.card.danger{border-color:var(--line)}.card.danger .head{align-items:center;gap:16px;flex-wrap:wrap;margin:0}.card.danger .head>div{flex:1 1 420px}
+/* Status pills and progress */
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;font-size:12.5px;font-weight:600;white-space:nowrap;line-height:20px;border:1px solid transparent}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
 .pill.ok{background:var(--ok-bg);color:var(--ok)}.pill.bad{background:var(--bad-bg);color:var(--bad)}
 .pill.wait{background:var(--wait-bg);color:var(--wait)}.pill.busy{background:var(--busy-bg);color:var(--busy)}
 .pill.off{background:var(--off-bg);color:var(--mute)}
-.bar{height:8px;background:var(--off-bg);border-radius:99px;overflow:hidden;margin-top:7px;min-width:150px}
+td .pill{margin:1px 0}
+.bar{height:6px;background:var(--off-bg);border-radius:99px;overflow:hidden;margin-top:8px;min-width:150px}
 .bar i{display:block;height:100%;background:var(--busy);border-radius:99px;transition:width .8s ease}
 .bar.live i{background-image:linear-gradient(45deg,rgba(255,255,255,.28) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.28) 50%,rgba(255,255,255,.28) 75%,transparent 75%);background-size:16px 16px;animation:stripes 1s linear infinite}
 @keyframes stripes{to{background-position:16px 0}}
-.bar.big{height:12px;min-width:0;flex:1}
-.prog{display:flex;align-items:center;gap:12px;margin:12px 0 4px}.prog .js-pct{font-weight:700;font-variant-numeric:tabular-nums;min-width:44px;text-align:right}
-.sub{color:var(--mute);font-size:12px;margin-top:4px;white-space:nowrap}
+.bar.big{height:10px;min-width:0;flex:1;margin:0}
+.prog{display:flex;align-items:center;gap:12px;margin:12px 0 4px}.prog .js-pct{font-weight:700;min-width:44px;text-align:right}
+.sub{color:var(--mute);font-size:12px;margin-top:3px;white-space:nowrap}
+/* Tick boxes */
 .ticks{display:flex;flex-wrap:wrap;gap:8px}
-.tick{display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--line);border-radius:9px;cursor:pointer;background:var(--soft);max-width:100%}
+.tick{display:flex;align-items:center;gap:9px;padding:7px 12px;border:1px solid var(--line2);border-radius:8px;cursor:pointer;background:var(--card);max-width:100%;font-size:13.5px}
 .tick:hover{border-color:var(--acc)}.tick:has(input:checked){border-color:var(--acc);background:var(--acc-soft)}
-.tick input{margin:0;width:17px;height:17px}.tick span{min-width:0;overflow-wrap:anywhere}.tick.hide{display:none}
-.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:14px}
-th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--mute);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap;background:var(--soft)}
-tr:last-child td{border-bottom:0}table.list tbody tr:hover td,table.list tr:hover td{background:var(--soft)}
-table.list td{vertical-align:middle}td.nw{white-space:nowrap}
-code,.crc{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--mute)}
-a{color:var(--acc)}td a{text-decoration:none}td a:hover{text-decoration:underline}
-.mute{color:var(--mute)}.okt{color:var(--ok)}.badt{color:var(--bad)}.waitt{color:var(--wait)}
-.steps{margin:0 0 14px;padding-left:20px;color:var(--mute);font-size:14px}.steps li{margin:3px 0}
-details summary{cursor:pointer;color:var(--acc);font-size:14px;font-weight:600}
-.login{max-width:380px;margin:12vh auto}.login input{width:100%;margin-bottom:10px}.login button{width:100%;padding:10px}
-.pw input{width:100%;max-width:340px}
-.seg{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
-.seg a{padding:7px 14px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);text-decoration:none;font-weight:600;font-size:14px}
-.seg a:hover{border-color:var(--acc)}
-.seg a span{color:var(--mute);font-weight:500;margin-left:4px}.seg a.on{background:var(--acc);border-color:var(--acc);color:var(--acc-ink)}
-.seg a.on span{color:var(--acc-ink);opacity:.8}.seg.types{margin:0 0 10px;align-items:center}.seg a.on .badt{color:var(--acc-ink)}
-.famtabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0 0 14px}
-.famtab{display:flex;flex-direction:column;gap:2px;padding:14px 18px;border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--ink);text-decoration:none;box-shadow:var(--shadow)}
-.famtab:hover{border-color:var(--acc)}.famtab b{font-size:17px}.famtab span{color:var(--mute);font-size:14px}
-.famtab.on{color:#fff}.famtab.on span{color:#fff;opacity:.92}.famtab.on .badt{color:#fff;opacity:1;text-decoration:underline}
-.famtab.on.lpc1768{border-color:var(--lpc);background:var(--lpc)}.famtab.on.esp32{border-color:var(--esp);background:var(--esp)}.famtab.on.dwlr{border-color:var(--dwlr);background:var(--dwlr)}
-.here{font-size:21px;font-weight:700;margin:6px 0 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.here .mute{font-size:15px;font-weight:500}
-.fam{display:inline-block;padding:3px 9px;border-radius:6px;font-size:12px;font-weight:700;letter-spacing:.04em;background:var(--line);color:var(--ink);vertical-align:middle}
+.tick input{margin:0;width:16px;height:16px}.tick span{min-width:0;overflow-wrap:anywhere}.tick.hide{display:none}
+/* Tables */
+.scroll{overflow-x:auto;margin:0 -22px;padding:0 22px}table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mute);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;background:var(--soft);border-top:1px solid var(--line)}
+th:first-child,td:first-child{padding-left:14px}
+tr:last-child td{border-bottom:0}table.list tr:hover td{background:var(--soft)}
+table.list td{vertical-align:middle}td.nw{white-space:nowrap}td.seen{min-width:118px}
+td a{text-decoration:none;font-weight:600}td a:hover{text-decoration:underline}
+.steps{margin:0 0 14px;padding-left:20px;color:var(--ink2);font-size:13.5px}.steps li{margin:3px 0}
+/* Login */
+.login{max-width:380px;margin:14vh auto;padding:28px}.login input{width:100%;margin-bottom:10px}.login button{width:100%;height:40px}
+.login .brand{margin-bottom:18px}
+/* Board and station type switch (type_bar) */
+.ctx{display:flex;flex-direction:column;gap:10px;margin:0 0 18px}
+.fsegs{display:inline-flex;align-self:flex-start;max-width:100%;overflow-x:auto;scrollbar-width:none;background:var(--card);border:1px solid var(--line2);border-radius:10px;padding:3px;gap:2px;box-shadow:var(--shadow)}
+.fsegs::-webkit-scrollbar{display:none}
+.fseg{display:flex;align-items:center;gap:8px;padding:6px 14px;border-radius:7px;color:var(--ink2);text-decoration:none;font-weight:600;font-size:13.5px;white-space:nowrap;flex:none}
+.fseg:hover{background:var(--soft)}
+.fseg .sw{width:8px;height:8px;border-radius:2px;background:var(--mute)}.fseg.lpc1768 .sw{background:var(--lpc)}.fseg.esp32 .sw{background:var(--esp)}.fseg.dwlr .sw{background:var(--dwlr)}
+.fseg.on{color:#fff}.fseg.on .sw{background:#fff;opacity:.85}
+.fseg.on.lpc1768{background:var(--lpc)}.fseg.on.esp32{background:var(--esp)}.fseg.on.dwlr{background:var(--dwlr)}
+.ct{display:inline-block;min-width:20px;padding:0 6px;border-radius:999px;background:var(--off-bg);color:var(--ink2);font-size:12px;font-weight:600;line-height:19px;text-align:center}
+.on>.ct{background:rgba(255,255,255,.22);color:inherit}
+.flag{display:inline-block;min-width:19px;padding:0 5px;border-radius:999px;background:var(--bad);color:#fff;font-size:11.5px;font-weight:700;line-height:19px;text-align:center;margin-left:-3px}
+.types{display:flex;gap:10px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin;padding-bottom:2px}
+.tgrp{display:flex;align-items:center;flex:none;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px}
+.tbase{padding:0 8px 0 9px;font-size:11.5px;font-weight:700;color:var(--mute);text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
+.topt{display:flex;align-items:center;gap:7px;padding:5px 11px;border-radius:7px;color:var(--ink2);text-decoration:none;font-weight:600;font-size:13px;white-space:nowrap}
+.topt:hover{background:var(--soft)}.topt.on{background:var(--acc);color:var(--acc-ink)}.topt.on .flag{box-shadow:0 0 0 2px var(--acc)}
+.here{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 16px}
+.here h1{margin:0;font-size:22px;font-weight:700;letter-spacing:-.015em}.here .mute{font-size:14px}
+.fam{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.05em;background:var(--line);color:var(--ink);vertical-align:middle;white-space:nowrap}
 .fam.esp32{background:var(--esp);color:#fff}.fam.dwlr{background:var(--dwlr);color:#fff}.fam.lpc1768{background:var(--lpc);color:#fff}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:9px;background:var(--ok);vertical-align:middle}
-.dot.bad{background:var(--bad)}.dot.wait{background:var(--wait)}
-.kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px 20px}
-.kv>div{display:flex;flex-direction:column;gap:2px;min-width:0}.kv>div>span:first-child{color:var(--mute);font-size:12px;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
-td .pill{margin:1px 2px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:9px;background:var(--ok);vertical-align:middle;box-shadow:0 0 0 3px var(--ok-bg)}
+.dot.bad{background:var(--bad);box-shadow:0 0 0 3px var(--bad-bg)}.dot.wait{background:var(--wait);box-shadow:0 0 0 3px var(--wait-bg)}
+.kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:16px 24px}
+.kv>div{display:flex;flex-direction:column;gap:3px;min-width:0}.kv>div>span:first-child{color:var(--mute);font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+/* Summary tiles */
 .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:0 0 16px}
-.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;box-shadow:var(--shadow)}
-.tile span{display:block;color:var(--mute);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-.tile b{display:block;font-size:26px;line-height:1.25;font-variant-numeric:tabular-nums}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px 18px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+.tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--line2)}
+.tile span{display:block;color:var(--mute);font-size:12px;font-weight:600}
+.tile b{display:block;font-size:26px;line-height:1.2;font-weight:700;letter-spacing:-.02em;margin-top:2px}
+.tile.look::before{background:var(--bad)}.tile.busy::before{background:var(--busy)}.tile.ok::before{background:var(--ok)}
 .tile.look b{color:var(--bad)}.tile.busy b{color:var(--busy)}.tile.ok b{color:var(--ok)}
 .live-tag{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mute);font-weight:600}
-.live-tag i{width:8px;height:8px;border-radius:50%;background:var(--mute)}
+.live-tag i{width:7px;height:7px;border-radius:50%;background:var(--mute)}
 .live-tag.on{color:var(--busy)}.live-tag.on i{background:var(--busy);animation:pulse 1.4s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.25}}
-.steps-bar{list-style:none;display:flex;margin:16px 0 8px;padding:0;counter-reset:s}
-.steps-bar li{flex:1;position:relative;text-align:center;font-size:13px;color:var(--mute);font-weight:600}
-.steps-bar li::before{content:"";position:absolute;top:14px;left:-50%;width:100%;height:3px;background:var(--line);z-index:0}
+/* Update steps */
+.steps-bar{list-style:none;display:flex;margin:18px 0 10px;padding:0}
+.steps-bar li{flex:1;position:relative;text-align:center;font-size:12.5px;color:var(--mute);font-weight:600}
+.steps-bar li::before{content:"";position:absolute;top:13px;left:-50%;width:100%;height:2px;background:var(--line);z-index:0}
 .steps-bar li:first-child::before{display:none}
-.steps-bar .num{position:relative;z-index:1;display:grid;place-items:center;width:30px;height:30px;margin:0 auto 6px;border-radius:50%;background:var(--card);border:2px solid var(--line);font-size:13px}
+.steps-bar .num{position:relative;z-index:1;display:grid;place-items:center;width:28px;height:28px;margin:0 auto 6px;border-radius:50%;background:var(--card);border:2px solid var(--line2);font-size:12px}
 .steps-bar li.done{color:var(--ink)}.steps-bar li.done .num{background:var(--ok);border-color:var(--ok);color:#fff;font-size:0}
-.steps-bar li.done .num::after{content:"✓";font-size:14px}.steps-bar li.done::before,.steps-bar li.now::before,.steps-bar li.fail::before{background:var(--ok)}
+.steps-bar li.done .num::after{content:"✓";font-size:13px}.steps-bar li.done::before,.steps-bar li.now::before,.steps-bar li.fail::before{background:var(--ok)}
 .steps-bar li.now{color:var(--busy)}.steps-bar li.now .num{border-color:var(--busy);color:var(--busy);box-shadow:0 0 0 4px var(--busy-bg)}
 .steps-bar li.fail{color:var(--bad)}.steps-bar li.fail .num{background:var(--bad);border-color:var(--bad);color:#fff}
+/* Station page */
 .hero{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
-.hero h1{margin:0;font-size:24px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.back{display:inline-block;margin:0 0 12px;text-decoration:none;font-weight:600;font-size:14px}
-@media (max-width:700px){.brand small{display:none}.topr{gap:6px}.theme button{padding:5px 7px;font-size:12px}.top .out{white-space:nowrap;padding:5px 9px;font-size:13px}.tiles{grid-template-columns:repeat(2,1fr)}.famtabs{gap:6px;margin-bottom:10px}.famtab{padding:9px 10px;border-radius:11px}.famtab b{font-size:14px}.famtab span{font-size:12px}.seg.types{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:4px}.seg.types a{white-space:nowrap;flex:none}.here{font-size:18px}main{padding:14px}.top,nav{padding-left:14px;padding-right:14px}
+.hero h1{margin:0;font-size:24px;letter-spacing:-.015em;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.back{display:inline-flex;align-items:center;gap:4px;margin:0 0 14px;text-decoration:none;font-weight:600;font-size:13.5px;color:var(--mute)}.back:hover{color:var(--acc)}
+@media (max-width:900px){.brand small{display:none}.top{gap:16px}}
+@media (max-width:760px){
+.top{height:auto;flex-wrap:wrap;padding:10px 14px 0;gap:8px 10px}.brand{flex:1}.topr{gap:6px}
+nav{order:3;flex-basis:100%;margin:0 -14px;padding:0 6px;border-top:1px solid var(--line)}nav a{padding:10px 10px}
+.theme button{padding:4px 7px;font-size:11.5px}.top .out{padding:5px 9px;font-size:12.5px}
+main{padding:14px}.card{padding:16px}.scroll{margin:0 -16px;padding:0 16px}
+.tiles{grid-template-columns:repeat(2,1fr);gap:10px}.tile{padding:12px 14px}.tile b{font-size:22px}
+.fsegs{align-self:stretch}.fseg{padding:6px 10px;font-size:13px}.here h1{font-size:19px}
 .steps-bar .lbl{font-size:11px}}
 """
 
@@ -913,8 +944,11 @@ TYPED_TABS = ("stations", "firmware", "history")
 
 
 def type_bar(tab, ptype):
-    """Where you are: first the board family (LPC1768 or ESP32), then the station type within it.
-    Each shows its station count, and how many need a look, so nothing is missed."""
+    """Where you are: first the board family (LPC (TRG/TWS), ESP32 (TRG/TWS), ESP32 (DWLR)), then the station type within it.
+    Each shows its station count and, in red, how many need a look, so nothing is missed.
+    23 Nov 2026 (user: the AIO9 types spilled onto a second line): the types are grouped by station type with
+    their display variants side by side ("KSNDMC TRG  Nuvoton 2  Matrix 1"), on one line that scrolls sideways
+    when it is too narrow."""
     with db() as con:
         stations = con.execute("SELECT * FROM stations").fetchall()
         used = {r["profile"] for r in con.execute("SELECT profile FROM builds UNION SELECT profile FROM stations")}
@@ -923,27 +957,48 @@ def type_bar(tab, ptype):
     for st in stations:
         if st["profile"] in flagged and attention(st, health_of(st)):
             flagged[st["profile"]] += 1
+
+    def plural(n, word):
+        return f"{n} {word}{'' if n == 1 else 's'}"
+
+    def flag(n):
+        return f"<span class='flag' title='{plural(n, 'station')} need{'s' if n == 1 else ''} a look'>{n}</span>" if n else ""
+
     cur = group_of(ptype)
     fams = []
     for name, cls, group in GROUPS:
         n = sum(counts[p] for p in group)
         bad = sum(flagged[p] for p in group)
         first = max(group, key=lambda p: (counts[p], p in used, -p))
-        target = ptype if group is cur[2] else first
-        fams.append(f"<a href='/?tab={tab}&type={target}' class='famtab {cls}{' on' if group is cur[2] else ''}'>"
-                    f"<b>{name}</b><span>{n} station{'s' if n != 1 else ''}"
-                    + (f" · <b class='badt'>{bad} need a look</b>" if bad else "") + "</span></a>")
-    items = []
+        on = group is cur[2]
+        fams.append(f"<a href='/?tab={tab}&type={ptype if on else first}' class='fseg {cls}{' on' if on else ''}'"
+                    f" title='{esc(name)}: {plural(n, 'station')}" + (f", {bad} need a look" if bad else "") + "'>"
+                    f"<i class='sw'></i><span>{esc(name)}</span><span class='ct'>{n}</span>{flag(bad)}</a>")
+
+    def opt(text, p):
+        return (f"<a href='/?tab={tab}&type={p}' class='topt{' on' if p == ptype else ''}'"
+                f" title='{esc(TYPES[p])}: {plural(counts[p], 'station')}"
+                + (f", {flagged[p]} need a look" if flagged[p] else "") + f"'>{esc(text)}"
+                f"<span class='ct'>{counts[p]}</span>{flag(flagged[p])}</a>")
+
+    bases = {}      # station type -> [(display variant or "", type number)], in GROUPS order
     for p in cur[2]:
         if cur[2] is AIO9_TYPES and p not in used and p != ptype:
             continue    # an AIO9 type shows once it has a station or a build
-        warn = f" <b class='badt'>· {flagged[p]}</b>" if flagged[p] else ""
-        items.append(f"<a href='/?tab={tab}&type={p}' class='{'on' if p == ptype else ''}'>{esc(type_label(p))} "
-                     f"<span>{counts[p]}</span>{warn}</a>")
-    here = (f"<div class='here'><span class='fam {cur[1]}'>{cur[0]}</span> {esc(type_label(ptype))}"
-            f" <span class='mute'>· {counts[ptype]} station{'s' if counts[ptype] != 1 else ''}</span></div>")
-    return (f"<div class='famtabs'>{''.join(fams)}</div>"
-            f"<div class='seg types'>{''.join(items)}</div>{here}")
+        base, _, variant = type_label(p).partition(" · ")
+        bases.setdefault(base, []).append((variant, p))
+    tgroups = []
+    for base, items in bases.items():
+        if len(items) == 1 and not items[0][0]:
+            tgroups.append(f"<div class='tgrp'>{opt(base, items[0][1])}</div>")
+        else:
+            tgroups.append(f"<div class='tgrp'><span class='tbase'>{esc(base)}</span>"
+                           + "".join(opt(v or base, p) for v, p in items) + "</div>")
+    n = counts[ptype]
+    here = (f"<div class='here'><span class='fam {cur[1]}'>{cur[0]}</span><h1>{esc(type_label(ptype))}</h1>"
+            f"<span class='mute'>{plural(n, 'station')}</span></div>")
+    return (f"<div class='ctx'><div class='fsegs' role='tablist' aria-label='Board'>{''.join(fams)}</div>"
+            f"<div class='types' role='tablist' aria-label='Station type'>{''.join(tgroups)}</div></div>{here}")
 
 
 # Theme: Auto (follows the device), Light or Dark; kept per browser in localStorage
@@ -970,12 +1025,13 @@ def page(title, body, tab=None, message="", script="", ptype=None, type_bar_show
         cls = "msg bad" if message.lower().startswith(("file refused", "wrong", "not ", "no ", "the new", "build #")) and "deleted" not in message else "msg"
         msg = f"<div class='{cls}'>{esc(message)}</div>"
     return (head + "<header><div class='top'><a class='brand' href='/'><span class='mark'>AIO</span>"
-            "<span><b>AIO stations</b><small>Firmware updates &amp; health</small></span></a>"
+            "<span><b>AIO Stations</b><small>Firmware updates &amp; health</small></span></a>"
+            f"<nav>{nav}</nav>"
             "<span class='topr'><span class='theme' role='group' aria-label='Theme'>"
             "<button type='button' data-t='auto' title='Follow this computer or phone'>Auto</button>"
             "<button type='button' data-t='light'>Light</button><button type='button' data-t='dark'>Dark</button></span>"
             f"<a class='out' href='/logout'>Log out</a></span></div>{THEME_SWITCH_JS}"
-            f"<nav>{nav}</nav></header><main>{bar}{msg}{body}</main>{script}</body></html>").encode()
+            f"</header><main>{bar}{msg}{body}</main>{script}</body></html>").encode()
 
 
 def build_name(b, with_type=False):
@@ -1659,7 +1715,7 @@ def health_charts(reports, profile):
 
 
 HEALTH_CHART_CSS = """
-.hc-grid-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px 22px}
+.hc-grid-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:18px 28px}
 .hc{margin:0;min-width:0;position:relative}.hc figcaption{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:baseline;font-size:14px;margin-bottom:4px}
 .hc-leg{display:flex;gap:12px;flex-wrap:wrap;color:var(--mute);font-size:12px}.hc-leg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
 .hc svg{width:100%;height:auto;display:block;overflow:visible}
@@ -1797,7 +1853,7 @@ def stations_tab(ptype, search):
               if esp else fw_text(s, hl))
         h.append(f"<tr data-k='{esc(s['key'])}'><td class='nw'>{dot}<a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
                  f"<td class='nw'>{fw}</td>{middle}"
-                 f"<td class='nw js-seen'>{esc(when(s['last_seen']))}</td>"
+                 f"<td class='seen js-seen'>{esc(when(s['last_seen']))}</td>"
                  f"<td class='nw'><div class='upd'><span class='pill js-pill {cls}' title='{esc(detail)}'>{esc(label)}</span>{stop}</div>{bar}"
                  + (f"<div style='margin-top:4px'><span class='pill {st_ctrl[s['key']][0]}'>{esc(st_ctrl[s['key']][1])}</span></div>"
                     if st_ctrl[s["key"]] else "") + "</td></tr>")
@@ -1989,7 +2045,7 @@ def firmware_tab(ptype):
             if s["ctrl_target"].isdigit():
                 used_by.setdefault(int(s["ctrl_target"]), []).append(sid(s) + " (CTRL)")
     h = ["<div class='card'><h2>Upload firmware</h2>"
-         "<ol class='steps'><li><b>LPC1768 stations:</b> the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
+         "<ol class='steps'><li><b>LPC (TRG/TWS) stations:</b> the same file that goes on the SD card: <code>fw_ksn_trg.hex</code>, "
          "<code>fw_bihar.hex</code>, <code>fw_ksn_tws.hex</code>, or <code>ctrl.hex</code> for the CTRL board "
          "(one file for every type).</li><li><b>ESP32 stations:</b> the build's <code>.bin</code> (AIO9 v6.56 or later; "
          "DWLR from DWLR-D15-S.13). "
@@ -2011,7 +2067,7 @@ def firmware_tab(ptype):
         users += used_by.get(b["id"], [])
         h.append(f"<tr><td class='nw'><b>{esc(b['version'])}</b> <span class='mute'>#{b['id']}</span><br>"
                  f"<span class='crc'>CRC {esc(b['image_crc'])} · {b['size'] // 1024} KB</span></td>"
-                 f"<td class='nw'>{esc(TYPES.get(b['profile'], 'LPC1768 CTRL board, every LPC type'))}</td><td>{esc(when(b['uploaded_at']))}</td>"
+                 f"<td class='nw'>{esc(TYPES.get(b['profile'], 'LPC CTRL board, every LPC type'))}</td><td>{esc(when(b['uploaded_at']))}</td>"
                  f"<td>{esc(b['note'])}</td><td>{esc(', '.join(users)) or '<span class=mute>nobody</span>'}</td>"
                  f"<td><form method='post' action='/build/delete' onsubmit=\"return confirm('Delete {esc(b['version'])} (#{b['id']})?')\">"
                  f"<input type='hidden' name='back' value='/?tab=firmware&type={ptype}'>"
@@ -2071,7 +2127,9 @@ def office_page(tab, message="", q=None):
 
 def login_page(error=""):
     err = f"<p class='badt'>{esc(error)}</p>" if error else ""
-    return page("Log in", f"<div class='card login'><h2>AIO firmware updates</h2><p class='hint' style='margin:0 0 6px'>LPC1768 and ESP32 stations</p><p class='hint'>Log in</p>{err}"
+    return page("Log in", f"<div class='card login'><div class='brand'><span class='mark'>AIO</span><span><b>AIO Stations</b>"
+                "<small>Firmware updates &amp; health</small></span></div>"
+                f"<p class='hint'>LPC (TRG/TWS), ESP32 (TRG/TWS) and ESP32 (DWLR) stations. Log in to continue.</p>{err}"
                 "<form method='post' action='/login'>"
                 "<input name='user' placeholder='User' autocomplete='username' required>"
                 "<input name='password' type='password' placeholder='Password' autocomplete='current-password' required>"
