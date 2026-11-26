@@ -639,6 +639,9 @@ def unit_check(q, ip):
             kp = {k: q[k] for k in KEYPAD_FIELDS if k in q and HEALTH_VALUE.fullmatch(q[k])}
             con.execute("UPDATE stations SET kp=?, kp_at=? WHERE key=?", (json.dumps(kp, separators=(",", ":")), now, key))
             add_event(con, stn, f"SEND STATUS on the unit: running {version}" + (f", {keypad_text(kp)}" if kp else ""))
+            fixed = current_result(st, target_build(con, st))
+            if fixed != (st["result"] or ""):
+                con.execute("UPDATE stations SET result=? WHERE key=?", (fixed, key))
             return "OTA NONE\n"
         store_health(con, key, q, now)
         build = target_build(con, st)
@@ -1156,7 +1159,7 @@ def ctrl_build(con, s):
 
 def station_state(s, build):
     """(pill class, pill text, detail line, download percent or None) in plain words."""
-    res = s["result"] or ""
+    res = current_result(s, build)
     us = s["unit_status"]
     if res.startswith("FAILED"):
         text = res.split(": ", 1)[-1] if ": " in res else "the unit went back to its old firmware"
@@ -1247,16 +1250,29 @@ def offered_state(s, build):
             f"It asks again at its next check, {nxt}.", None)
 
 
+def current_result(s, build):
+    """The stored result, unless it speaks of a firmware the unit no longer runs. 26 Nov 2026 (user): a SEND
+    STATUS from the keypad (or any check that returns early) updates the version but not the result, and AIO9
+    units check for updates only twice a day: so after an SD card/USB change the page showed "Updated to 7.01"
+    next to Firmware 7.02 for up to 12 h. Worked out again from what the unit runs now."""
+    res = s["result"] or ""
+    if (build is not None and s["target"] != "hold" and s["running_crc"] != build["image_crc"]
+            and res.startswith(("updated", "running the target", "on trial", "older", "same"))):
+        held = version_not_newer(build["version"], s["version"])
+        return f"{held}: {build['version']} vs {s['version']} on the unit" if held else ""
+    return res
+
+
 def held_back(s, build):
     """The unit runs a newer version than its update, or another build of the same version: nothing is sent."""
-    res = s["result"] or ""
+    res = current_result(s, build)
     return res.startswith(("older", "same")) and s["target"] != "hold" and build is not None
 
 
 def short_text(s, label, build):
     """The line under the pill in the stations list: download progress, or why it waits and until when."""
     if held_back(s, build):
-        return (f"set update {build['version']} is older" if (s["result"] or "").startswith("older")
+        return (f"set update {build['version']} is older" if current_result(s, build).startswith("older")
                 else f"set update is another build of {build['version']}")
     if label.startswith(("Downloading", "Download paused")):
         return dl_text(s, build)
@@ -2091,7 +2107,7 @@ def station_page(key, message=""):
            f"<i style='width:{pct or 0}%'></i></div><span class='js-pct'>{'' if pct is None else str(pct) + '%'}</span></div>")
     held = held_back(s, build)
     steps = stepper(s, label) if build is not None and s["target"] != "hold" and not held else ""
-    older = held and (s["result"] or "").startswith("older")
+    older = held and current_result(s, build).startswith("older")
     target_txt = (f"<p class='hint' style='margin:4px 0 0'>{'Set update (not sent)' if held else 'Target'}: "
                   f"<b>{esc(build['version'])}</b> <span class='crc'>{esc(build['image_crc'])}</span>"
                   + (" · older than the firmware it runs" if older else " · another build of the version it runs" if held else "")
