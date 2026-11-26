@@ -680,6 +680,7 @@ With no card and no network, the oldest records are overwritten after about 6.5 
 | Modem hung | Between the two power-on tries the 3.8V rail is held off 3 s, so the modem really restarts (v6.9.14; before, it was switched straight back on) | |
 | `$f7` lost | Sent again at 10, 20 and 30 s if still powered, unless a slot is due (then restart and run it). The UI task checks in while waiting (v6.9.14) | |
 | Bucket rebound | | A rise within 500 ms of a counted tip is the same tip (CTRL v1.18; was counted twice) |
+| Clock set by hand (MENU > SET DATE/TIME) | Same rain day as the clock it corrects: rain total kept (`TIME SET`). Another rain day or no valid clock: total from 0 (`TIME SET, RF 0`). 7.02; before, always from 0 | |
 | Backlog record the server won't take | Any non-success answer is a strike; set aside after 3 slots, the rest keeps going (7.02; it held the whole backlog for good) | |
 | Impossible values | 15-min rain over 100 mm logged as ERROR; value sent as read (v6.9.14). No battery range check: the battery may be 12 V or 3.3-3.7 V under the new power design, so its limits come later as a per-unit setting with the low-voltage cut-off | |
 | No SIM / no network | Record saved to backlog; 1 try a slot after about an hour | |

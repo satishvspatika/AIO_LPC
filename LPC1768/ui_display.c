@@ -252,7 +252,9 @@ static const char *station_id_for_display(const char *id)
 }
 /* MENU > SET DATE/TIME (v6.9.34): DDMMYYYYHHMM, a digit at a time like the station ID, shown as
  * DD-MM-YYYY HH:MM. For sites with no network time (no SIM or coverage, a freshly converted unit).
- * Setting it starts afresh (user, 2026-11-12): rain-day total from 0, see clock_set_by_hand().
+ * 7.02 (user, 26 Nov 2026): the rain-day total is kept when the new time is in the same rain day as
+ * the clock it corrects, and starts from 0 only when it is in another one (was: always from 0, user
+ * 2026-11-12), see time_set_keeps_rain() and clock_set_by_hand().
  * The server still corrects the clock on the next delivery if it is 90 s or more off. */
 static char s_edit_time[13] = "";
 static int s_time_pos = 0;
@@ -2169,6 +2171,21 @@ static void time_edit_message(const char *line2)
     s_force_redraw = true;
 }
 
+/* RAIN_KEEP_RULE_BEGIN */
+/* 7.02 (user, 26 Nov 2026): a time set by hand in the same rain day (08:45 to 08:30) as the clock it
+ * corrects keeps the day's rain total: the rain was counted that day, and a small correction must not
+ * make the total drop. In another rain day, or over a clock with no valid time, the total starts from
+ * 0: it belonged to a day the unit was wrongly in, and carried over it would add rain to the new day. */
+static bool time_set_keeps_rain(const char *old_ts, const char *new_ts)
+{
+    char old_close[12], new_close[12];
+    return intermcu_ts14_believable(old_ts) &&
+           intermcu_rain_close_date(old_ts, old_close, sizeof(old_close)) &&
+           intermcu_rain_close_date(new_ts, new_close, sizeof(new_close)) &&
+           strcmp(old_close, new_close) == 0;
+}
+/* RAIN_KEEP_RULE_END */
+
 /* EN on the editor */
 static void time_edit_save(const telemetry_data_t *telemetry)
 {
@@ -2187,16 +2204,18 @@ static void time_edit_save(const telemetry_data_t *telemetry)
         return;
     }
     bool old_ok = intermcu_ts14_believable(telemetry->present_time);
-    snprintf(line, sizeof(line), "Clock set by hand: %.14s -> %s, rain total from 0",
-             old_ok ? telemetry->present_time : "(no valid time)", ts);
-    uint32_t seq = clock_set_by_hand(ts);
+    const bool keep_rain = time_set_keeps_rain(telemetry->present_time, ts);
+    snprintf(line, sizeof(line), "Clock set by hand: %.14s -> %s, %s",
+             old_ok ? telemetry->present_time : "(no valid time)", ts,
+             keep_rain ? "same rain day: rain total kept" : "rain total from 0");
+    uint32_t seq = clock_set_by_hand(ts, !keep_rain);
     storage_log_debug("RTC", line);
     /* The unit's service history: kept with the debug log off too */
     snprintf(history, sizeof(history), "Station %s: %s (after record #%lu)", flash_nvram_get_station_id(),
              line, (unsigned long)seq);
     storage_append_stamped(FW_HISTORY_FILENAME, history);
 
-    time_edit_message("TIME SET, RF 0  ");
+    time_edit_message(keep_rain ? "TIME SET        " : "TIME SET, RF 0  ");
     s_ui_mode = UI_MODE_BROWSE;
 }
 

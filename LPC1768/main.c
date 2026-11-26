@@ -1154,12 +1154,14 @@ static void save_last_slot(int32_t slot_id)
     }
 }
 
-/* MENU > SET DATE/TIME (v6.9.34). A time set by hand starts afresh: the LPC845's rain-day total
- * restarts at 0, records made before no longer carry CUM_RF forward (never-dip rule, restore after
- * an LPC845 restart, gap fill), and the scheduler waits for the next boundary of the new time, so
- * the jump is neither run as a slot at once nor gap-filled. Called from the UI task while no slot is
- * running or due. Returns the flash-log seq marked. */
-uint32_t clock_set_by_hand(const char *ts14)
+/* MENU > SET DATE/TIME (v6.9.34). The scheduler waits for the next boundary of the new time, so the
+ * jump is neither run as a slot at once nor gap-filled. With restart_rain (7.02: only when the new
+ * time is in another rain day than the clock it corrects, or that clock had no valid time) the time
+ * starts afresh: the LPC845's rain-day total restarts at 0 and records made before no longer carry
+ * CUM_RF forward (never-dip rule, restore after an LPC845 restart, gap fill). Without it the day's
+ * total is kept, as a server or SMS correction does. Called from the UI task while no slot is running
+ * or due. Returns the newest flash-log seq. */
+uint32_t clock_set_by_hand(const char *ts14, bool restart_rain)
 {
     static telemetry_data_t t;          /* UI task stack is short: not on it */
     int min = 0, sec = 0;
@@ -1186,12 +1188,13 @@ uint32_t clock_set_by_hand(const char *ts14)
     xSemaphoreGive(s_sched_lock);
     /* The CTRL ignores a command that arrives while it is still decoding the previous one: $R right
      * after $S was lost if it was busy reading a sensor (about 100 ms; review, v6.9.51) */
-    vTaskDelay(300 / portTICK_RATE_MS);
-    intermcu_reset_cumulative_rain();
-
     uint32_t seq = flash_log_newest_seq();
-    if (seq != 0 && !flash_nvram_set_rain_reset_seq(seq)) {
-        storage_log_debug("ERROR", "Rain total restart could not be saved to flash");
+    if (restart_rain) {
+        vTaskDelay(300 / portTICK_RATE_MS);
+        intermcu_reset_cumulative_rain();
+        if (seq != 0 && !flash_nvram_set_rain_reset_seq(seq)) {
+            storage_log_debug("ERROR", "Rain total restart could not be saved to flash");
+        }
     }
     if (done >= 0) {
         save_last_slot(done);

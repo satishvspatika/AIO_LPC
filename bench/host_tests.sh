@@ -38,3 +38,9 @@ cc $F -Wno-unused-function -I$O -o $O/bkt $R/LPC1768/tests/backlog_test.c && $O/
 # CTRL v1.18: the rain debounce (LPC845 main.c debounce_rfpin) against rain gauge waveforms
 sed -n '/^#define RF_HOLDOFF_CALLS/,/^void Pin_init/p' $R/LPC845/main.c | sed '$d' > $O/rf_debounce.inc
 cc $F -I$O -o $O/rdt $R/LPC845/tests/rain_debounce_test.c && $O/rdt | tail -1
+# 7.02: MENU > SET DATE/TIME keeps the rain total in the same rain day (ui_display.c time_set_keeps_rain)
+{ grep '^#define RAIN_CLOSE_SLOT' $R/LPC1768/intermcu_protocol.c
+  for fn in "static bool ts14_valid" "static int digits2" "bool intermcu_rain_close_date" "bool intermcu_ts14_believable"; do
+    sed -n "/^${fn}(/,/^}/p" $R/LPC1768/intermcu_protocol.c; done; } > $O/ts_funcs.inc
+sed -n '/RAIN_KEEP_RULE_BEGIN/,/RAIN_KEEP_RULE_END/p' $R/LPC1768/ui_display.c > $O/keep_rule.inc
+cc $F -Wno-unused-function -I$O -o $O/tsr $R/LPC1768/tests/time_set_rain_test.c && $O/tsr | tail -1
