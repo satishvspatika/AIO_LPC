@@ -1163,15 +1163,18 @@ def station_state(s, build):
         return "bad", "Update failed", text[:1].upper() + text[1:].rstrip(".") + ". It won't take this file again: upload a new build to try again.", None
     if res.startswith("target is for another"):
         return "bad", "Wrong type", "The chosen firmware is for a different station type. Choose another.", None
-    if res.startswith("older") and s["target"] != "hold" and build is not None:
-        return ("bad", "Older firmware: not sent",
-                f"The target {build['version']} is older than {s['version'] or '?'} on the unit, so it is not sent. "
-                "Open the station and press 'Send it anyway' to take it back, or choose a newer target.", None)
-    if res.startswith("same") and s["target"] != "hold" and build is not None:
-        return ("wait", "Same version: not sent",
-                f"The unit already runs {build['version']}, but another build of it ({s['running_crc'] or '?'}, the "
-                f"file is {build['image_crc']}), so it is not sent. Press 'Send it anyway' on the station page to "
-                "replace it with this file.", None)
+    # 26 Nov 2026 (user): a unit that already runs a newer version than its update (e.g. put on it by SD card
+    # or USB), or another build of the same version, is up to date: the Update column must not go on showing
+    # the old OTA target next to the newer Firmware. The target is only a note; nothing is sent.
+    if held_back(s, build):
+        older = res.startswith("older")
+        return ("ok", "Up to date",
+                (f"It runs {s['version'] or '?'}, newer than the update set for it ({build['version']}), so nothing "
+                 "is sent. To take it back to the older one, press 'Send it anyway' on the station page."
+                 if older else
+                 f"It runs {build['version']}, another build than the update file ({s['running_crc'] or '?'}, the "
+                 f"file is {build['image_crc']}), so nothing is sent. Press 'Send it anyway' on the station page "
+                 "to replace it with this file."), None)
     if us == "4":
         return "bad", "File refused", "The unit refused the downloaded file. It will try again at its next check.", None
     if us == "5":
@@ -1244,8 +1247,17 @@ def offered_state(s, build):
             f"It asks again at its next check, {nxt}.", None)
 
 
+def held_back(s, build):
+    """The unit runs a newer version than its update, or another build of the same version: nothing is sent."""
+    res = s["result"] or ""
+    return res.startswith(("older", "same")) and s["target"] != "hold" and build is not None
+
+
 def short_text(s, label, build):
     """The line under the pill in the stations list: download progress, or why it waits and until when."""
+    if held_back(s, build):
+        return (f"set update {build['version']} is older" if (s["result"] or "").startswith("older")
+                else f"set update is another build of {build['version']}")
     if label.startswith(("Downloading", "Download paused")):
         return dl_text(s, build)
     if label.startswith(("Waiting", "Download not started", "Offered, not started")):
@@ -1408,10 +1420,6 @@ def attention(s, h):
         out.append(("bad", "CTRL update failed"))
     elif res.startswith("target is for another"):
         out.append(("bad", "Wrong firmware type set"))
-    elif res.startswith("older") and s["target"] != "hold":
-        out.append(("bad", "Target older than its firmware"))
-    elif res.startswith("same") and s["target"] != "hold":
-        out.append(("wait", "Same version, another build: not sent"))
     if s["unit_status"] in ("4", "5"):
         out.append(("bad", UNIT_STATUS[s["unit_status"]].capitalize()))
     if h and s["health_at"] and now - s["health_at"] <= STALE_AFTER_S + 3600:
@@ -2081,10 +2089,13 @@ def station_page(key, message=""):
     live = pct is not None and pct < 100
     bar = (f"<div class='prog js-bar-wrap'><div class='bar big js-bar{' live' if live else ''}'{'' if pct is not None else ' hidden'}>"
            f"<i style='width:{pct or 0}%'></i></div><span class='js-pct'>{'' if pct is None else str(pct) + '%'}</span></div>")
-    steps = stepper(s, label) if build is not None and s["target"] != "hold" else ""
-    older = label == "Older firmware: not sent"
-    target_txt = (f"<p class='hint' style='margin:4px 0 0'>Target: <b>{esc(build['version'])}</b> "
-                  f"<span class='crc'>{esc(build['image_crc'])}</span></p>" if build is not None else "")
+    held = held_back(s, build)
+    steps = stepper(s, label) if build is not None and s["target"] != "hold" and not held else ""
+    older = held and (s["result"] or "").startswith("older")
+    target_txt = (f"<p class='hint' style='margin:4px 0 0'>{'Set update (not sent)' if held else 'Target'}: "
+                  f"<b>{esc(build['version'])}</b> <span class='crc'>{esc(build['image_crc'])}</span>"
+                  + (" · older than the firmware it runs" if older else " · another build of the version it runs" if held else "")
+                  + "</p>" if build is not None else "")
     h.append(f"<div class='card'><div class='head'><div class='row' style='gap:12px'><h2>Firmware update</h2>"
              f"<span id='live' class='live-tag'><i></i> Live</span></div>"
              f"<span class='pill js-pill {cls}'>{esc(label)}</span></div>{target_txt}{steps}{bar}"
@@ -2101,7 +2112,7 @@ def station_page(key, message=""):
                 f"<input type='hidden' name='key' value='{esc(s['key'])}'><input type='hidden' name='crc' value='{esc(build['image_crc'])}'>"
                 f"<button class='del'>Send it anyway</button><span class='mute'>"
                 + ("takes the unit back to the older " if older else "replaces its build with this file of ")
-                + f"{esc(build['version'])}</span></form>" if label in ("Older firmware: not sent", "Same version: not sent") else ""))
+                + f"{esc(build['version'])}</span></form>" if held else ""))
     # v6.9.63: CTRL (LPC1768 stations only: ESP32 stations have no CTRL board)
     if s["profile"] in ESP_TYPES:
         h.append("</div>")
