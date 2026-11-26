@@ -1907,32 +1907,6 @@ def stations_tab(ptype, search):
              f"<div class='tile busy'><span>Updating now</span><b id='tile-busy'>{tiles['busy']}</b></div>"
              f"<div class='tile ok'><span>Updated / up to date</span><b id='tile-ok'>{tiles['ok']}</b></div></div>")
 
-    # Needs attention: this type's stations (the type switch above counts the others)
-    flagged = []
-    for s in stations:
-        if s["profile"] != ptype:
-            continue
-        a = attention(s, health_of(s))
-        if a:
-            flagged.append((s, a))
-    h.append("<div class='card'><h2>Needs attention</h2>")
-    if flagged:
-        h.append("<div class='scroll'><table><tr><th>Station</th><th>What</th></tr>")
-        for s, a in flagged:
-            pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a)
-            line = summary_line(health_of(s))
-            stale = any(t.startswith("No check-in for") for _, t in a)
-            rm = (f"<form method='post' action='/station/delete' class='rowact' onsubmit=\"return confirm('Remove station {esc(sid(s))} from the office page? Its health history goes too; the History tab keeps its events. If the unit checks in again it comes back as a new station.')\">"
-                     f"<input type='hidden' name='key' value='{esc(s['key'])}'><input type='hidden' name='back' value='/?tab=stations&type={s['profile']}'>"
-                  "<button class='del small'>Remove</button></form>") if stale else ""
-            h.append(f"<tr><td class='nw'><a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
-                     f"<td><div class='upd' style='flex-wrap:wrap'>{pills}{rm}</div>{'<div class=mute style=margin-top:4px>' + line + '</div>' if line else ''}</td></tr>")
-        h.append("</table></div>")
-    else:
-        h.append(f"<p class='hint' style='margin:0'><span class='okt'>Nothing.</span> Every station of this type "
-                 "checked in within 26 hours and reports no problem.</p>")
-    h.append("</div>")
-
     # The type's stations
     esp = ptype in ESP_TYPES
     rows = [s for s in stations if s["profile"] == ptype]
@@ -2019,6 +1993,33 @@ def stations_tab(ptype, search):
              "<select name='profile'>" + "".join(f"<option value='{p}'{' selected' if p == ptype else ''}>{t}</option>"
                                                  for p, t in TYPES.items()) +
              "</select><button class='plain'>Add</button></form></details>")
+
+    # Needs attention: this type's stations (the type switch above counts the others).
+    # 26 Nov 2026 (user): at the bottom of the Stations tab (it was above the stations list)
+    flagged = []
+    for s in stations:
+        if s["profile"] != ptype:
+            continue
+        a = attention(s, health_of(s))
+        if a:
+            flagged.append((s, a))
+    h.append("<div class='card'><h2>Needs attention</h2>")
+    if flagged:
+        h.append("<div class='scroll'><table><tr><th>Station</th><th>What</th></tr>")
+        for s, a in flagged:
+            pills = " ".join(f"<span class='pill {c}'>{esc(t)}</span>" for c, t in a)
+            line = summary_line(health_of(s))
+            stale = any(t.startswith("No check-in for") for _, t in a)
+            rm = (f"<form method='post' action='/station/delete' class='rowact' onsubmit=\"return confirm('Remove station {esc(sid(s))} from the office page? Its health history goes too; the History tab keeps its events. If the unit checks in again it comes back as a new station.')\">"
+                     f"<input type='hidden' name='key' value='{esc(s['key'])}'><input type='hidden' name='back' value='/?tab=stations&type={s['profile']}'>"
+                  "<button class='del small'>Remove</button></form>") if stale else ""
+            h.append(f"<tr><td class='nw'><a href='/s?k={esc(s['key'])}'><b>{esc(sid(s))}</b></a></td>"
+                     f"<td><div class='upd' style='flex-wrap:wrap'>{pills}{rm}</div>{'<div class=mute style=margin-top:4px>' + line + '</div>' if line else ''}</td></tr>")
+        h.append("</table></div>")
+    else:
+        h.append(f"<p class='hint' style='margin:0'><span class='okt'>Nothing.</span> Every station of this type "
+                 "checked in within 26 hours and reports no problem.</p>")
+    h.append("</div>")
 
     # Live: the rows, bars and tiles are redrawn in place (every 3 s while a station is updating), so
     # nothing ticked or typed on the page is lost (it used to reload the whole page every 30 s)
@@ -2250,10 +2251,59 @@ def password_tab():
             "<div><button>Change password</button></div></form></div>")
 
 
+def home_tab():
+    """26 Nov 2026 (user): the main page after login. It used to open the type with the most stations (DWLR):
+    now one overview of every group and type, each row leading to that type's stations."""
+    with db() as con:
+        stations = con.execute("SELECT * FROM stations").fetchall()
+        targets = {r["profile"]: r["build_id"] for r in con.execute("SELECT * FROM type_targets")}
+        builds = {b["id"]: b for b in con.execute("SELECT id, version FROM builds")}
+        st_builds = {s["key"]: target_build(con, s) for s in stations}
+    per = {p: {"n": 0, "look": 0, "busy": 0, "ok": 0, "seen": 0} for p in TYPES}
+    for s in stations:
+        if s["profile"] not in per:
+            continue
+        r = per[s["profile"]]
+        cls = station_state(s, st_builds[s["key"]])[0]
+        r["n"] += 1
+        r["look"] += bool(attention(s, health_of(s)))
+        r["busy"] += cls == "busy"
+        r["ok"] += cls == "ok"
+        r["seen"] = max(r["seen"], s["last_seen"] or 0)
+    tot = {k: sum(r[k] for r in per.values()) for k in ("n", "look", "busy", "ok")}
+    h = ["<div class='tiles'>"
+         f"<div class='tile'><span>Stations</span><b>{tot['n']}</b></div>"
+         f"<div class='tile look'><span>Need a look</span><b>{tot['look']}</b></div>"
+         f"<div class='tile busy'><span>Updating now</span><b>{tot['busy']}</b></div>"
+         f"<div class='tile ok'><span>Up to date</span><b>{tot['ok']}</b></div></div>"]
+    for name, cls, group in GROUPS:
+        used = [p for p in group if per[p]["n"] or p in targets]
+        h.append(f"<div class='card'><div class='head'><h2><span class='fam {cls}'>{esc(name)}</span></h2>"
+                 f"<span class='mute'>{_plural(sum(per[p]['n'] for p in group), 'station')}</span></div>")
+        if not used:
+            h.append("<p class='hint' style='margin:0'>No station of this group has checked in yet.</p></div>")
+            continue
+        h.append("<div class='scroll'><table class='list'><tr><th>Type</th><th>Stations</th><th>Need a look</th>"
+                 "<th>Updating now</th><th>Whole-type update</th><th>Latest check</th></tr>")
+        for p in used:
+            r = per[p]
+            wb = builds.get(targets.get(p))
+            look = (f"<span class='pill bad'>{r['look']}</span>" if r["look"] else "<span class='mute'>—</span>")
+            busy = (f"<span class='pill busy'>{r['busy']}</span>" if r["busy"] else "<span class='mute'>—</span>")
+            h.append(f"<tr><td class='nw'><a href='/?tab=stations&type={p}'><b>{esc(type_label(p))}</b></a></td>"
+                     f"<td>{r['n']}</td><td>{look}</td><td>{busy}</td>"
+                     f"<td class='nw'>{esc(wb['version']) if wb else '<span class=mute>none</span>'}</td>"
+                     f"<td class='seen'>{esc(when(r['seen'])) if r['seen'] else '<span class=mute>—</span>'}</td></tr>")
+        h.append("</table></div></div>")
+    return "".join(h)
+
+
 def office_page(tab, message="", q=None):
     q = q or {}
     if tab == "password":
         return page("Password", password_tab(), tab, message)
+    if tab == "home":
+        return page("AIO Stations", home_tab(), tab, message)
     try:
         ptype = int(q.get("type", ""))
     except ValueError:
@@ -2466,7 +2516,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.session():
             return self.redirect("/login")
         if url.path == "/":
-            return self.send(200, office_page(q.get("tab", "stations"), q.get("m", ""), q))
+            # no tab and no type: the overview (it used to open the type with the most stations)
+            return self.send(200, office_page(q.get("tab", "stations" if "type" in q else "home"), q.get("m", ""), q))
         if url.path == "/live":
             return self.send(200, live_json(q), "application/json", (("Cache-Control", "no-store"),))
         if url.path == "/s":
