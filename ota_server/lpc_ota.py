@@ -638,6 +638,13 @@ def unit_check(q, ip):
             if not result.startswith("FAILED"):
                 add_event(con, stn, f"Update failed: {build['version']}: {text}")
             result = f"FAILED: {text}"
+        elif profile in DWLR_TYPES and version and version == build["version"]:
+            # 26 Nov 2026 (user): a DWLR already on the target's version is up to date even when it is another
+            # build of it (SD card / USB from a different compile): no 490 KB download of the same code.
+            # A unit part-way through that download gets OTA NONE and drops it. Releases always get a new number.
+            if not result.startswith("running the target"):
+                add_event(con, stn, f"Already on {version} (another build, {crc}): not offered")
+            result = "running the target version (another build): not offered"
         else:
             reply = f"OTA FW {build['size']} {build['file_crc']} {build['image_crc']}\n"
             offered = build["image_crc"]
@@ -1119,6 +1126,9 @@ def station_state(s, build):
         return "ok", f"Updated to {build['version']}", "", None
     if res == "running the target":
         return "ok", "Up to date", "", None
+    if res.startswith("running the target version"):
+        return ("ok", "Up to date", f"Already running {build['version']} from another build of it (SD card or USB), "
+                "so the file is not sent.", None)
     if res.startswith("downloading"):
         pct = s["progress"] * 100 // build["size"] if build["size"] else 0
         pct = max(0, min(100, pct))
