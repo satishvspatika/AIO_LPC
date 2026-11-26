@@ -84,14 +84,23 @@ static long s_count = 0;   /* the LCD's backlog count */
 static void ui_inc_backlog_count(void) { s_count++; }
 static void ui_dec_backlog_count(void) { s_count--; }
 static void ui_set_backlog_count(uint32_t c) { s_count = (long)c; }
-static int s_rejected_file = 0;
-static void storage_append_stamped(const char *name, const char *text) { (void)name; (void)text; s_rejected_file++; }
+static int s_rejected_file = 0, s_retry_delivered_notes = 0, s_final_notes = 0;
+static void storage_append_stamped(const char *name, const char *text)
+{
+    (void)name;
+    if (strncmp(text, "DELIVERED ON RETRY", 18) == 0) s_retry_delivered_notes++;
+    else if (strncmp(text, "STILL REFUSED", 13) == 0) s_final_notes++;
+    else s_rejected_file++;
+}
 static void storage_log_debug(const char *tag, const char *msg) { (void)tag; (void)msg; }
 static void hal_power_heartbeat(void) {}
 static portTickType s_now = 0;
 static portTickType xTaskGetTickCount(void) { return s_now; }
 static void vTaskDelay(portTickType t) { s_now += t; }
 static bool tws_payload_th_missing(const char *p) { (void)p; return false; }
+static int32_t s_archive_slot_id = 0;     /* the slot being run; slot of the day = id % 96 */
+static int slot_of_day(int32_t id) { return (int)(id % 96); }
+#include "bk_defs.inc"                     /* main.c SET_ASIDE_RETRIES, SET_ASIDE_RETRY_SLOT */
 
 /* pretend server */
 static char s_beh[2000];            /* behaviour per record id */
@@ -125,8 +134,9 @@ uint32_t storage_backlog_get_pending_count(void);
 #include "bk_store.inc"
 #include "bk_post.inc"
 
-static void run_slot(void)
+static void run_slot_at(int day_slot)
 {
+    s_archive_slot_id = 96 * 100 + day_slot;
     char payload[512];
     static http_endpoint_t ep = { "x" };
     const http_endpoint_t *endpoint = &ep;
@@ -138,6 +148,7 @@ static void run_slot(void)
     (void)bk_failed;
     s_now += 900000;
 }
+static void run_slot(void) { run_slot_at(0); }   /* 00:00: not a retry slot */
 
 static int s_fails = 0;
 static void check(const char *what, long got, long want)
@@ -148,6 +159,7 @@ static void check(const char *what, long got, long want)
 static void reset(void)
 {
     s_card_exists = false; s_card_size = 0; s_count = 0; s_rejected_file = 0; s_bytes_read = 0;
+    s_retry_delivered_notes = 0; s_final_notes = 0;
     memset(s_beh, 'O', sizeof s_beh); memset(s_seen_first, 0, sizeof s_seen_first);
     memset(s_delivered, 0, sizeof s_delivered);
 }
@@ -212,6 +224,56 @@ int main(void)
     check("1500 sent entries before 15 waiting: all 15 sent in one slot", delivered(1501, 1515), 15);
     printf("     card read for that slot: %lu KB\n", s_bytes_read / 1024);
     check("  card read under 2 MB (one scan, not one per record)", s_bytes_read < 2000000UL, 1);
+
+#ifndef OLD_LOOP
+    /* 7: set aside, then refused at 08:45 and 09:30 too: final, BACKLOG.DAT then removed */
+    reset(); queue(1, 3); s_beh[2] = 'E';
+    run_slot(); run_slot(); run_slot();
+    check("always refused: set aside after 3 slots", s_rejected_file, 1);
+    check("  BACKLOG.DAT kept for the retries", s_card_exists, 1);
+    run_slot_at(20); run_slot_at(40);
+    check("  not retried outside 08:45/09:30/11:30", s_final_notes, 0);
+    run_slot_at(35);
+    check("  08:45 retry refused: not final yet", s_final_notes, 0);
+    run_slot_at(38);
+    check("  09:30 retry refused: final, noted", s_final_notes, 1);
+    run_slot_at(46);
+    check("  not tried again at 11:30", s_final_notes, 1);
+    check("  BACKLOG.DAT removed", s_card_exists, 0);
+    check("  backlog count 0", s_count, 0);
+
+    /* 8: set aside, server fixed by next morning: delivered at 08:45 */
+    reset(); queue(1, 3); s_beh[2] = 'R';
+    run_slot(); run_slot(); run_slot();
+    s_beh[2] = 'O';
+    run_slot_at(35);
+    check("server fixed: set-aside record delivered at 08:45", s_delivered[2], 1);
+    check("  noted in REJECTED.TXT as delivered", s_retry_delivered_notes, 1);
+    check("  BACKLOG.DAT removed", s_card_exists, 0);
+    check("  backlog count 0", s_count, 0);
+
+    /* 9: no network at 08:45 and 09:30: no try used; 11:30 works */
+    reset(); queue(1, 1); s_beh[1] = 'E';
+    run_slot(); run_slot(); run_slot();
+    s_beh[1] = 'N';
+    run_slot_at(35); run_slot_at(38);
+    check("no network at 08:45 and 09:30: no try used", s_final_notes, 0);
+    s_beh[1] = 'O';
+    run_slot_at(46);
+    check("  delivered at 11:30", s_delivered[1], 1);
+
+    /* 10: no network at all three: carried to the next day */
+    reset(); queue(1, 1); s_beh[1] = 'E';
+    run_slot(); run_slot(); run_slot();
+    s_beh[1] = 'N';
+    run_slot_at(35); run_slot_at(38); run_slot_at(46);
+    s_beh[1] = 'E';
+    run_slot_at(35);
+    check("no network all morning: next day 08:45 refused, not final", s_final_notes, 0);
+    run_slot_at(38);
+    check("  next day 09:30 refused: final", s_final_notes, 1);
+    check("  never delivered, nothing lost from the card's DATA", s_delivered[1], 0);
+#endif
 
     printf("%s (%d failed)\n", s_fails ? "FAILED" : "ALL PASSED", s_fails);
     return s_fails != 0;

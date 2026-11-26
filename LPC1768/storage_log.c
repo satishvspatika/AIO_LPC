@@ -797,8 +797,8 @@ bool storage_backlog_mark_sent(uint32_t entry_offset)
 }
 
 /* The server refused this record. The count sits in the entry's unused last slot_time byte, so older
- * files read as no strikes. Once set aside, the record goes to REJECTED.TXT to resend by hand, and
- * stays in DATA/ and flash. Returns true then. */
+ * files read as no strikes. Once set aside (flag 2), the record goes to REJECTED.TXT and stays in
+ * DATA/ and flash; it gets two more tries at 08:45 / 09:30 (below). Returns true then. */
 bool storage_backlog_note_rejected(uint32_t entry_offset, int strikes_allowed, const char *payload)
 {
     const uint32_t strike_at = entry_offset + offsetof(storage_backlog_entry_t, slot_time) +
@@ -831,9 +831,138 @@ bool storage_backlog_note_rejected(uint32_t entry_offset, int strikes_allowed, c
     return set_aside;
 }
 
+/* 7.02 (user, 26 Nov 2026): a record set aside after REJECTIONS_ALLOWED refusals (flag 2) gets
+ * BACKLOG_SET_ASIDE_RETRIES more tries, one per 08:45 / 09:30 slot in which it is actually tried.
+ * The strike byte keeps counting; a refusal at the last try makes it final (flag 3): it stays in
+ * REJECTED.TXT to resend by hand. A delivery makes it sent (1) and is noted in REJECTED.TXT so it
+ * isn't resent by hand. The backlog count already left it when it was set aside. */
+bool storage_backlog_get_next_set_aside(uint32_t start_offset, uint32_t *out_offset, char *out_payload, size_t max_len)
+{
+    if (!out_offset || !out_payload || max_len == 0) return false;
+
+    fs_lock();
+    if (!s_fs_mounted) {
+        f_mount(0, &s_fatfs);
+        s_fs_mounted = true;
+    }
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ) != FR_OK) {
+        fs_unlock();
+        return false;
+    }
+    if (f_lseek(&s_backlog_file, start_offset) != FR_OK) {
+        f_close(&s_backlog_file);
+        fs_unlock();
+        return false;
+    }
+
+    storage_backlog_entry_t entry;
+    UINT br;
+    uint32_t current_pos = s_backlog_file.fptr;
+    bool found = false;
+    while (f_read(&s_backlog_file, &entry, sizeof(entry), &br) == FR_OK && br == sizeof(entry)) {
+        if (entry.sent == 2) {
+            *out_offset = current_pos;
+            strncpy(out_payload, entry.payload, max_len - 1);
+            out_payload[max_len - 1] = '\0';
+            found = true;
+            break;
+        }
+        current_pos = s_backlog_file.fptr;
+    }
+    f_close(&s_backlog_file);
+    fs_unlock();
+    return found;
+}
+
+/* Sets a set-aside entry's flag (1 delivered, 3 final) and notes it in REJECTED.TXT */
+static bool backlog_set_aside_close(uint32_t entry_offset, uint8_t flag)
+{
+    storage_backlog_entry_t head;   /* Flag and slot time only */
+    bool ok = false;
+    UINT n = 0;
+
+    fs_lock();
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ | FA_WRITE) == FR_OK) {
+        if (f_lseek(&s_backlog_file, entry_offset) == FR_OK &&
+            f_read(&s_backlog_file, &head, offsetof(storage_backlog_entry_t, payload), &n) == FR_OK &&
+            n == offsetof(storage_backlog_entry_t, payload) && head.sent == 2 &&
+            f_lseek(&s_backlog_file, entry_offset) == FR_OK &&
+            f_write(&s_backlog_file, &flag, 1, &n) == FR_OK && n == 1) {
+            ok = true;
+        }
+        if (f_close(&s_backlog_file) != FR_OK) {
+            ok = false;
+        }
+    }
+    fs_unlock();
+
+    if (ok) {
+        char note[64];
+        head.slot_time[14] = '\0';     /* The strike count sits in the last byte */
+        snprintf(note, sizeof(note), "%s slot %s", flag == 1 ? "DELIVERED ON RETRY:" : "STILL REFUSED, FINAL:",
+                 head.slot_time);
+        storage_append_stamped(REJECTED_FILENAME, note);
+    }
+    return ok;
+}
+
+bool storage_backlog_mark_set_aside_delivered(uint32_t entry_offset)
+{
+    return backlog_set_aside_close(entry_offset, 1);
+}
+
+/* Returns true when that was its last try */
+bool storage_backlog_note_set_aside_refused(uint32_t entry_offset, int strikes_allowed, int retries)
+{
+    const uint32_t strike_at = entry_offset + offsetof(storage_backlog_entry_t, slot_time) +
+                               sizeof(((storage_backlog_entry_t *)0)->slot_time) - 1;
+    uint8_t strikes = 0;
+    UINT n = 0;
+    bool counted = false;
+
+    fs_lock();
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ | FA_WRITE) == FR_OK) {
+        if (f_lseek(&s_backlog_file, strike_at) == FR_OK &&
+            f_read(&s_backlog_file, &strikes, 1, &n) == FR_OK && n == 1) {
+            if (strikes < strikes_allowed) {
+                strikes = (uint8_t)strikes_allowed;   /* Set aside before the count was kept */
+            }
+            strikes++;
+            counted = (f_lseek(&s_backlog_file, strike_at) == FR_OK &&
+                       f_write(&s_backlog_file, &strikes, 1, &n) == FR_OK && n == 1);
+        }
+        f_close(&s_backlog_file);
+    }
+    fs_unlock();
+
+    /* Not counted (card trouble): final, so it can't be tried at every retry slot for good */
+    if (!counted || strikes >= strikes_allowed + retries) {
+        backlog_set_aside_close(entry_offset, 3);
+        return true;
+    }
+    return false;
+}
+
+/* Set-aside entries still to be retried keep BACKLOG.DAT */
+static bool backlog_has_set_aside(void)
+{
+    bool found = false;
+    fs_lock();
+    if (f_open(&s_backlog_file, BACKLOG_FILENAME, FA_OPEN_EXISTING | FA_READ) == FR_OK) {
+        storage_backlog_entry_t entry;
+        UINT br;
+        while (!found && f_read(&s_backlog_file, &entry, sizeof(entry), &br) == FR_OK && br == sizeof(entry)) {
+            found = (entry.sent == 2);
+        }
+        f_close(&s_backlog_file);
+    }
+    fs_unlock();
+    return found;
+}
+
 void storage_backlog_cleanup_if_all_sent(void)
 {
-    if (storage_backlog_get_pending_count() == 0) {
+    if (storage_backlog_get_pending_count() == 0 && !backlog_has_set_aside()) {
         fs_lock();
         f_unlink(BACKLOG_FILENAME);
         fs_unlock();

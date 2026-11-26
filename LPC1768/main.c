@@ -221,6 +221,11 @@ static void vUi_Task(void *pvParameters)
 #define NO_NETWORK_SLOTS_BEFORE_ONE_TRY 4   /* About an hour with no network: one try per slot */
 #define SLOT_SEND_BUDGET_SEC    300 /* No new send starts past this, so bad signal can't drain the battery */
 #define REJECTIONS_ALLOWED      3   /* Separate slots, as a wrong clock can cause one and gets corrected */
+/* 7.02 (user, 26 Nov 2026): a set-aside record gets this many more tries, in the 08:45, 09:30 and
+ * 11:30 slots. Only a slot whose own record got through uses a try, so a day with no network at
+ * those times costs nothing and the tries carry over to the next day. */
+#define SET_ASIDE_RETRIES       2
+#define SET_ASIDE_RETRY_SLOT(s) ((s) == 35 || (s) == 38 || (s) == 46)   /* 08:45, 09:30, 11:30 */
 #define SLOT_CLOCK_WAIT_SEC     180 /* Scheduled wake with no valid clock: give up after this */
 #define SLOT_CLOCK_NO_NET_SEC   120 /* Sooner if there's no network to get the time from */
 
@@ -1012,6 +1017,39 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                     storage_log_debug("BACKLOG", "Backlog transmission failed! Aborting backlog cycle.");
                     bk_failed = true;
                     break;
+                }
+            }
+
+            /* 7.02: then, at 08:45 / 09:30 / 11:30, the records set aside after 3 refusals, within
+             * the same limits. A delivery or a final refusal is noted in REJECTED.TXT. */
+            if (!bk_failed && SET_ASIDE_RETRY_SLOT(slot_of_day(s_archive_slot_id))) {
+                bk_scan = 0;
+                while (backlogs_sent < 15 && bk_tries < 20 && SLOT_BUDGET_LEFT() &&
+                       storage_backlog_get_next_set_aside(bk_scan, &bk_offset, payload, 384)) {
+                    bk_tries++;
+                    bk_scan = bk_offset + STORAGE_BACKLOG_ENTRY_SIZE;
+                    storage_log_debug("BACKLOG", "Retrying a set-aside record");
+                    hal_power_heartbeat();
+                    vTaskDelay(3000 / portTICK_RATE_MS);
+                    if (post_backlog_record(endpoint, payload, good_route, budget_end)) {
+                        if (!storage_backlog_mark_set_aside_delivered(bk_offset)) {
+                            storage_log_debug("ERROR", "Set-aside mark failed: retries stopped");
+                            bk_failed = true;
+                            break;
+                        }
+                        storage_log_debug("BACKLOG", "Set-aside record delivered on retry");
+                        backlogs_sent++;
+                    } else if (sim7600_post_rejected() || sim7600_post_answered()) {
+                        if (storage_backlog_note_set_aside_refused(bk_offset, REJECTIONS_ALLOWED, SET_ASIDE_RETRIES)) {
+                            storage_log_debug("ERROR", "Set-aside record refused at its last retry: final in " REJECTED_FILENAME);
+                        } else {
+                            storage_log_debug("BACKLOG", "Set-aside record refused: one more retry left");
+                        }
+                    } else {
+                        storage_log_debug("BACKLOG", "Set-aside retry not sent (network): kept for the next retry slot");
+                        bk_failed = true;
+                        break;
+                    }
                 }
             }
             storage_backlog_cleanup_if_all_sent();

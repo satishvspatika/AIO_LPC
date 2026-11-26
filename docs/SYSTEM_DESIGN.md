@@ -272,6 +272,9 @@ status, firmware version and a checksum. Also the replies to the commands below.
    HTTP 400/500, a "duplicate" page) gets a strike and the next record is tried in the same slot; after 3 slots it
    goes to `REJECTED.TXT`. Up to 20 records are tried a slot; the scan goes on from the last one (it read the whole
    file again for every record). Before 7.02 such an answer stopped the backlog at that record in every slot.
+   A set-aside record (flag 2, kept in `BACKLOG.DAT`) gets 2 more tries in the 08:45, 09:30 and 11:30 slots after
+   the normal backlog; only a slot whose own record got through uses one. Then flag 1 (delivered) or 3 (final),
+   each noted in `REJECTED.TXT`. SD backlog only; the flash queue sets aside for good after 3 slots.
 9. **Not delivered?** The record goes to the SD backlog, or to the flash queue if there is no card.
 10. **GPS** (01:00, 07:00, 13:00, 19:00 with no saved position; 13:00 only once a position is saved; skipped below
     11.8 V), then a check for incoming SMS.
@@ -647,7 +650,7 @@ SD card files:
 | `SLOTS.CSV` | One line per slot: time, slot, result, reason, tries, signal, seconds, battery, boot type, backlog |
 | `UPDATE.TXT` | Firmware update outcomes |
 | `ERRORS.TXT`, `ERRORS.OLD` | Copy of the flash error log; rolls at 64 KB, so at most 128 KB |
-| `REJECTED.TXT` | Records the server refused 3 times |
+| `REJECTED.TXT` | Records the server refused 3 times; "DELIVERED ON RETRY" / "STILL REFUSED, FINAL" after the 08:45 / 09:30 / 11:30 retries |
 | `LOG/<YYMMDD>.TXT`, `HTTPLOG.TXT`, `DEBUG.TXT` | Debug logs (about 1 MB a day). To be switched off in production |
 | `LASTSLOT.DAT`, `LASTLOG.DAT`, `FLASHSYN.DAT`, `ERRSYNC.DAT`, `RATMODE.DAT`, `SDCHECK.DAT` | State |
 | `fw_bihar.hex`, `fw_ksn_trg.hex`, `fw_ksn_tws.hex`, `ctrl.hex` | Firmware files, never deleted by the unit |

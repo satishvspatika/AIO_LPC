@@ -33,6 +33,7 @@ cc $F -I$R/LPC1768/tests/host_stubs -I$R/LPC1768 -o $O/hlt $R/LPC1768/tests/heal
 # (storage_log.c's backlog section, main.c post_backlog_record and the slot's backlog loop)
 sed -n '/Backlog Records Management on SD Card/,/^\/\* Firmware files/p' $R/LPC1768/storage_log.c | sed '1,2d;$d' > $O/bk_store.inc
 sed -n '/^static bool post_backlog_record/,/^}/p' $R/LPC1768/main.c > $O/bk_post.inc
+grep -E '^#define (SET_ASIDE_RETRIES|SET_ASIDE_RETRY_SLOT)' $R/LPC1768/main.c > $O/bk_defs.inc
 sed -n '/^            uint8_t backlogs_sent = 0;/,/^            storage_backlog_cleanup_if_all_sent();/p' $R/LPC1768/main.c > $O/bk_loop.inc
 cc $F -Wno-unused-function -I$O -o $O/bkt $R/LPC1768/tests/backlog_test.c && $O/bkt | tail -1
 # CTRL v1.18: the rain debounce (LPC845 main.c debounce_rfpin) against rain gauge waveforms
