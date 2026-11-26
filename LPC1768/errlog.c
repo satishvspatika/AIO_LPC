@@ -243,7 +243,7 @@ static bool write_pending(void)
 
     taskENTER_CRITICAL();
     page.repeats = s_last_repeats;
-    snprintf(page.text, sizeof(page.text), "%s %s", FIRMWARE_VERSION, s_pending);
+    snprintf(page.text, sizeof(page.text), "%s %s", UNIT_NAME, s_pending);
     s_last_hash = s_pending_hash;
     s_last_repeats = s_pending_repeats;
     s_has_pending = false;

@@ -24,6 +24,8 @@ MAIN_VER=$(awk '$1=="#define" && $2=="FIRMWARE_VERSION" {gsub(/"/,"",$3); print 
 CTRL_VER=$(awk '$1=="#define" && $2=="FW845_VERSION" {gsub(/"/,"",$3); print $3}' "${ROOT}/LPC845/boot/fw845_app.h")
 MIG_VER=$(awk '$1=="#define" && $2=="MIG_VERSION" {gsub(/"/,"",$3); print $3}' "${ROOT}/TEST_JIG/migrate/main.c")
 PROD=$(awk '$1=="#define" && $2=="PRODUCTION_BUILD" {print $3}' "${ROOT}/LPC1768/user_config.h")
+# v7.01: FIRMWARE_VERSION is the bare number ("7.01"); release folders and names keep the "v" (v6.9.66, v7.01)
+MAIN_VER="v${MAIN_VER#v}"
 OUT="${DEST}/${MAIN_VER}"
 NAME="LPC-AIO_${MAIN_VER}_CTRL_${CTRL_VER}_${MIG_VER}"
 
@@ -65,20 +67,23 @@ fi
 echo "    $(grep -c "ALL PASS" "${LOGS}/host_tests.log") test sets, ALL PASS"
 
 echo "--- 4. Package"
-rm -rf "${OUT}/SD_CARD" "${OUT}/FACTORY_MCU-LINK"
-mkdir -p "${OUT}/SD_CARD" "${OUT}/FACTORY_MCU-LINK"
+rm -rf "${OUT}/SD_CARD" "${OUT}/FACTORY_MCU-LINK" "${OUT}/OTA"
+mkdir -p "${OUT}/SD_CARD" "${OUT}/FACTORY_MCU-LINK" "${OUT}/OTA"
 cp "${WORK}/tree_KSNDMC_TRG/LPC1768/Debug/fw_ksn_trg.hex" "${OUT}/SD_CARD/"
 cp "${WORK}/tree_BIHAR_TRG/LPC1768/Debug/fw_bihar.hex" "${OUT}/SD_CARD/"
 cp "${WORK}/tree_KSNDMC_TWS/LPC1768/Debug/fw_ksn_tws.hex" "${OUT}/SD_CARD/"
 cp "${ROOT}/LPC845/ctrl.hex" "${OUT}/SD_CARD/"
 cp "${ROOT}/TEST_JIG/migrate/out/fw.hex" "${OUT}/SD_CARD/"
+# 24 Nov 2026: OTA/ (files to upload to the office page): the three main files and ctrl.hex, the same files as on
+# the card (before, this folder was made by hand)
+cp "${OUT}/SD_CARD/fw_ksn_trg.hex" "${OUT}/SD_CARD/fw_bihar.hex" "${OUT}/SD_CARD/fw_ksn_tws.hex" "${OUT}/SD_CARD/ctrl.hex" "${OUT}/OTA/"
 cp "${WORK}/tree_KSNDMC_TRG/LPC1768/Debug/LPC1768_AIO_FULL.hex" "${OUT}/FACTORY_MCU-LINK/MAIN_KSNDMC_TRG_${MAIN_VER}_FULL.hex"
 cp "${WORK}/tree_BIHAR_TRG/LPC1768/Debug/LPC1768_AIO_FULL.hex" "${OUT}/FACTORY_MCU-LINK/MAIN_BIHAR_TRG_${MAIN_VER}_FULL.hex"
 cp "${WORK}/tree_KSNDMC_TWS/LPC1768/Debug/LPC1768_AIO_FULL.hex" "${OUT}/FACTORY_MCU-LINK/MAIN_KSNDMC_TWS_${MAIN_VER}_FULL.hex"
 cp "${ROOT}/LPC845/LPC845_TWS.hex" "${OUT}/FACTORY_MCU-LINK/CTRL_${CTRL_VER}_FULL.hex"
 python3 -I "${REL}/notes_to_pdf.py" "${OUT}/RELEASE_NOTES.md" | sed "s/^/    /"
 
-(cd "${OUT}" && find SD_CARD FACTORY_MCU-LINK -type f | sort | xargs shasum -a 256 > SHA256SUMS.txt)
+(cd "${OUT}" && find OTA SD_CARD FACTORY_MCU-LINK -type f ! -name .DS_Store | sort | xargs shasum -a 256 > SHA256SUMS.txt)
 GIT_DESC="$(cd "${ROOT}" && git rev-parse --short HEAD)$(cd "${ROOT}" && git diff --quiet HEAD -- '*.c' '*.h' '*.s' '*.ld' '*.sh' || echo ' + uncommitted source changes')"
 echo "Built $(date '+%Y-%m-%d %H:%M') from ${GIT_DESC}" > "${OUT}/BUILD_INFO.txt"
 

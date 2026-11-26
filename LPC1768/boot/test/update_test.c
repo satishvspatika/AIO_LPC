@@ -124,7 +124,7 @@ int main(int argc, char **argv)
     expect_check(FW_E_BAD_ADDRESS, "data for the boot area (a FULL hex)"); use_original();
     { size_t st, ln; assert(nth_line(0, &st, &ln)); }
     s_read_fail_at = (long)(s_file_len / 2); expect_check(FW_E_READ, "SD card fails part way"); use_original();
-    { fw_file_info_t tmp; memset(&tmp, 0, sizeof(tmp)); assert(fw_update_check("fw.hex", s_profile + 1, &tmp, NULL) == FW_E_WRONG_PROFILE); assert(tmp.profile == s_profile && tmp.length > 0 && tmp.version[0] == 'v');
+    { fw_file_info_t tmp; memset(&tmp, 0, sizeof(tmp)); assert(fw_update_check("fw.hex", s_profile + 1, &tmp, NULL) == FW_E_WRONG_PROFILE); assert(tmp.profile == s_profile && tmp.length > 0 && tmp.version[0] > ' ' && tmp.version[0] <= '~');   /* v7.01: the version was read ("7.01"; up to v6.9.66 it began with 'v') */
       puts("  file for another station type                -> asks the operator, with its details");
       fresh_flash(); assert(fw_update_stage("fw.hex", &tmp, NULL) == FW_OK); assert(fw_image_valid(FW_SLOT_B_BASE)); fresh_flash(); puts("  ... and installs when the operator says yes"); }
     for (size_t i = 0; i < sizeof(s_flash); i++) assert(s_flash[i] == 0xFF);

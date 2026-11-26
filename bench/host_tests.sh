@@ -29,3 +29,12 @@ sed -n '/^static size_t __attribute__((noinline)) get_collect/,/^const char \*si
 cc $F -I$O -o $O/otag $R/LPC1768/tests/ota_get_test.c && $O/otag | tail -1
 # Health report (v6.9.60): built from a pretend SLOTS.CSV
 cc $F -I$R/LPC1768/tests/host_stubs -I$R/LPC1768 -o $O/hlt $R/LPC1768/tests/health_test.c $R/LPC1768/health.c && $O/hlt | tail -1
+# 7.02: the SD backlog slot after slot against a pretend server, from the firmware's own code
+# (storage_log.c's backlog section, main.c post_backlog_record and the slot's backlog loop)
+sed -n '/Backlog Records Management on SD Card/,/^\/\* Firmware files/p' $R/LPC1768/storage_log.c | sed '1,2d;$d' > $O/bk_store.inc
+sed -n '/^static bool post_backlog_record/,/^}/p' $R/LPC1768/main.c > $O/bk_post.inc
+sed -n '/^            uint8_t backlogs_sent = 0;/,/^            storage_backlog_cleanup_if_all_sent();/p' $R/LPC1768/main.c > $O/bk_loop.inc
+cc $F -Wno-unused-function -I$O -o $O/bkt $R/LPC1768/tests/backlog_test.c && $O/bkt | tail -1
+# CTRL v1.18: the rain debounce (LPC845 main.c debounce_rfpin) against rain gauge waveforms
+sed -n '/^#define RF_HOLDOFF_CALLS/,/^void Pin_init/p' $R/LPC845/main.c | sed '$d' > $O/rf_debounce.inc
+cc $F -I$O -o $O/rdt $R/LPC845/tests/rain_debounce_test.c && $O/rdt | tail -1

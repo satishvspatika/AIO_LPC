@@ -56,6 +56,7 @@ void storage_backlog_init(void);
 bool storage_backlog_save(const char *slot_time, const char *payload);
 uint32_t storage_backlog_get_pending_count(void);
 bool storage_backlog_get_next_unsent(uint32_t start_offset, uint32_t *out_offset, char *out_payload, size_t max_len);
+#define STORAGE_BACKLOG_ENTRY_SIZE 401u   /* One BACKLOG.DAT entry: sent flag, slot time, payload */
 bool storage_backlog_mark_sent(uint32_t entry_offset);
 bool storage_backlog_note_rejected(uint32_t entry_offset, int strikes_allowed, const char *payload);
 void storage_backlog_cleanup_if_all_sent(void);

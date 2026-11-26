@@ -246,6 +246,9 @@ static void limit_wind_speed(telemetry_data_t *telem);
 #endif
 static void sms_only_session(const telemetry_data_t *telem, int32_t slot_id);
 static bool lpc845_link_alive(void);
+#if (UNIT_CFG != KSNDMC_TWS)
+static void keep_cum_from_dipping(telemetry_data_t *telem);
+#endif
 
 /* Parses YYYYMMDDHHMMSS. Slot ID = days since year 0 * 96 + slot of the day. */
 static bool parse_slot_clock(const telemetry_data_t *t, int *out_min, int *out_sec, int32_t *out_id)
@@ -672,7 +675,7 @@ static void __attribute__((noinline)) reach_test(portTickType budget_end)
     };
     static char body[48];
     static char line[96];
-    snprintf(body, sizeof(body), "id=%.12s&fw=%s", flash_nvram_get_station_id(), FIRMWARE_VERSION);
+    snprintf(body, sizeof(body), "id=%.12s&fw=%s", flash_nvram_get_station_id(), UNIT_NAME);
     sim7600_set_server_clock_sync(false);
     for (int i = 0; i < 2; i++) {
         if ((long)(budget_end - xTaskGetTickCount()) <= 0 || !sim7600_still_registered()) {
@@ -696,8 +699,8 @@ static bool post_backlog_record(const http_endpoint_t *endpoint, const char *pay
     if (post_to(endpoint, payload, route)) {
         return true;
     }
-    if (sim7600_post_rejected() || sim7600_post_unanswered() || !sim7600_still_registered() ||
-        (long)(budget_end - xTaskGetTickCount()) <= 0) {
+    if (sim7600_post_rejected() || sim7600_post_answered() || sim7600_post_unanswered() ||
+        !sim7600_still_registered() || (long)(budget_end - xTaskGetTickCount()) <= 0) {
         return false;
     }
     storage_log_debug("BACKLOG", "Backlog send failed: retry in 3s");
@@ -953,9 +956,17 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
             uint8_t backlogs_sent = 0;
             uint32_t bk_offset = 0;
             bool bk_failed = false;
+            /* 7.02: the scan goes on from the record just tried. From 0 every time, a refused record
+             * stopped the loop (it came first again), and the file's sent entries, kept until all are
+             * sent, were read again for every record: after a long outage that used up the slot. */
+            uint32_t bk_scan = 0;
+            uint8_t bk_tries = 0;
 
             /* This slot is archived, so its payload buffer can carry the backlog records */
-            while (backlogs_sent < 15 && SLOT_BUDGET_LEFT() && storage_backlog_get_next_unsent(0, &bk_offset, payload, 384)) {
+            while (backlogs_sent < 15 && bk_tries < 20 && SLOT_BUDGET_LEFT() &&
+                   storage_backlog_get_next_unsent(bk_scan, &bk_offset, payload, 384)) {
+                bk_tries++;
+                bk_scan = bk_offset + STORAGE_BACKLOG_ENTRY_SIZE;
                 char bk_msg[64];
                 snprintf(bk_msg, sizeof(bk_msg), "Sending Backlog #%d (offset %u)...", backlogs_sent + 1, (unsigned int)bk_offset);
                 storage_log_debug("BACKLOG", bk_msg);
@@ -987,14 +998,15 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                         break;
                     }
                     backlogs_sent++;
-                } else if (sim7600_post_rejected()) {
-                    /* This slot's own record was just accepted, so the server is working and it's this record */
+                } else if (sim7600_post_rejected() || sim7600_post_answered()) {
+                    /* This slot's own record was just accepted, so the server is working and it's this record.
+                     * 7.02: any answer that isn't a success counts (HTTP 400/500, "duplicate", an error page):
+                     * as a plain failure it stopped the backlog at this record in every slot, never set
+                     * aside, and nothing behind it was ever sent. The next record is tried now. */
                     if (storage_backlog_note_rejected(bk_offset, REJECTIONS_ALLOWED, payload)) {
                         storage_log_debug("ERROR", "Backlog record refused 3 times: moved to " REJECTED_FILENAME);
                     } else {
                         storage_log_debug("BACKLOG", "Backlog record refused: trying it again next slot");
-                        bk_failed = true;
-                        break;
                     }
                 } else {
                     storage_log_debug("BACKLOG", "Backlog transmission failed! Aborting backlog cycle.");
@@ -1037,7 +1049,7 @@ static slot_result_t execute_slot_transmission(telemetry_data_t *telem, int *out
                     flash_log_mark_sent(flash_seq);
                     ui_dec_backlog_count();
                     backlogs_sent++;
-                } else if (sim7600_post_rejected()) {
+                } else if (sim7600_post_rejected() || sim7600_post_answered()) {   /* 7.02: as above */
                     if (flash_log_note_rejected(flash_seq, REJECTIONS_ALLOWED)) {
                         storage_log_debug("ERROR", "Flash backlog refused 3x: set aside");
                         storage_append_stamped(REJECTED_FILENAME, payload);
@@ -1383,6 +1395,12 @@ static void __attribute__((noinline)) fill_missed_slots(const telemetry_data_t *
         }
 #endif
         if (state == 1) {
+#if (UNIT_CFG != KSNDMC_TWS)
+            /* 7.02: a measured row keeps the never-dip rule too. A CTRL that lost power (its total
+             * restarts at 0) and then ran slots the LPC1768 missed has low totals in those samples:
+             * they went out as they were, and the live record then carried on from the low row. */
+            keep_cum_from_dipping(&s_gap_record);
+#endif
             format_slot_payload(payload, sizeof(payload), &s_gap_record, SIGNAL_GAP_FILLED);
             s_archive_slot_id = id;
             archive_slot(&s_gap_record, SIGNAL_GAP_FILLED, payload);
@@ -1685,9 +1703,9 @@ static void __attribute__((noinline)) keep_cum_from_dipping(telemetry_data_t *te
     const flash_log_page_t *rec = newest_record_for_rain();
     if (!rec || !parse_record_total(rec->record, ts, sizeof(ts), &tips) ||
         !intermcu_rain_close_date(ts, stored_close, sizeof(stored_close)) ||
-        !intermcu_rain_close_date(telem->present_time, current_close, sizeof(current_close)) ||
+        !intermcu_rain_close_date(slot_timestamp(telem), current_close, sizeof(current_close)) ||
         strcmp(stored_close, current_close) != 0) {
-        return; /* Nothing yet this rain day: a new day starts from zero */
+        return; /* Nothing yet this rain day: a new day starts from zero (7.02: the record's own slot) */
     }
     float floor_mm = (float)tips * RF_BUCKET_RESOLUTION;
     /* This slot's rain counts on top, unless the newest record already is this slot */
@@ -1937,7 +1955,7 @@ static void __attribute__((noinline)) log_boot_header(void)
 
     char boot_info[140];
     snprintf(boot_info, sizeof(boot_info), "=== BOOT %s Station=%s Profile=%s ResetReason=0x%02X%s%s%s%s%s ===",
-             FIRMWARE_VERSION, flash_nvram_get_station_id(),
+             UNIT_NAME, flash_nvram_get_station_id(),
              (UNIT_CFG == KSNDMC_TRG) ? "KSNDMC_TRG" :
              (UNIT_CFG == BIHAR_TRG) ? "BIHAR_TRG" : "KSNDMC_TWS",
              (unsigned int)s_reset_reason,

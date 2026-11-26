@@ -268,7 +268,10 @@ status, firmware version and a checksum. Also the replies to the commands below.
 7. **Save first.** The record goes to flash, then to the SD day file (the last row is compared first, so a restart
    can't add a second copy).
 8. **Send.** Up to 3 tries, one per route (by name, by IP, by modem HTTP). The route that worked then carries up to 15
-   backlog records. No new send starts after 300 s.
+   backlog records. No new send starts after 300 s. (7.02) A backlog record the server answers with anything but a success (a refusal,
+   HTTP 400/500, a "duplicate" page) gets a strike and the next record is tried in the same slot; after 3 slots it
+   goes to `REJECTED.TXT`. Up to 20 records are tried a slot; the scan goes on from the last one (it read the whole
+   file again for every record). Before 7.02 such an answer stopped the backlog at that record in every slot.
 9. **Not delivered?** The record goes to the SD backlog, or to the flash queue if there is no card.
 10. **GPS** (01:00, 07:00, 13:00, 19:00 with no saved position; 13:00 only once a position is saved; skipped below
     11.8 V), then a check for incoming SMS.
@@ -676,6 +679,8 @@ With no card and no network, the oldest records are overwritten after about 6.5 
 | Bad clock | Gives up after 3 min (2 with no network) | Jammed I2C reset, stopped RTC restarted, wake after 15 min with no valid time (845-v1.5). Stuck/halted judged only from good reads (845-v1.6) |
 | Modem hung | Between the two power-on tries the 3.8V rail is held off 3 s, so the modem really restarts (v6.9.14; before, it was switched straight back on) | |
 | `$f7` lost | Sent again at 10, 20 and 30 s if still powered, unless a slot is due (then restart and run it). The UI task checks in while waiting (v6.9.14) | |
+| Bucket rebound | | A rise within 500 ms of a counted tip is the same tip (CTRL v1.18; was counted twice) |
+| Backlog record the server won't take | Any non-success answer is a strike; set aside after 3 slots, the rest keeps going (7.02; it held the whole backlog for good) | |
 | Impossible values | 15-min rain over 100 mm logged as ERROR; value sent as read (v6.9.14). No battery range check: the battery may be 12 V or 3.3-3.7 V under the new power design, so its limits come later as a per-unit setting with the low-voltage cut-off | |
 | No SIM / no network | Record saved to backlog; 1 try a slot after about an hour | |
 | Stuck job (SMS, GPS, test) | Cancelled at 8 min, restart if that fails | |

@@ -120,21 +120,24 @@ if [ -n "$TARGET_VER" ]; then
     NEW_RAW_VER="${TARGET_VER#v}"
     IS_AUTO=0
 else
-    # Automatically bump patch version (e.g. 6.0.1 -> 6.0.2)
+    # v7.01 (24 Nov 2026): versions are MAJOR.MINOR with two digits (7.01 -> 7.02, 7.99 -> 8.01), the line
+    # common to all units. A three-part version (6.9.66, up to v6.9.66) goes to 7.01.
     IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_RAW_VER"
-    MAJOR=${MAJOR:-6}
-    MINOR=${MINOR:-0}
-    PATCH=${PATCH:-0}
-    NEW_PATCH=$((PATCH + 1))
-    NEW_RAW_VER="${MAJOR}.${MINOR}.${NEW_PATCH}"
+    if [ -n "$PATCH" ]; then
+        NEW_RAW_VER="7.01"
+    else
+        MINOR=$((10#${MINOR:-0} + 1))
+        if [ "$MINOR" -gt 99 ]; then MAJOR=$((MAJOR + 1)); MINOR=1; fi
+        NEW_RAW_VER=$(printf "%d.%02d" "$MAJOR" "$MINOR")
+    fi
     IS_AUTO=1
 fi
 
 NEW_TAG="v${NEW_RAW_VER}"
 
-# LCD 16x2 sanity check: Line 2 format is "ID:001061 vX.Y.Z" (max 16 chars)
-if [ ${#NEW_TAG} -gt 9 ]; then
-    echo -e "${YELLOW}[WARNING] Version '${NEW_TAG}' is ${#NEW_TAG} characters. Line 2 on 16x2 LCD may be truncated.${NC}"
+# The SD card menu shows 7 characters of the version ("FW 7.01 FOUND"); the unit name (TRGL-BIH-7.01) at most 15
+if [ ${#NEW_RAW_VER} -gt 7 ]; then
+    echo -e "${YELLOW}[WARNING] Version '${NEW_RAW_VER}' is ${#NEW_RAW_VER} characters: the SD card menu shows only 7.${NC}"
 fi
 
 # Default commit message if -m was not provided
@@ -164,11 +167,11 @@ python3 -c "
 import re
 with open('${CONFIG_FILE}', 'r') as f:
     content = f.read()
-content = re.sub(r'#define FIRMWARE_VERSION\s+\"[^\"]+\"', '#define FIRMWARE_VERSION    \"${NEW_TAG}\"', content)
+content = re.sub(r'#define FIRMWARE_VERSION\s+\"[^\"]+\"', '#define FIRMWARE_VERSION \"${NEW_RAW_VER}\"', content)
 with open('${CONFIG_FILE}', 'w') as f:
     f.write(content)
 "
-echo -e "${GREEN}✔ Configured version as ${NEW_TAG} in LPC1768/user_config.h${NC}"
+echo -e "${GREEN}✔ Configured version as ${NEW_RAW_VER} in LPC1768/user_config.h (git tag ${NEW_TAG})${NC}"
 
 # 2. Build firmware
 if [ "$SKIP_BUILD" -eq 0 ]; then
@@ -224,7 +227,7 @@ echo -e "${BOLD}${GREEN}✔ PUSH SUCCESSFUL!${NC}"
 echo -e "  Repository: https://github.com/satishvspatika/AIO_LPC"
 echo -e "  Branch:     ${CURRENT_BRANCH}"
 echo -e "  Tag:        ${BOLD}${NEW_TAG}${NC}"
-echo -e "  LCD View:   ${CYAN}Line 2 will show: ID:001061 ${NEW_TAG}${NC}"
+echo -e "  LCD View:   ${CYAN}MENU > FIRMWARE shows the unit name, e.g. TRGL-BIH-${NEW_RAW_VER}${NC}"
 echo -e "${GREEN}======================================================${NC}"
 echo -e "To update and flash on your other laptop:"
 echo -e "  ${BOLD}git pull && ./flash_lpc1768.sh${NC}\n"

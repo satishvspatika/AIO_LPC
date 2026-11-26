@@ -616,6 +616,7 @@ typedef struct __attribute__((packed)) {
     char slot_time[16];   /* "20261104220000" */
     char payload[384];    /* HTTP payload string */
 } storage_backlog_entry_t;
+typedef char backlog_entry_size_check[(sizeof(storage_backlog_entry_t) == STORAGE_BACKLOG_ENTRY_SIZE) ? 1 : -1];
 
 
 void storage_backlog_init(void)

@@ -19,8 +19,20 @@
 #define UNIT_CFG        BIHAR_TRG
 #endif
 
-/* Firmware Version Identifier (visible on LCD line 2 & Status SMS) */
-#define FIRMWARE_VERSION "v6.9.66"
+/* Firmware version, the number alone: the office OTA check (v=), the .hex image header and the SD card menu
+ * ("FW 7.01 FOUND"). v7.01 (24 Nov 2026): the version line common to all units starts here (was v6.9.66). */
+#define FIRMWARE_VERSION "7.02"
+
+/* v7.01: the unit name, as on the ESP32 units (TRGE-BIH-7.01-M): <product>-<network>-<version>, product
+ * TRGL/TWSL (L: LPC). On the LCD (MENU > FIRMWARE), in the status report and SMS, and in the boot and error
+ * logs. Up to v6.9.66 they showed FIRMWARE_VERSION ("v6.9.66"). At most 15 characters. */
+#if (UNIT_CFG == KSNDMC_TRG)
+#define UNIT_NAME "TRGL-DMC-" FIRMWARE_VERSION
+#elif (UNIT_CFG == BIHAR_TRG)
+#define UNIT_NAME "TRGL-BIH-" FIRMWARE_VERSION
+#else
+#define UNIT_NAME "TWSL-DMC-" FIRMWARE_VERSION
+#endif
 
 /* THE production switch. 1 = field build:
  *   - MENU > KEY TEST hidden (and TEST SEND can't be switched on)

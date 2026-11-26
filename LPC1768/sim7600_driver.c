@@ -2117,6 +2117,7 @@ static bool __attribute__((noinline)) http_post_modem_stack(const http_endpoint_
     /* 6xx and 7xx are the modem's own errors, not the server's answer */
     if (status >= 100 && status <= 599) {
         s_post_unanswered = false;
+        s_post_answered = true;     /* 7.02: the server answered (sim7600_post_answered) */
     }
     if (status < 200 || status > 202) {
         goto done;
@@ -2191,8 +2192,9 @@ bool sim7600_http_post_once(const http_endpoint_t *endpoint, const char *payload
     bool got_reply = false;
     s_post_unanswered = false;
     s_post_rejected = false;
+    s_post_answered = false;
     bool ok = post_by_route(endpoint, payload, route, NULL, 0, &got_reply);
-    s_post_answered = got_reply;
+    s_post_answered = s_post_answered || got_reply;
     return ok;
 }
 
@@ -3237,7 +3239,7 @@ static bool status_sms(const telemetry_data_t *telem, int csq_dbm, char kind, co
         kind,
         stn_id,
         time_iso,
-        FIRMWARE_VERSION,
+        UNIT_NAME,           /* v7.01: the unit name (TRGL-BIH-7.01), as the ESP32 units send theirs */
         csq_dbm,
         bat_str, /* The server shows only this first battery field, so it carries the real voltage */
         bat_str,
@@ -3613,7 +3615,7 @@ static void sms_run(sms_in_t *m, const telemetry_data_t *telemetry)
         }
         snprintf(out, osz, "STN %s %s MAIN %s CTRL %s MODE %u S2 %s%.40s NUMS %d%s",
                  stn, (UNIT_CFG == KSNDMC_TRG) ? "KSNDMC_TRG" : (UNIT_CFG == BIHAR_TRG) ? "BIHAR_TRG" : "KSNDMC_TWS",
-                 FIRMWARE_VERSION, (v845 && v845[0]) ? v845 : "----", (unsigned)r.server_mode, s2,
+                 UNIT_NAME, (v845 && v845[0]) ? v845 : "----", (unsigned)r.server_mode, s2,
                  r.s2_host[0] ? r.s2_path : "", office_count(&r), r.sending_stopped ? " SENDING STOPPED" : "");
         break;
     }

@@ -364,12 +364,22 @@ static void stack_guard_check(void)
 	}
 }
 
+/* CTRL v1.18: after a counted tip, rises for RF_HOLDOFF_CALLS more calls (5 ms each: 500 ms) are the
+ * same tip (the bucket rebounding, the magnet passing the reed again): not counted. A 10 ms stable
+ * rise was counted however soon after the last one. Real tips are at least ~1.5 s apart (0.25 mm
+ * bucket at 600 mm/h). Same rule as the ESP32 units (AIO9 7.02). */
+#define RF_HOLDOFF_CALLS	100
+static uint8_t s_rf_holdoff;
+
 void debounce_rfpin(void)
 {
 	//GPIO_PinRead(GPIO_Type *base, uint32_t port, uint32_t pin)
 	//rfpin_newstate = Chip_GPIO_GetPinState(LPC_GPIO_PORT, 0, RF_PIN);
 
 	rfpin_newstate = GPIO_PinRead(GPIO, LPC845_PORT, RF_PIN);
+	if(s_rf_holdoff){
+		s_rf_holdoff--;
+	}
 
 	if(rfpin_newstate != rfpin_prevstate){
 		rfpin_debouncecnt = MAX_RF_DEBCNT;
@@ -382,10 +392,13 @@ void debounce_rfpin(void)
 			if(rfpin_newstate != rfpin_oldstate){
 				rfpin_oldstate = rfpin_newstate;
 				//if(rfpin_newstate == 1)
-				if((rfpin_newstate == 1) && (calib_mode == 0))
-					rf_val++;
-				else if((rfpin_newstate == 1) && (calib_mode == 1))
-					calib_rf++;
+				if((rfpin_newstate == 1) && (s_rf_holdoff == 0)){
+					s_rf_holdoff = RF_HOLDOFF_CALLS;
+					if(calib_mode == 0)
+						rf_val++;
+					else
+						calib_rf++;
+				}
 
 			}
 		}

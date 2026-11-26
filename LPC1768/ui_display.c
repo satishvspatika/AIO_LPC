@@ -1817,7 +1817,7 @@ static void render_screen(screen_type_t scr, const telemetry_data_t *telemetry, 
                 /* Named as the MAIN F/W and CTRL F/W updates. The LPC845's version is read about
                  * 11 s after boot; "----" until then, or if it never answers */
                 const char *v845 = fw_app_845_version();
-                snprintf(line1, sizeof(line1), "MAIN  %-10.10s", FIRMWARE_VERSION);
+                snprintf(line1, sizeof(line1), "%-16.16s", UNIT_NAME);   /* v7.01: TRGL-BIH-7.01 */
                 snprintf(line2, sizeof(line2), "CTRL  %-10.10s", (v845 && v845[0]) ? v845 : "----");
                 break;
             }
