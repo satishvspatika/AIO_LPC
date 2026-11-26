@@ -351,6 +351,24 @@ def init_db():
             con.execute("ALTER TABLE stations ADD COLUMN kp TEXT DEFAULT ''")
         if "kp_at" not in cols:
             con.execute("ALTER TABLE stations ADD COLUMN kp_at INTEGER DEFAULT 0")
+        # 26 Nov 2026 (user): the latest firmware change (when the office first saw it, OTA or SD card/USB,
+        # what it ran before). Stations from before: taken from their kept events, once.
+        if "fw_at" not in cols:
+            con.execute("ALTER TABLE stations ADD COLUMN fw_at INTEGER DEFAULT 0")
+            con.execute("ALTER TABLE stations ADD COLUMN fw_how TEXT DEFAULT ''")
+            con.execute("ALTER TABLE stations ADD COLUMN fw_from TEXT DEFAULT ''")
+            for s in con.execute("SELECT key, shown_id FROM stations").fetchall():
+                ev = con.execute("SELECT id, at, text FROM events WHERE station=? ORDER BY id", (s["shown_id"],)).fetchall()
+                last = next((e for e in reversed(ev) if e["text"].startswith("Now running ")), None)
+                m = last and re.match(r"Now running (\S+) \((a different build, )?was (.*)\)$", last["text"])
+                if not m:
+                    continue
+                ver = m.group(1)
+                was = f"another build of {ver} ({m.group(3)})" if m.group(2) else m.group(3)
+                ota = any(e["id"] >= last["id"] and (e["text"].startswith(f"Installed {ver}:")
+                                                     or e["text"].startswith(f"Updated to {ver}:")) for e in ev)
+                con.execute("UPDATE stations SET fw_at=?, fw_how=?, fw_from=? WHERE key=?",
+                            (last["at"], "OTA" if ota else "SD", was, s["key"]))
         # Only the newest EVENTS_PER_STATION events of each station are kept (user, 22 Nov 2026)
         for r in con.execute("SELECT DISTINCT station FROM events WHERE station != ''").fetchall():
             trim_events(con, r["station"])
@@ -604,6 +622,10 @@ def unit_check(q, ip):
                 same = version == st["version"]
                 add_event(con, stn, f"Now running {version}" + (f" (a different build, was {st['running_crc']})" if same
                                                                  else f" (was {st['version']})"))
+                # 26 Nov 2026 (user): the latest firmware change on the station page, with how it came
+                how = "OTA" if (crc == (st["offered_crc"] or "") or status == "2") else "SD"
+                was = f"another build of {version} ({st['running_crc']})" if same else (st["version"] or "")
+                con.execute("UPDATE stations SET fw_at=?, fw_how=?, fw_from=? WHERE key=?", (now, how, was, key))
             if st["unit_status"] != status and status in UNIT_EVENT:
                 add_event(con, stn, UNIT_EVENT[status])
             con.execute("UPDATE stations SET shown_id=?, profile=?, version=?, running_crc=?, unit_status=?,"
@@ -932,6 +954,16 @@ SECTIONS = [("stations", "Stations"), ("firmware", "Firmware files"), ("history"
 
 def esc(v):
     return html.escape(str(v if v is not None else ""))
+
+
+def fw_change_text(s):
+    """26 Nov 2026: the station's latest firmware change as the office saw it (HTML)."""
+    if not s["fw_at"]:
+        return "<span class='mute'>not seen by the office (it already ran this firmware at its first check)</span>"
+    how = "by OTA" if s["fw_how"] == "OTA" else "not by OTA: SD card or USB"
+    return (f"{esc(when(s['fw_at']))} · <b>{how}</b>"
+            + (f"<br><span class='mute'>before: {esc(s['fw_from'])}. The time is the unit's first check on the new "
+               f"firmware.</span>" if s["fw_from"] else ""))
 
 
 def when(ts):
@@ -1967,6 +1999,7 @@ def station_page(key, message=""):
              + f"<div class='kv' style='margin-top:16px'>"
              f"<div><span>Firmware</span><span>{fw} <span class='crc js-crc'>{esc(s['running_crc'])}</span></span></div>"
              f"<div><span>Last check</span><span class='js-seen'>{esc(when(s['last_seen']))}</span></div>"
+             + f"<div><span>Last firmware change</span><span>{fw_change_text(s)}</span></div>"
              + (f"<div><span>Board</span>{board_name(s['profile'])}</div>" if s["profile"] in ESP_TYPES else "")
              + f"<div><span>Last health report</span>{esc(when(s['health_at'])) if s['health_at'] else '<span class=mute>none yet (firmware ' + ('DWLR-D15-S.22' if s['profile'] in DWLR_TYPES else '6.57' if s['profile'] in ESP_TYPES else 'v6.9.60') + ' on)</span>'}</div>" +
              (f"<div><span>Last SEND STATUS on the unit</span><span>{esc(when(s['kp_at']))}"
