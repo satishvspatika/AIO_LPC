@@ -353,6 +353,9 @@ def init_db():
             con.execute("ALTER TABLE stations ADD COLUMN kp_at INTEGER DEFAULT 0")
         # 26 Nov 2026 (user): the latest firmware change (when the office first saw it, OTA or SD card/USB,
         # what it ran before). Stations from before: taken from their kept events, once.
+        # 26 Nov 2026 (user): an older target is sent only once confirmed for that build (its image id)
+        if "downgrade_ok" not in cols:
+            con.execute("ALTER TABLE stations ADD COLUMN downgrade_ok TEXT DEFAULT ''")
         if "fw_at" not in cols:
             con.execute("ALTER TABLE stations ADD COLUMN fw_at INTEGER DEFAULT 0")
             con.execute("ALTER TABLE stations ADD COLUMN fw_how TEXT DEFAULT ''")
@@ -660,13 +663,15 @@ def unit_check(q, ip):
             if not result.startswith("FAILED"):
                 add_event(con, stn, f"Update failed: {build['version']}: {text}")
             result = f"FAILED: {text}"
-        elif profile in DWLR_TYPES and version and version == build["version"]:
-            # 26 Nov 2026 (user): a DWLR already on the target's version is up to date even when it is another
-            # build of it (SD card / USB from a different compile): no 490 KB download of the same code.
-            # A unit part-way through that download gets OTA NONE and drops it. Releases always get a new number.
-            if not result.startswith("running the target"):
-                add_event(con, stn, f"Already on {version} (another build, {crc}): not offered")
-            result = "running the target version (another build): not offered"
+        elif (held := version_not_newer(build["version"], version)) and (st["downgrade_ok"] or "") != build["image_crc"]:
+            # 26 Nov 2026 (user): a target that is not newer than what the unit runs (older, e.g. units put on
+            # S.31 by SD card while the type still points at S.30, or the same version from another build) is
+            # never sent by itself: only after "Send it anyway" on the station page. A unit part-way through
+            # that download gets OTA NONE and drops it.
+            if not result.startswith(held):
+                add_event(con, stn, f"Not sent {build['version']}: " + ("older than" if held == "older" else "the same version as")
+                          + f" {version} on the unit ({crc}). Confirm on the station page to send it.")
+            result = f"{held}: {build['version']} vs {version} on the unit"
         else:
             reply = f"OTA FW {build['size']} {build['file_crc']} {build['image_crc']}\n"
             offered = build["image_crc"]
@@ -956,6 +961,22 @@ def esc(v):
     return html.escape(str(v if v is not None else ""))
 
 
+def version_parts(v):
+    """'DWLR-D15-S.31' -> ('DWLR-D15-S.', (31,), ''), '6.56c' -> ('', (6, 56), 'c'); None if no number at the end."""
+    m = re.fullmatch(r"(.*?)(\d+(?:\.\d+)*)([a-z]?)", (v or "").strip())
+    return (m.group(1), tuple(int(x) for x in m.group(2).split(".")), m.group(3)) if m else None
+
+
+def version_not_newer(target, running):
+    """'older' / 'same' when the target is not a newer release of the same line than the unit runs, else ''.
+    Different lines (S. vs K.) or names that can't be read give '', so nothing is held back by a name the
+    office can't compare. (The exact running build never gets here: that is 'running the target'.)"""
+    a, b = version_parts(target), version_parts(running)
+    if not (a and b and a[0] == b[0]):
+        return ""
+    return "older" if (a[1], a[2]) < (b[1], b[2]) else "same" if (a[1], a[2]) == (b[1], b[2]) else ""
+
+
 def fw_change_text(s):
     """26 Nov 2026: the station's latest firmware change as the office saw it (HTML)."""
     if not s["fw_at"]:
@@ -1142,6 +1163,15 @@ def station_state(s, build):
         return "bad", "Update failed", text[:1].upper() + text[1:].rstrip(".") + ". It won't take this file again: upload a new build to try again.", None
     if res.startswith("target is for another"):
         return "bad", "Wrong type", "The chosen firmware is for a different station type. Choose another.", None
+    if res.startswith("older") and s["target"] != "hold" and build is not None:
+        return ("bad", "Older firmware: not sent",
+                f"The target {build['version']} is older than {s['version'] or '?'} on the unit, so it is not sent. "
+                "Open the station and press 'Send it anyway' to take it back, or choose a newer target.", None)
+    if res.startswith("same") and s["target"] != "hold" and build is not None:
+        return ("wait", "Same version: not sent",
+                f"The unit already runs {build['version']}, but another build of it ({s['running_crc'] or '?'}, the "
+                f"file is {build['image_crc']}), so it is not sent. Press 'Send it anyway' on the station page to "
+                "replace it with this file.", None)
     if us == "4":
         return "bad", "File refused", "The unit refused the downloaded file. It will try again at its next check.", None
     if us == "5":
@@ -1158,9 +1188,6 @@ def station_state(s, build):
         return "ok", f"Updated to {build['version']}", "", None
     if res == "running the target":
         return "ok", "Up to date", "", None
-    if res.startswith("running the target version"):
-        return ("ok", "Up to date", f"Already running {build['version']} from another build of it (SD card or USB), "
-                "so the file is not sent.", None)
     if res.startswith("downloading"):
         pct = s["progress"] * 100 // build["size"] if build["size"] else 0
         pct = max(0, min(100, pct))
@@ -1381,6 +1408,10 @@ def attention(s, h):
         out.append(("bad", "CTRL update failed"))
     elif res.startswith("target is for another"):
         out.append(("bad", "Wrong firmware type set"))
+    elif res.startswith("older") and s["target"] != "hold":
+        out.append(("bad", "Target older than its firmware"))
+    elif res.startswith("same") and s["target"] != "hold":
+        out.append(("wait", "Same version, another build: not sent"))
     if s["unit_status"] in ("4", "5"):
         out.append(("bad", UNIT_STATUS[s["unit_status"]].capitalize()))
     if h and s["health_at"] and now - s["health_at"] <= STALE_AFTER_S + 3600:
@@ -2051,6 +2082,7 @@ def station_page(key, message=""):
     bar = (f"<div class='prog js-bar-wrap'><div class='bar big js-bar{' live' if live else ''}'{'' if pct is not None else ' hidden'}>"
            f"<i style='width:{pct or 0}%'></i></div><span class='js-pct'>{'' if pct is None else str(pct) + '%'}</span></div>")
     steps = stepper(s, label) if build is not None and s["target"] != "hold" else ""
+    older = label == "Older firmware: not sent"
     target_txt = (f"<p class='hint' style='margin:4px 0 0'>Target: <b>{esc(build['version'])}</b> "
                   f"<span class='crc'>{esc(build['image_crc'])}</span></p>" if build is not None else "")
     h.append(f"<div class='card'><div class='head'><div class='row' style='gap:12px'><h2>Firmware update</h2>"
@@ -2061,7 +2093,15 @@ def station_page(key, message=""):
              f"<input type='hidden' name='back' value='/s?k={esc(s['key'])}'><label class='mute' for='tsel'>Update target</label>"
              f"<select id='tsel' name='target'>{sel}</select><button>Set</button>"
              + ("<button class='del' name='target' value='hold' formnovalidate>Stop update</button>"
-                if s["target"] != "hold" and label.startswith(STOPPABLE_LABELS) else "") + "</form>")
+                if s["target"] != "hold" and label.startswith(STOPPABLE_LABELS) else "") + "</form>"
+             + (f"<form method='post' action='/station/downgrade' class='row' style='margin-top:10px' "
+                f"onsubmit=\"return confirm('Send {esc(build['version'])} to {esc(sid(s))}? It runs {esc(s['version'] or '?')}"
+                + (", which is newer. The unit goes back to " if older else ", another build of the same version. The unit gets this file of ")
+                + f"{esc(build['version'])} at its next check.')\">"
+                f"<input type='hidden' name='key' value='{esc(s['key'])}'><input type='hidden' name='crc' value='{esc(build['image_crc'])}'>"
+                f"<button class='del'>Send it anyway</button><span class='mute'>"
+                + ("takes the unit back to the older " if older else "replaces its build with this file of ")
+                + f"{esc(build['version'])}</span></form>" if label in ("Older firmware: not sent", "Same version: not sent") else ""))
     # v6.9.63: CTRL (LPC1768 stations only: ESP32 stations have no CTRL board)
     if s["profile"] in ESP_TYPES:
         h.append("</div>")
@@ -2448,12 +2488,25 @@ class Handler(BaseHTTPRequestHandler):
                 with _db_lock, db() as con:
                     st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
                     if st:
-                        con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL, progress=0 WHERE key=?", (target, st["key"]))
+                        con.execute("UPDATE stations SET target=?, result='', offered_crc=NULL, progress=0, downgrade_ok=''"
+                                    " WHERE key=?", (target, st["key"]))
                         add_event(con, st["shown_id"], "Office: " + ("updates resumed (follows its type)" if target == "type" else "updates stopped"
                                                                      if target == "hold" else f"to get {build_version(con, target)}"))
                         message = (f"Updates stopped for {sid(st)}." if target == "hold" else
                                    f"Updates resumed for {sid(st)}." if target == "type" else
                                    f"Station {sid(st)} set. It acts on this at its next check.")
+        elif url.path == "/station/downgrade":
+            # 26 Nov 2026 (user): confirmed "Send it anyway" for that one older build (its image id)
+            with _db_lock, db() as con:
+                st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
+                build = target_build(con, st) if st else None
+                if build is not None and build["image_crc"] == f.get("crc", ""):
+                    con.execute("UPDATE stations SET downgrade_ok=?, result='' WHERE key=?", (build["image_crc"], st["key"]))
+                    add_event(con, st["shown_id"], f"Office: confirmed going back to {build['version']} (runs {st['version']})")
+                    message = f"{sid(st)} gets {build['version']} at its next check."
+                else:
+                    message = "The target changed meanwhile: nothing confirmed. Look again."
+            f = {"back": f"/s?k={f.get('key', '')}"}
         elif url.path == "/station/delete":
             with _db_lock, db() as con:
                 st = con.execute("SELECT * FROM stations WHERE key=?", (f.get("key", ""),)).fetchone()
